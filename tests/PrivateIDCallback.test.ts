@@ -4,7 +4,7 @@ import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("PrivateID callback", () => {
-		it("accepts a success callback and advances the shared session", async () => {
+		it("returns processing when callback arrives before webhook completion", async () => {
 				const { app } = await buildOidcTestApp();
 				const client = new PrivateIDClient();
 				const session = await client.createAuthenticationSession();
@@ -14,16 +14,96 @@ describe("PrivateID callback", () => {
 						url: `/privateid/callback?result=success&session_id=${encodeURIComponent(session.sessionId)}&txn_id=${encodeURIComponent(session.transactionId)}`
 				});
 
+				expect(response.statusCode).toBe(202);
+				const payload = response.json() as Record<string, unknown>;
+				expect(payload).toMatchObject({
+						status: "created",
+						sessionId: session.sessionId,
+						transactionId: session.transactionId,
+						message: "Authentication still processing...",
+						retry: true
+				});
+
+				expect((await client.getSession()).status).toBe("created");
+				await app.close();
+		});
+
+		it("rejects webhook calls with invalid shared secret", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				await client.createAuthenticationSession();
+
+				const response = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "wrong-secret"
+						},
+						payload: {
+								status: "SUCCESS"
+						}
+				});
+
+				expect(response.statusCode).toBe(401);
+				await app.close();
+		});
+
+		it("accepts SUCCESS webhook and then allows callback continuation", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				const session = await client.createAuthenticationSession();
+
+				const webhookResponse = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "SUCCESS",
+								sessionId: session.sessionId,
+								transactionId: session.transactionId,
+								privateIdUserId: "dev-user-1"
+						}
+				});
+
+				expect(webhookResponse.statusCode).toBe(200);
+				expect((await client.getSession()).status).toBe("ready");
+
+				const response = await app.inject({
+						method: "GET",
+						url: "/privateid/callback?reason=success"
+				});
+
 				expect(response.statusCode).toBe(200);
 				const payload = response.json() as Record<string, unknown>;
 				expect(payload).toMatchObject({
 						status: "ready",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						identityResolved: true
+						message: "Continue OIDC authorization"
 				});
 
-				expect((await client.getSession()).status).toBe("ready");
+				await app.close();
+		});
+
+		it("requires exact uppercase status values in webhook", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				await client.createAuthenticationSession();
+
+				const response = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "success"
+						}
+				});
+
+				expect(response.statusCode).toBe(400);
 				await app.close();
 		});
 
@@ -37,7 +117,7 @@ describe("PrivateID callback", () => {
 						url: `/privateid/callback?reason=failed&sessionId=${encodeURIComponent(session.sessionId)}&transactionId=${encodeURIComponent(session.transactionId)}`
 				});
 
-				expect(response.statusCode).toBe(401);
+				expect(response.statusCode).toBe(200);
 				expect(response.body).toBe("authentication failed");
 
 				await app.close();

@@ -4,14 +4,14 @@ import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession, PrivateIDSessionStatus } from "./PrivateIDSession.js";
-import { findPrivateIDSession, storePrivateIDResult, storePrivateIDSession } from "./PrivateIDSessionStore.js";
+import { findPrivateIDSession, getCurrentPrivateIDSessionRecord, storePrivateIDResult, storePrivateIDSession } from "./PrivateIDSessionStore.js";
 
 type PrivateIDSessionApiResponse = Record<string, unknown>;
 
 export type PrivateIDCallbackPayload = {
 		reason: string;
-		sessionId: string;
-		transactionId: string;
+		sessionId?: string;
+		transactionId?: string;
 };
 
 export class PrivateIDClient {
@@ -133,14 +133,16 @@ export class PrivateIDClient {
 
 		async handleCallback(payload: PrivateIDCallbackPayload): Promise<PrivateIDSession> {
 				const reason = payload.reason.trim();
-				const sessionId = payload.sessionId.trim();
-				const transactionId = payload.transactionId.trim();
+				const sessionId = payload.sessionId?.trim();
+				const transactionId = payload.transactionId?.trim();
 
-				if (!reason || !sessionId || !transactionId) {
-						throw new Error("PrivateID callback is missing required fields");
+				if (!reason) {
+						throw new Error("PrivateID callback is missing reason");
 				}
 
-				const record = findPrivateIDSession(sessionId, transactionId);
+				const record = (sessionId || transactionId)
+						? findPrivateIDSession(sessionId, transactionId)
+						: getCurrentPrivateIDSessionRecord();
 				if (!record) {
 						throw new Error("PrivateID callback session not found");
 				}

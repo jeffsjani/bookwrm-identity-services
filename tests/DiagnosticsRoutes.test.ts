@@ -17,7 +17,7 @@ describe("Diagnostics routes", () => {
 					expect(body).toMatchObject({
 								diagnostics: expect.arrayContaining(["/diagnostics/oidc", "/diagnostics/privateid", "/diagnostics/routes"]),
 								oidc: expect.arrayContaining(["/.well-known/openid-configuration", "/authorize", "/jwks", "/userinfo", "/token"]),
-								privateid: expect.arrayContaining(["/privateid/callback"])
+								privateid: expect.arrayContaining(["/privateid/webhook", "/privateid/callback"])
 					});
 				} finally {
 						await app.close();
