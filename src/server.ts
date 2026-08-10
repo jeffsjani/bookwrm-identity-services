@@ -6,6 +6,7 @@ import formbody from "@fastify/formbody";
 import { configuration } from "./config/ConfigurationService.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerDiagnosticsRoutes } from "./routes/diagnostics.js";
+import { registerPrivateIdRoutes } from "./routes/privateid.js";
 import { registerIdentityRoutes } from "./routes/identity.js";
 import { oidcService } from "./oidc/OIDCService.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
@@ -34,6 +35,7 @@ await app.register(formbody);
 // Routes
 registerHealthRoutes(app);
 await registerDiagnosticsRoutes(app);
+await registerPrivateIdRoutes(app);
 await registerIdentityRoutes(app);
 await oidcService.registerEndpoints(app);
 

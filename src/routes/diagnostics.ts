@@ -275,6 +275,7 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/reverify",
 										"/diagnostics/resolve",
 										"/diagnostics/privateid",
+										"/privateid/callback",
 										"/diagnostics/oidc",
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/oidc/base44",
@@ -286,6 +287,9 @@ export async function registerDiagnosticsRoutes(
 										"/jwks",
 										"/userinfo",
 										"/token"
+								],
+								privateid: [
+										"/privateid/callback"
 								]
 						};
 

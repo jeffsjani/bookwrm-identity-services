@@ -9,7 +9,6 @@ import {
 } from "node:crypto";
 import Provider from "oidc-provider";
 
-import { MockAuthenticationProvider } from "../authentication/MockAuthenticationProvider.js";
 import type { AuthenticationProvider } from "../authentication/AuthenticationProvider.js";
 import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
@@ -34,6 +33,7 @@ import { OIDCRateLimiter } from "./infrastructure/OIDCRateLimiter.js";
 import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
+import { PrivateIDAuthenticationProvider } from "../privateid/PrivateIDAuthenticationProvider.js";
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -154,7 +154,7 @@ export class OIDCService {
 
 		constructor(options: OIDCServiceOptions = {}) {
 				this.options = options;
-				this.authenticationProvider = new MockAuthenticationProvider();
+				this.authenticationProvider = new PrivateIDAuthenticationProvider();
 				this.claimsService = new ClaimsService();
 				this.redisStore = new RedisOIDCStore();
 				this.lockService = new RedisLockService();

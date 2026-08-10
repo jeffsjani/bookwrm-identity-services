@@ -16,7 +16,8 @@ describe("Diagnostics routes", () => {
 					const body = response.json() as Record<string, unknown>;
 					expect(body).toMatchObject({
 								diagnostics: expect.arrayContaining(["/diagnostics/oidc", "/diagnostics/privateid", "/diagnostics/routes"]),
-							oidc: expect.arrayContaining(["/.well-known/openid-configuration", "/authorize", "/jwks", "/userinfo", "/token"])
+								oidc: expect.arrayContaining(["/.well-known/openid-configuration", "/authorize", "/jwks", "/userinfo", "/token"]),
+								privateid: expect.arrayContaining(["/privateid/callback"])
 					});
 				} finally {
 						await app.close();
@@ -39,7 +40,7 @@ describe("Diagnostics routes", () => {
 											configured: true,
 											authApiConfigured: true,
 											baseUrlConfigured: true,
-											redirectUrlConfigured: false,
+											redirectUrlConfigured: true,
 											mockMode: true
 								},
 								privateIdReachable: true,

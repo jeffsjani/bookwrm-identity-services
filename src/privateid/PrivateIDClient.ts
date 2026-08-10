@@ -4,22 +4,27 @@ import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession, PrivateIDSessionStatus } from "./PrivateIDSession.js";
+import { findPrivateIDSession, storePrivateIDResult, storePrivateIDSession } from "./PrivateIDSessionStore.js";
 
 type PrivateIDSessionApiResponse = Record<string, unknown>;
 
+export type PrivateIDCallbackPayload = {
+		reason: string;
+		sessionId: string;
+		transactionId: string;
+};
+
 export class PrivateIDClient {
-		private session?: PrivateIDSession;
-		private result?: PrivateIDResult;
+		private currentSessionId?: string;
 
 		async createAuthenticationSession(): Promise<PrivateIDSession> {
 				const now = Date.now();
 				const transactionId = randomUUID();
 				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
-				this.result = undefined;
 
 				if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
 						const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl : `${authBaseUrl}/`;
-						this.session = {
+						const session: PrivateIDSession = {
 								sessionId: randomUUID(),
 								transactionId,
 								status: "created",
@@ -27,8 +32,10 @@ export class PrivateIDClient {
 								expires: now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000),
 								created: now
 						};
+						storePrivateIDSession(session);
+						this.currentSessionId = session.sessionId;
 
-						return this.session;
+						return session;
 				}
 
 				const authConfiguration = secretProvider.getPrivateIdAuthConfiguration();
@@ -78,12 +85,14 @@ export class PrivateIDClient {
 						throw new Error(`PrivateID session API request failed (${response.status}): ${rawBody || response.statusText}`);
 				}
 
-				this.session = responsePayload as PrivateIDSession;
-				if (!this.session.launchUrl) {
+				const session = responsePayload as PrivateIDSession;
+				if (!session.launchUrl) {
 						throw new Error("PrivateID session API response missing launchUrl");
 				}
+				storePrivateIDSession(session);
+				this.currentSessionId = session.sessionId;
 
-				return this.session;
+				return session;
 		}
 
 		async getSession(): Promise<PrivateIDSession> {
@@ -109,14 +118,46 @@ export class PrivateIDClient {
 						return session;
 				}
 
-				session.status = "polling";
-				if (!this.result) {
-						this.result = this.buildResult(session);
+				if (!configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
+						session.status = "polling";
+						return session;
 				}
 
+				session.status = "polling";
+				const result = this.buildResult(session);
+				storePrivateIDResult(session.sessionId, result);
 				session.status = "ready";
 				session.completed = Date.now();
 				return session;
+		}
+
+		async handleCallback(payload: PrivateIDCallbackPayload): Promise<PrivateIDSession> {
+				const reason = payload.reason.trim();
+				const sessionId = payload.sessionId.trim();
+				const transactionId = payload.transactionId.trim();
+
+				if (!reason || !sessionId || !transactionId) {
+						throw new Error("PrivateID callback is missing required fields");
+				}
+
+				const record = findPrivateIDSession(sessionId, transactionId);
+				if (!record) {
+						throw new Error("PrivateID callback session not found");
+				}
+
+				const normalizedReason = reason.toLowerCase();
+				if (normalizedReason === "cancelled" || normalizedReason === "failed" || normalizedReason === "expired") {
+						record.session.status = normalizedReason;
+				} else {
+						record.session.status = "ready";
+						const result = this.buildResult(record.session);
+						storePrivateIDResult(record.session.sessionId, result);
+				}
+
+				record.session.completed = Date.now();
+				this.currentSessionId = record.session.sessionId;
+
+				return record.session;
 		}
 
 		async cancelSession(): Promise<PrivateIDSession> {
@@ -128,16 +169,18 @@ export class PrivateIDClient {
 
 		async getResult(): Promise<PrivateIDResult | undefined> {
 				const session = await this.ensureSession();
-				if (this.result) {
-						return this.result;
+				const record = findPrivateIDSession(session.sessionId);
+				if (record?.result) {
+						return record.result;
 				}
 
 				if (session.status !== "ready") {
 						return undefined;
 				}
 
-				this.result = this.buildResult(session);
-				return this.result;
+				const result = this.buildResult(session);
+				storePrivateIDResult(session.sessionId, result);
+				return result;
 		}
 
 		async initialize(): Promise<PrivateIDSession> {
@@ -172,11 +215,16 @@ export class PrivateIDClient {
 		}
 
 		private async ensureSession(): Promise<PrivateIDSession> {
-				if (!this.session) {
-						await this.createAuthenticationSession();
+				if (!this.currentSessionId) {
+						throw new Error("PrivateID session is not initialized");
 				}
 
-				return this.session as PrivateIDSession;
+				const record = findPrivateIDSession(this.currentSessionId);
+				if (!record) {
+						throw new Error("PrivateID session not found");
+				}
+
+				return record.session;
 		}
 
 		private buildResult(session: PrivateIDSession): PrivateIDResult {

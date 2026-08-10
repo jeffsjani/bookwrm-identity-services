@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import formbody from "@fastify/formbody";
 import { createHash, generateKeyPairSync } from "node:crypto";
+import { configuration } from "../src/config/ConfigurationService.js";
 
 type AuthorizeOptions = {
 		clientId?: string;
@@ -41,19 +42,27 @@ export function ensureOidcTestEnvironment(): void {
 
 		process.env.PRIVATEID_AUTH_API_KEY = "privateid-auth-key";
 		process.env.PRIVATEID_AUTH_BASE_URL = "https://privateid.example.com";
+		process.env.PRIVATEID_REDIRECT_URL = "https://example.com/privateid/callback";
 		process.env.PRIVATEID_ALLOWED_REDIRECT_ORIGINS = "https://example.com,https://bookwrm.local";
 		process.env.PRIVATEID_WEBHOOK_SHARED_SECRET = "privateid-webhook-secret";
 		process.env.PRIVATEID_MOCK_MODE = "true";
+		process.env.PRIVATEID_FALLBACK_USER_ID = "dev-user-1";
+		process.env.PRIVATEID_FALLBACK_EMAIL = "dev.user@bookwrm.local";
+		process.env.PRIVATEID_FALLBACK_NAME = "Dev User";
+
+		configuration.reload();
 }
 
 export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {
 		ensureOidcTestEnvironment();
 		const { oidcService } = await import("../src/oidc/OIDCService.js");
 		const { registerDiagnosticsRoutes } = await import("../src/routes/diagnostics.js");
+		const { registerPrivateIdRoutes } = await import("../src/routes/privateid.js");
 
 		const app = Fastify();
 		await app.register(formbody);
 		await registerDiagnosticsRoutes(app);
+		await registerPrivateIdRoutes(app);
 		await oidcService.registerEndpoints(app);
 		await app.ready();
 

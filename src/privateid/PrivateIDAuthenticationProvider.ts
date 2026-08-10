@@ -1,9 +1,10 @@
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus } from "../authentication/AuthenticationProvider.js";
 import { identityService } from "../identity/IdentityService.js";
-import { PrivateIDClient } from "./PrivateIDClient.js";
+import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClient.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
+import { getPrivateIDAuthenticatedUser, storePrivateIDAuthenticatedUser } from "./PrivateIDSessionStore.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
@@ -26,6 +27,14 @@ function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessio
 export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		private readonly client = new PrivateIDClient();
 		private statusSnapshot: AuthenticationStatus = { state: "idle" };
+
+		async completeCallback(payload: PrivateIDCallbackPayload): Promise<{ session: PrivateIDSession; user: AuthenticatedUser; result?: PrivateIDResult; }> {
+				const session = await this.client.handleCallback(payload);
+				const result = await this.client.getResult();
+				const user = await this.returnResult(result, session);
+				this.statusSnapshot = { state: "ready", sessionId: session.sessionId };
+				return { session, user, result: result ?? undefined };
+		}
 
 		async authenticate(): Promise<AuthenticatedUser> {
 				const session = await this.launchSession();
@@ -78,11 +87,26 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 				}
 
 		private async returnResult(result: PrivateIDResult | undefined, session: PrivateIDSession): Promise<AuthenticatedUser> {
-				if (result?.privateIdUserId) {
-						await identityService.resolveIdentity(result.privateIdUserId);
+				const existingAuthenticatedUser = getPrivateIDAuthenticatedUser(session.sessionId);
+				if (existingAuthenticatedUser) {
+						return existingAuthenticatedUser;
 				}
 
-				return toAuthenticatedUser(result, session.sessionId, session.transactionId);
+				if (result?.privateIdUserId) {
+						try {
+								await identityService.resolveIdentity(result.privateIdUserId);
+						} catch (error) {
+								this.statusSnapshot = {
+										state: "ready",
+										sessionId: session.sessionId,
+										message: error instanceof Error ? error.message : "Identity resolution failed"
+								};
+						}
+				}
+
+				const authenticatedUser = toAuthenticatedUser(result, session.sessionId, session.transactionId);
+				storePrivateIDAuthenticatedUser(session.sessionId, authenticatedUser);
+				return authenticatedUser;
 		}
 
 		async cancel(): Promise<void> {
