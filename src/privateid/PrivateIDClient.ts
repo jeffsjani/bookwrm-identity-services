@@ -46,8 +46,6 @@ export class PrivateIDClient {
 				const redirectUrl = this.resolveRedirectUrl();
 				const callbackUrl = this.resolveCallbackUrl(redirectUrl);
 				const callbackHeaders = this.resolveCallbackHeaders();
-				const locale = configuration.get("PRIVATEID_LOCALE", "en-US") ?? "en-US";
-				const enableDesktop = configuration.getBoolean("PRIVATEID_ENABLE_DESKTOP", true);
 
 				const response = await fetch(endpoint, {
 						method: "POST",
@@ -56,13 +54,13 @@ export class PrivateIDClient {
 								"x-api-key": authConfiguration.authApiKey as string
 						},
 						body: JSON.stringify({
-							sessionType: "SIGN_IN",
+							type: "SIGN-IN",
 							redirectURL: redirectUrl,
-							callbackURL: callbackUrl,
-							callbackHeaders,
-							locale,
-							enableDesktop,
-							transactionID: transactionId
+							enableDesktop: true,
+							callback: {
+									url: callbackUrl,
+									headers: callbackHeaders
+							}
 						})
 				});
 
@@ -80,29 +78,10 @@ export class PrivateIDClient {
 						throw new Error(`PrivateID session API request failed (${response.status}): ${rawBody || response.statusText}`);
 				}
 
-				const launchUrl = this.pickString(responsePayload, ["launchUrl", "launchURL", "redirectURL", "redirectUrl", "url"]);
-				if (!launchUrl) {
-						throw new Error("PrivateID session API response missing launch URL");
+				this.session = responsePayload as PrivateIDSession;
+				if (!this.session.launchUrl) {
+						throw new Error("PrivateID session API response missing launchUrl");
 				}
-
-				const sessionId = this.pickString(responsePayload, ["sessionId", "sessionID", "verificationSessionID", "id"]) ?? randomUUID();
-				const resolvedTransactionId = this.pickString(responsePayload, ["transactionId", "transactionID", "txId"]) ?? transactionId;
-				const status = this.pickString(responsePayload, ["status", "state"]) ?? "created";
-				const created = this.pickTimestamp(responsePayload, ["created", "createdAt", "timestamp"], now);
-				const expires = this.pickTimestamp(
-						responsePayload,
-						["expires", "expiresAt", "expiration", "expiry"],
-						now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000)
-				);
-
-				this.session = {
-						sessionId,
-						transactionId: resolvedTransactionId,
-						status: this.normalizeStatus(status),
-						launchUrl,
-						expires,
-						created
-				};
 
 				return this.session;
 		}
