@@ -17,6 +17,8 @@ const app = Fastify({
 		}
 });
 
+configuration.validatePrivateIdConfiguration();
+
 // Security
 await app.register(helmet);
 

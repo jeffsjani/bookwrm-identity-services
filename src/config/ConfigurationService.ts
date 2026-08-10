@@ -163,6 +163,17 @@ export class ConfigurationService {
 				return DEFAULTS;
 		}
 
+		validatePrivateIdConfiguration(): void {
+				if (!this.isProduction()) {
+						return;
+				}
+
+				const redirectUrl = this.get("PRIVATEID_REDIRECT_URL")?.trim();
+				if (!redirectUrl) {
+						throw new Error("Configuration validation failed: PRIVATEID_REDIRECT_URL is required in production");
+				}
+		}
+
 		private readMultilineValues(key: string): string[] {
 				const raw = this.get(key);
 				if (!raw) {

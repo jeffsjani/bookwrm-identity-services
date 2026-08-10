@@ -206,6 +206,10 @@ export class PrivateIDClient {
 
 		private resolveRedirectUrl(): string {
 				const explicitRedirectUrl = configuration.get("PRIVATEID_REDIRECT_URL")?.trim();
+				if (configuration.isProduction() && !explicitRedirectUrl) {
+						throw new Error("PrivateID redirect URL is required in production: set PRIVATEID_REDIRECT_URL");
+				}
+
 				if (explicitRedirectUrl) {
 						return explicitRedirectUrl;
 				}
@@ -230,16 +234,7 @@ export class PrivateIDClient {
 						}
 				}
 
-				const allowedOrigins = configuration.get("PRIVATEID_ALLOWED_REDIRECT_ORIGINS")?.trim();
-				if (allowedOrigins) {
-						const firstOrigin = allowedOrigins.split(",").map((entry) => entry.trim()).find((entry) => entry.length > 0);
-						if (firstOrigin) {
-								const normalized = firstOrigin.endsWith("/") ? firstOrigin.slice(0, -1) : firstOrigin;
-								return `${normalized}/callback`;
-						}
-				}
-
-				throw new Error("PrivateID session API configuration missing redirect URL: set PRIVATEID_REDIRECT_URL, OIDC_BASE44_REDIRECT_URI, OIDC_BASE44_REDIRECT_URIS, or PRIVATEID_ALLOWED_REDIRECT_ORIGINS");
+				throw new Error("PrivateID session API configuration missing redirect URL: set PRIVATEID_REDIRECT_URL, OIDC_BASE44_REDIRECT_URI, or OIDC_BASE44_REDIRECT_URIS");
 		}
 
 		private resolveCallbackUrl(redirectUrl: string): string {
