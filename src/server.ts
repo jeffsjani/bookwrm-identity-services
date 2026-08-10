@@ -3,6 +3,7 @@ import helmet from "@fastify/helmet";
 import cors from "@fastify/cors";
 
 import { registerHealthRoutes } from "./routes/health.js";
+import { registerDiagnosticsRoutes } from "./routes/diagnostics.js";
 
 const app = Fastify({
 		logger: {
@@ -20,7 +21,8 @@ await app.register(cors, {
 });
 
 // Routes
-await registerHealthRoutes(app);
+registerHealthRoutes(app);
+await registerDiagnosticsRoutes(app);
 
 app.get("/", async () => {
 		return {
