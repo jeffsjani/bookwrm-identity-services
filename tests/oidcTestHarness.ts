@@ -38,6 +38,11 @@ export function ensureOidcTestEnvironment(): void {
 		process.env.BASE44_BASE_URL = "https://identity.example.com";
 		process.env.IDENTITY_API_PATH = "/api/identity";
 		process.env.BOOKWRM_IDENTITY_API_KEY = "test-key";
+
+		process.env.PRIVATEID_ENABLED = "true";
+		process.env.PRIVATEID_LAUNCH_URL = "https://privateid.example.com/launch";
+		process.env.PRIVATEID_CLIENT_ID = "privateid-client";
+		process.env.PRIVATEID_CLIENT_SECRET = "privateid-secret";
 }
 
 export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {

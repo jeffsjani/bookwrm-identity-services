@@ -15,9 +15,37 @@ describe("Diagnostics routes", () => {
 
 					const body = response.json() as Record<string, unknown>;
 					expect(body).toMatchObject({
-							diagnostics: expect.arrayContaining(["/diagnostics/oidc", "/diagnostics/routes"]),
+								diagnostics: expect.arrayContaining(["/diagnostics/oidc", "/diagnostics/privateid", "/diagnostics/routes"]),
 							oidc: expect.arrayContaining(["/.well-known/openid-configuration", "/authorize", "/jwks", "/userinfo", "/token"])
 					});
+				} finally {
+						await app.close();
+				}
+		});
+
+		it("returns the PrivateID diagnostics probe", async () => {
+				const { app } = await buildOidcTestApp();
+				try {
+						const response = await app.inject({
+								method: "GET",
+								url: "/diagnostics/privateid"
+						});
+
+						expect(response.statusCode).toBe(200);
+
+						const body = response.json() as Record<string, unknown>;
+						expect(body).toMatchObject({
+								configuration: {
+										privateIdEnabled: true,
+										launchUrlConfigured: true,
+										credentialsConfigured: true,
+										configured: true
+								},
+								privateIdReachable: true,
+								authenticationSessionCreated: true,
+								launchUrlReturned: true,
+								launchUrl: "https://privateid.example.com/launch"
+						});
 				} finally {
 						await app.close();
 				}

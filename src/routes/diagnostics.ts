@@ -1,11 +1,93 @@
 import { FastifyInstance } from "fastify";
 
+import { configuration } from "../config/ConfigurationService.js";
+import { featureFlags } from "../config/FeatureFlagService.js";
+import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
+import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 
 type ResolveBody = {
 		privateIdUserId?: string;
 };
+
+type PrivateIdDiagnosticsResponse = {
+		configuration: {
+				privateIdEnabled: boolean;
+				launchUrlConfigured: boolean;
+				credentialsConfigured: boolean;
+				configured: boolean;
+		};
+		privateIdReachable: boolean;
+		authenticationSessionCreated: boolean;
+		launchUrlReturned: boolean;
+		session?: {
+				sessionId: string;
+				transactionId: string;
+				status: string;
+				launchUrl: string;
+				expires: number;
+				created: number;
+				completed?: number;
+		};
+		launchUrl?: string;
+		error?: string;
+};
+
+async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse> {
+		const privateIdEnabled = featureFlags.isPrivateIdEnabled();
+		const launchUrlConfigured = Boolean(configuration.get("PRIVATEID_LAUNCH_URL"));
+		const credentials = secretProvider.getPrivateIdCredentials();
+		const credentialsConfigured = Boolean(credentials.clientId && credentials.clientSecret);
+		const configured = privateIdEnabled && launchUrlConfigured && credentialsConfigured;
+
+		if (!configured) {
+				return {
+						configuration: {
+								privateIdEnabled,
+								launchUrlConfigured,
+								credentialsConfigured,
+								configured
+						},
+						privateIdReachable: false,
+						authenticationSessionCreated: false,
+						launchUrlReturned: false,
+						error: "PrivateID configuration is incomplete"
+				};
+		}
+
+		const client = new PrivateIDClient();
+
+		try {
+				const session = await client.createAuthenticationSession();
+				return {
+						configuration: {
+								privateIdEnabled,
+								launchUrlConfigured,
+								credentialsConfigured,
+								configured
+						},
+						privateIdReachable: true,
+						authenticationSessionCreated: true,
+						launchUrlReturned: Boolean(session.launchUrl),
+						session,
+						launchUrl: session.launchUrl
+				};
+		} catch (error) {
+				return {
+						configuration: {
+								privateIdEnabled,
+								launchUrlConfigured,
+								credentialsConfigured,
+								configured
+						},
+						privateIdReachable: false,
+						authenticationSessionCreated: false,
+						launchUrlReturned: false,
+						error: error instanceof Error ? error.message : "PrivateID diagnostics failed"
+				};
+		}
+}
 
 export async function registerDiagnosticsRoutes(
 		app: FastifyInstance
@@ -122,6 +204,22 @@ export async function registerDiagnosticsRoutes(
 
 		app.get(
 
+				"/diagnostics/privateid",
+
+				async (_request, reply)=>{
+						const diagnostics = await buildPrivateIdDiagnostics();
+						if (!diagnostics.configuration.configured || !diagnostics.privateIdReachable || !diagnostics.authenticationSessionCreated || !diagnostics.launchUrlReturned) {
+								reply.code(503);
+						}
+
+						return diagnostics;
+
+				}
+
+		);
+
+		app.get(
+
 				"/diagnostics/oidc",
 
 				async ()=>{
@@ -165,6 +263,7 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/timeline",
 										"/diagnostics/reverify",
 										"/diagnostics/resolve",
+										"/diagnostics/privateid",
 										"/diagnostics/oidc",
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/oidc/base44",

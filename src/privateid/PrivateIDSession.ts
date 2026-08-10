@@ -15,5 +15,6 @@ export type PrivateIDSession = {
 		status: PrivateIDSessionStatus;
 		launchUrl: string;
 		expires: number;
-		result?: unknown;
+		created: number;
+		completed?: number;
 };

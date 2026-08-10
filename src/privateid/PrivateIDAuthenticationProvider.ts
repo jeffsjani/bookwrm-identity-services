@@ -1,27 +1,25 @@
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus } from "../authentication/AuthenticationProvider.js";
+import { identityService } from "../identity/IdentityService.js";
 import { PrivateIDClient } from "./PrivateIDClient.js";
+import type { PrivateIDResult } from "./PrivateIDResult.js";
+import type { PrivateIDSession } from "./PrivateIDSession.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function toAuthenticatedUser(result: unknown, fallbackSessionId: string, fallbackTransactionId: string): AuthenticatedUser {
-		if (result && typeof result === "object") {
-				const candidate = result as Record<string, unknown>;
-				const id = typeof candidate.id === "string" ? candidate.id : fallbackSessionId;
-				const sub = typeof candidate.sub === "string" ? candidate.sub : fallbackTransactionId;
-				const email = typeof candidate.email === "string" ? candidate.email : "privateid.user@bookwrm.local";
-				const name = typeof candidate.name === "string" ? candidate.name : "PrivateID User";
-
-				return { id, sub, email, name };
-		}
+function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessionId: string, fallbackTransactionId: string): AuthenticatedUser {
+		const privateIdUserId = result?.privateIdUserId ?? fallbackSessionId;
+		const subjectId = result?.privateIdUserId ?? fallbackTransactionId;
+		const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
+		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
 
 		return {
-				id: fallbackSessionId,
-				sub: fallbackTransactionId,
-				email: "privateid.user@bookwrm.local",
-				name: "PrivateID User"
+				id: privateIdUserId,
+				sub: subjectId,
+				email: fallbackEmail,
+				name: fallbackName
 		};
 }
 
@@ -30,24 +28,36 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		private statusSnapshot: AuthenticationStatus = { state: "idle" };
 
 		async authenticate(): Promise<AuthenticatedUser> {
-				this.statusSnapshot = { state: "initializing" };
-				const session = await this.client.initialize();
-				this.statusSnapshot = { state: "waiting", sessionId: session.sessionId };
-
-				await this.client.launch();
-				this.statusSnapshot = { state: "polling", sessionId: session.sessionId };
+				const session = await this.launchSession();
+				await this.waitForSession(session);
 
 				const timeoutMs = configuration.getNumber("PRIVATEID_POLL_TIMEOUT_MS", 30_000);
 				const pollIntervalMs = configuration.getNumber("PRIVATEID_POLL_INTERVAL_MS", 1000);
+				const result = await this.pollForResult(session, timeoutMs, pollIntervalMs);
+				return await this.returnResult(result, session);
+		}
+
+		private async launchSession(): Promise<PrivateIDSession> {
+				this.statusSnapshot = { state: "initializing" };
+				const session = await this.client.createAuthenticationSession();
+				this.statusSnapshot = { state: "waiting", sessionId: session.sessionId };
+				return session;
+		}
+
+		private async waitForSession(session: PrivateIDSession): Promise<PrivateIDSession> {
+				this.statusSnapshot = { state: "polling", sessionId: session.sessionId };
+				return this.client.getSession();
+		}
+
+		private async pollForResult(session: PrivateIDSession, timeoutMs: number, pollIntervalMs: number): Promise<PrivateIDResult | undefined> {
 				const startedAt = Date.now();
 
 				while (Date.now() - startedAt < timeoutMs) {
-						await this.client.identify();
-						const status = await this.client.getStatus();
+						const sessionState = await this.client.pollSession();
+						const status = sessionState.status;
 						if (status === "ready") {
-								const result = await this.client.getResult();
 								this.statusSnapshot = { state: "ready", sessionId: session.sessionId };
-								return toAuthenticatedUser(result, session.sessionId, session.transactionId);
+								return this.client.getResult();
 						}
 
 						if (status === "cancelled") {
@@ -61,14 +71,22 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 						}
 
 						await sleep(pollIntervalMs);
-				}
+					}
 
 				this.statusSnapshot = { state: "failed", sessionId: session.sessionId, message: "PrivateID polling timed out" };
 				throw new Error("PrivateID polling timed out");
+				}
+
+		private async returnResult(result: PrivateIDResult | undefined, session: PrivateIDSession): Promise<AuthenticatedUser> {
+				if (result?.privateIdUserId) {
+						await identityService.resolveIdentity(result.privateIdUserId);
+				}
+
+				return toAuthenticatedUser(result, session.sessionId, session.transactionId);
 		}
 
 		async cancel(): Promise<void> {
-				await this.client.cancel();
+				await this.client.cancelSession();
 				this.statusSnapshot = { state: "cancelled" };
 		}
 

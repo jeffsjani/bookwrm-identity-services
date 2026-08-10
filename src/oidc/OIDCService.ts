@@ -10,7 +10,6 @@ import {
 import Provider from "oidc-provider";
 
 import { MockAuthenticationProvider } from "../authentication/MockAuthenticationProvider.js";
-import { PrivateIDAuthenticationProvider } from "../privateid/PrivateIDAuthenticationProvider.js";
 import type { AuthenticationProvider } from "../authentication/AuthenticationProvider.js";
 import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
@@ -155,9 +154,7 @@ export class OIDCService {
 
 		constructor(options: OIDCServiceOptions = {}) {
 				this.options = options;
-				this.authenticationProvider = featureFlags.isPrivateIdEnabled()
-						? new PrivateIDAuthenticationProvider()
-						: new MockAuthenticationProvider();
+				this.authenticationProvider = new MockAuthenticationProvider();
 				this.claimsService = new ClaimsService();
 				this.redisStore = new RedisOIDCStore();
 				this.lockService = new RedisLockService();
