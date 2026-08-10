@@ -113,7 +113,7 @@ export type OIDCDashboardSnapshot = {
 			};
 			featureFlags: {
 				oidcEnabled: boolean;
-				privateIdEnabled: boolean;
+				mockMode: boolean;
 				mockAuthEnabled: boolean;
 				redisEnabled: boolean;
 				cacheEnabled: boolean;
@@ -1091,7 +1091,7 @@ export class OIDCService {
 							},
 							featureFlags: {
 								oidcEnabled: featureFlags.isOidcEnabled(),
-								privateIdEnabled: featureFlags.isPrivateIdEnabled(),
+								mockMode: featureFlags.isPrivateIdMockMode(),
 								mockAuthEnabled: featureFlags.isMockAuthEnabled(),
 								redisEnabled: featureFlags.isRedisEnabled(),
 								cacheEnabled: featureFlags.isCacheEnabled(),

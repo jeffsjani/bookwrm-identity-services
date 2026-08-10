@@ -36,10 +36,11 @@ describe("Diagnostics routes", () => {
 						const body = response.json() as Record<string, unknown>;
 						expect(body).toMatchObject({
 								configuration: {
-										privateIdEnabled: true,
-										launchUrlConfigured: true,
-										credentialsConfigured: true,
-										configured: true
+											configured: true,
+											authApiConfigured: true,
+											baseUrlConfigured: true,
+											redirectOriginsConfigured: true,
+											mockMode: false
 								},
 								privateIdReachable: true,
 								authenticationSessionCreated: true,

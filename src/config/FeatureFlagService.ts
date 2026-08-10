@@ -5,8 +5,8 @@ export class FeatureFlagService {
 				return configuration.getFeatureFlag("OIDC_ENABLED", true);
 		}
 
-		isPrivateIdEnabled(): boolean {
-				return configuration.getFeatureFlag("PRIVATEID_ENABLED", false);
+		isPrivateIdMockMode(): boolean {
+				return configuration.getFeatureFlag("PRIVATEID_MOCK_MODE", false);
 		}
 
 		isMockAuthEnabled(): boolean {

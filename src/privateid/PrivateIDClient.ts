@@ -10,12 +10,14 @@ export class PrivateIDClient {
 
 		async createAuthenticationSession(): Promise<PrivateIDSession> {
 				const now = Date.now();
+				const authBaseUrl = configuration.get("PRIVATEID_AUTH_BASE_URL", "https://privateid.local") ?? "https://privateid.local";
+				const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl : `${authBaseUrl}/`;
 				this.result = undefined;
 				this.session = {
 						sessionId: randomUUID(),
 						transactionId: randomUUID(),
 						status: "created",
-						launchUrl: configuration.get("PRIVATEID_LAUNCH_URL", "https://privateid.local/launch") ?? "https://privateid.local/launch",
+						launchUrl: `${normalizedAuthBaseUrl}launch`,
 						expires: now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000),
 						created: now
 				};

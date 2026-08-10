@@ -13,10 +13,11 @@ type ResolveBody = {
 
 type PrivateIdDiagnosticsResponse = {
 		configuration: {
-				privateIdEnabled: boolean;
-				launchUrlConfigured: boolean;
-				credentialsConfigured: boolean;
 				configured: boolean;
+				authApiConfigured: boolean;
+				baseUrlConfigured: boolean;
+				redirectOriginsConfigured: boolean;
+				mockMode: boolean;
 		};
 		privateIdReachable: boolean;
 		authenticationSessionCreated: boolean;
@@ -35,19 +36,22 @@ type PrivateIdDiagnosticsResponse = {
 };
 
 async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse> {
-		const privateIdEnabled = featureFlags.isPrivateIdEnabled();
-		const launchUrlConfigured = Boolean(configuration.get("PRIVATEID_LAUNCH_URL"));
-		const credentials = secretProvider.getPrivateIdCredentials();
-		const credentialsConfigured = Boolean(credentials.clientId && credentials.clientSecret);
-		const configured = privateIdEnabled && launchUrlConfigured && credentialsConfigured;
+		const authConfiguration = secretProvider.getPrivateIdAuthConfiguration();
+		const authApiConfigured = Boolean(authConfiguration.authApiKey);
+		const baseUrlConfigured = Boolean(configuration.get("PRIVATEID_AUTH_BASE_URL")?.trim());
+		const redirectOriginsConfigured = Boolean(configuration.get("PRIVATEID_ALLOWED_REDIRECT_ORIGINS")?.trim());
+		const mockMode = featureFlags.isPrivateIdMockMode();
+		const webhookSharedSecretConfigured = Boolean(authConfiguration.webhookSharedSecret);
+		const configured = authApiConfigured && baseUrlConfigured && redirectOriginsConfigured && webhookSharedSecretConfigured;
 
 		if (!configured) {
 				return {
 						configuration: {
-								privateIdEnabled,
-								launchUrlConfigured,
-								credentialsConfigured,
-								configured
+								configured,
+								authApiConfigured,
+								baseUrlConfigured,
+								redirectOriginsConfigured,
+								mockMode
 						},
 						privateIdReachable: false,
 						authenticationSessionCreated: false,
@@ -62,10 +66,11 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 				const session = await client.createAuthenticationSession();
 				return {
 						configuration: {
-								privateIdEnabled,
-								launchUrlConfigured,
-								credentialsConfigured,
-								configured
+								configured,
+								authApiConfigured,
+								baseUrlConfigured,
+								redirectOriginsConfigured,
+								mockMode
 						},
 						privateIdReachable: true,
 						authenticationSessionCreated: true,
@@ -76,10 +81,11 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 		} catch (error) {
 				return {
 						configuration: {
-								privateIdEnabled,
-								launchUrlConfigured,
-								credentialsConfigured,
-								configured
+								configured,
+								authApiConfigured,
+								baseUrlConfigured,
+								redirectOriginsConfigured,
+								mockMode
 						},
 						privateIdReachable: false,
 						authenticationSessionCreated: false,

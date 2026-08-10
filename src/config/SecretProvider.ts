@@ -17,10 +17,10 @@ export class SecretProvider {
 				return configuration.getIdentityApiKey();
 		}
 
-		getPrivateIdCredentials(): { clientId?: string; clientSecret?: string } {
+		getPrivateIdAuthConfiguration(): { authApiKey?: string; webhookSharedSecret?: string } {
 				return {
-						clientId: configuration.get("PRIVATEID_CLIENT_ID")?.trim() || undefined,
-						clientSecret: configuration.get("PRIVATEID_CLIENT_SECRET")?.trim() || undefined
+						authApiKey: configuration.get("PRIVATEID_AUTH_API_KEY")?.trim() || undefined,
+						webhookSharedSecret: configuration.get("PRIVATEID_WEBHOOK_SHARED_SECRET")?.trim() || undefined
 				};
 		}
 
