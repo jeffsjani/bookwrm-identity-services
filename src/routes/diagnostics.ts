@@ -40,9 +40,10 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 		const authApiConfigured = Boolean(authConfiguration.authApiKey);
 		const baseUrlConfigured = Boolean(configuration.get("PRIVATEID_AUTH_BASE_URL")?.trim());
 		const redirectOriginsConfigured = Boolean(configuration.get("PRIVATEID_ALLOWED_REDIRECT_ORIGINS")?.trim());
+		const mockModeConfigured = Boolean(configuration.get("PRIVATEID_MOCK_MODE")?.trim());
 		const mockMode = featureFlags.isPrivateIdMockMode();
 		const webhookSharedSecretConfigured = Boolean(authConfiguration.webhookSharedSecret);
-		const configured = authApiConfigured && baseUrlConfigured && redirectOriginsConfigured && webhookSharedSecretConfigured;
+		const configured = authApiConfigured && baseUrlConfigured && redirectOriginsConfigured && webhookSharedSecretConfigured && mockModeConfigured;
 
 		if (!configured) {
 				return {

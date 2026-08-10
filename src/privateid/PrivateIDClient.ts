@@ -36,12 +36,6 @@ export class PrivateIDClient {
 				if (!authConfiguration.authApiKey) {
 						missingCredentials.push("PRIVATEID_AUTH_API_KEY");
 				}
-				if (!authConfiguration.clientId) {
-						missingCredentials.push("PRIVATEID_AUTH_CLIENT_ID");
-				}
-				if (!authConfiguration.clientSecret) {
-						missingCredentials.push("PRIVATEID_AUTH_CLIENT_SECRET");
-				}
 
 				if (missingCredentials.length > 0) {
 						throw new Error(`PrivateID session API configuration missing required credentials: ${missingCredentials.join(", ")}`);
@@ -59,9 +53,7 @@ export class PrivateIDClient {
 						method: "POST",
 						headers: {
 								"content-type": "application/json",
-								x_api_key: authConfiguration.authApiKey as string,
-								clientID: authConfiguration.clientId as string,
-								clientSecret: authConfiguration.clientSecret as string
+								"x-api-key": authConfiguration.authApiKey as string
 						},
 						body: JSON.stringify({
 							sessionType: "SIGN_IN",
