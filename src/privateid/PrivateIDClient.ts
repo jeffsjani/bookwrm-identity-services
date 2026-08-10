@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 
 import { configuration } from "../config/ConfigurationService.js";
+import { secretProvider } from "../config/SecretProvider.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession, PrivateIDSessionStatus } from "./PrivateIDSession.js";
+
+type PrivateIDSessionApiResponse = Record<string, unknown>;
 
 export class PrivateIDClient {
 		private session?: PrivateIDSession;
@@ -10,16 +13,103 @@ export class PrivateIDClient {
 
 		async createAuthenticationSession(): Promise<PrivateIDSession> {
 				const now = Date.now();
-				const authBaseUrl = configuration.get("PRIVATEID_AUTH_BASE_URL", "https://privateid.local") ?? "https://privateid.local";
-				const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl : `${authBaseUrl}/`;
+				const transactionId = randomUUID();
+				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
 				this.result = undefined;
+
+				if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
+						const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl : `${authBaseUrl}/`;
+						this.session = {
+								sessionId: randomUUID(),
+								transactionId,
+								status: "created",
+								launchUrl: `${normalizedAuthBaseUrl}launch`,
+								expires: now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000),
+								created: now
+						};
+
+						return this.session;
+				}
+
+				const authConfiguration = secretProvider.getPrivateIdAuthConfiguration();
+				const missingCredentials: string[] = [];
+				if (!authConfiguration.authApiKey) {
+						missingCredentials.push("PRIVATEID_AUTH_API_KEY");
+				}
+				if (!authConfiguration.clientId) {
+						missingCredentials.push("PRIVATEID_AUTH_CLIENT_ID");
+				}
+				if (!authConfiguration.clientSecret) {
+						missingCredentials.push("PRIVATEID_AUTH_CLIENT_SECRET");
+				}
+
+				if (missingCredentials.length > 0) {
+						throw new Error(`PrivateID session API configuration missing required credentials: ${missingCredentials.join(", ")}`);
+				}
+
+				const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl.slice(0, -1) : authBaseUrl;
+				const endpoint = `${normalizedAuthBaseUrl}/v2/verification-session`;
+				const redirectUrl = this.resolveRedirectUrl();
+				const callbackUrl = this.resolveCallbackUrl(redirectUrl);
+				const callbackHeaders = this.resolveCallbackHeaders();
+				const locale = configuration.get("PRIVATEID_LOCALE", "en-US") ?? "en-US";
+				const enableDesktop = configuration.getBoolean("PRIVATEID_ENABLE_DESKTOP", true);
+
+				const response = await fetch(endpoint, {
+						method: "POST",
+						headers: {
+								"content-type": "application/json",
+								x_api_key: authConfiguration.authApiKey as string,
+								clientID: authConfiguration.clientId as string,
+								clientSecret: authConfiguration.clientSecret as string
+						},
+						body: JSON.stringify({
+							sessionType: "SIGN_IN",
+							redirectURL: redirectUrl,
+							callbackURL: callbackUrl,
+							callbackHeaders,
+							locale,
+							enableDesktop,
+							transactionID: transactionId
+						})
+				});
+
+				const rawBody = await response.text();
+				let responsePayload: PrivateIDSessionApiResponse = {};
+				if (rawBody.trim().length > 0) {
+						try {
+								responsePayload = JSON.parse(rawBody) as PrivateIDSessionApiResponse;
+						} catch {
+								throw new Error("PrivateID session API returned a non-JSON response");
+						}
+				}
+
+				if (!response.ok) {
+						throw new Error(`PrivateID session API request failed (${response.status}): ${rawBody || response.statusText}`);
+				}
+
+				const launchUrl = this.pickString(responsePayload, ["launchUrl", "launchURL", "redirectURL", "redirectUrl", "url"]);
+				if (!launchUrl) {
+						throw new Error("PrivateID session API response missing launch URL");
+				}
+
+				const sessionId = this.pickString(responsePayload, ["sessionId", "sessionID", "verificationSessionID", "id"]) ?? randomUUID();
+				const resolvedTransactionId = this.pickString(responsePayload, ["transactionId", "transactionID", "txId"]) ?? transactionId;
+				const status = this.pickString(responsePayload, ["status", "state"]) ?? "created";
+				const created = this.pickTimestamp(responsePayload, ["created", "createdAt", "timestamp"], now);
+				const expires = this.pickTimestamp(
+						responsePayload,
+						["expires", "expiresAt", "expiration", "expiry"],
+						now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000)
+				);
+
 				this.session = {
-						sessionId: randomUUID(),
-						transactionId: randomUUID(),
-						status: "created",
-						launchUrl: `${normalizedAuthBaseUrl}launch`,
-						expires: now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000),
-						created: now
+						sessionId,
+						transactionId: resolvedTransactionId,
+						status: this.normalizeStatus(status),
+						launchUrl,
+						expires,
+						created
 				};
 
 				return this.session;
@@ -141,5 +231,108 @@ export class PrivateIDClient {
 							completed: session.completed
 						}
 				};
+		}
+
+		private resolveRedirectUrl(): string {
+				const explicitRedirectUrl = configuration.get("PRIVATEID_REDIRECT_URL")?.trim();
+				if (explicitRedirectUrl) {
+						return explicitRedirectUrl;
+				}
+
+				const base44RedirectUri = configuration.get("OIDC_BASE44_REDIRECT_URI")?.trim();
+				if (base44RedirectUri) {
+						return base44RedirectUri;
+				}
+
+				const configuredRedirectUris = configuration.get("OIDC_BASE44_REDIRECT_URIS")?.trim();
+				if (configuredRedirectUris) {
+						try {
+								const parsed = JSON.parse(configuredRedirectUris) as string[];
+								if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === "string") {
+										return parsed[0];
+								}
+						} catch {
+								const csvValue = configuredRedirectUris.split(",").map((entry) => entry.trim()).find((entry) => entry.length > 0);
+								if (csvValue) {
+										return csvValue;
+								}
+						}
+				}
+
+				const allowedOrigins = configuration.get("PRIVATEID_ALLOWED_REDIRECT_ORIGINS")?.trim();
+				if (allowedOrigins) {
+						const firstOrigin = allowedOrigins.split(",").map((entry) => entry.trim()).find((entry) => entry.length > 0);
+						if (firstOrigin) {
+								const normalized = firstOrigin.endsWith("/") ? firstOrigin.slice(0, -1) : firstOrigin;
+								return `${normalized}/callback`;
+						}
+				}
+
+				throw new Error("PrivateID session API configuration missing redirect URL: set PRIVATEID_REDIRECT_URL, OIDC_BASE44_REDIRECT_URI, OIDC_BASE44_REDIRECT_URIS, or PRIVATEID_ALLOWED_REDIRECT_ORIGINS");
+		}
+
+		private resolveCallbackUrl(redirectUrl: string): string {
+				return configuration.get("PRIVATEID_CALLBACK_URL", redirectUrl) ?? redirectUrl;
+		}
+
+		private resolveCallbackHeaders(): Record<string, string> {
+				const headers: Record<string, string> = {};
+				const webhookSharedSecret = secretProvider.getPrivateIdAuthConfiguration().webhookSharedSecret;
+				if (webhookSharedSecret) {
+						headers["x-privateid-webhook-shared-secret"] = webhookSharedSecret;
+				}
+
+				return headers;
+		}
+
+		private pickString(payload: PrivateIDSessionApiResponse, candidates: string[]): string | undefined {
+				for (const key of candidates) {
+						const value = payload[key];
+						if (typeof value === "string" && value.trim().length > 0) {
+								return value;
+						}
+				}
+
+				return undefined;
+		}
+
+		private pickTimestamp(payload: PrivateIDSessionApiResponse, candidates: string[], fallback: number): number {
+				for (const key of candidates) {
+						const value = payload[key];
+						if (typeof value === "number" && Number.isFinite(value)) {
+								return value;
+						}
+						if (typeof value === "string" && value.trim().length > 0) {
+								const asNumber = Number(value);
+								if (Number.isFinite(asNumber)) {
+										return asNumber;
+								}
+								const asDate = Date.parse(value);
+								if (!Number.isNaN(asDate)) {
+										return asDate;
+								}
+						}
+				}
+
+				return fallback;
+		}
+
+		private normalizeStatus(status: string): PrivateIDSessionStatus {
+				const normalized = status.toLowerCase();
+				if (
+						normalized === "created"
+						|| normalized === "initialized"
+						|| normalized === "launching"
+						|| normalized === "waiting"
+						|| normalized === "polling"
+						|| normalized === "ready"
+						|| normalized === "cancelled"
+						|| normalized === "failed"
+						|| normalized === "expired"
+				) {
+						return normalized;
+				}
+
+				return "created";
 		}
 }

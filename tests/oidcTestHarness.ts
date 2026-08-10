@@ -41,9 +41,11 @@ export function ensureOidcTestEnvironment(): void {
 
 		process.env.PRIVATEID_AUTH_API_KEY = "privateid-auth-key";
 		process.env.PRIVATEID_AUTH_BASE_URL = "https://privateid.example.com";
+		process.env.PRIVATEID_AUTH_CLIENT_ID = "privateid-client-id";
+		process.env.PRIVATEID_AUTH_CLIENT_SECRET = "privateid-client-secret";
 		process.env.PRIVATEID_ALLOWED_REDIRECT_ORIGINS = "https://example.com,https://bookwrm.local";
 		process.env.PRIVATEID_WEBHOOK_SHARED_SECRET = "privateid-webhook-secret";
-		process.env.PRIVATEID_MOCK_MODE = "false";
+		process.env.PRIVATEID_MOCK_MODE = "true";
 }
 
 export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {

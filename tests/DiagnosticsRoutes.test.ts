@@ -40,7 +40,7 @@ describe("Diagnostics routes", () => {
 											authApiConfigured: true,
 											baseUrlConfigured: true,
 											redirectOriginsConfigured: true,
-											mockMode: false
+											mockMode: true
 								},
 								privateIdReachable: true,
 								authenticationSessionCreated: true,
