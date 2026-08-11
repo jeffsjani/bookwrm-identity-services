@@ -17,6 +17,8 @@ type PrivateIdDiagnosticsResponse = {
 				authApiConfigured: boolean;
 				baseUrlConfigured: boolean;
 				redirectUrlConfigured: boolean;
+				callbackUrlConfigured: boolean;
+				redirectOriginsConfigured: boolean;
 				mockMode: boolean;
 		};
 		privateIdReachable: boolean;
@@ -40,14 +42,18 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 		const authApiConfigured = Boolean(authConfiguration.authApiKey);
 		const baseUrlConfigured = Boolean(configuration.get("PRIVATEID_AUTH_BASE_URL")?.trim());
 		const redirectUrlConfigured = Boolean(configuration.get("PRIVATEID_REDIRECT_URL")?.trim());
-		const oidcRedirectUriConfigured = Boolean(configuration.get("OIDC_BASE44_REDIRECT_URI")?.trim());
-		const oidcRedirectUrisConfigured = Boolean(configuration.get("OIDC_BASE44_REDIRECT_URIS")?.trim());
-		const redirectSourceConfigured = redirectUrlConfigured || oidcRedirectUriConfigured || oidcRedirectUrisConfigured;
-		const productionRedirectRequirementSatisfied = !configuration.isProduction() || redirectUrlConfigured;
+		const callbackUrlConfigured = Boolean(configuration.get("PRIVATEID_CALLBACK_URL")?.trim());
+		const redirectOriginsConfigured = Boolean(configuration.get("PRIVATEID_ALLOWED_REDIRECT_ORIGINS")?.trim());
 		const mockModeConfigured = Boolean(configuration.get("PRIVATEID_MOCK_MODE")?.trim());
 		const mockMode = featureFlags.isPrivateIdMockMode();
 		const webhookSharedSecretConfigured = Boolean(authConfiguration.webhookSharedSecret);
-		const configured = authApiConfigured && baseUrlConfigured && redirectSourceConfigured && productionRedirectRequirementSatisfied && webhookSharedSecretConfigured && mockModeConfigured;
+		const configured = authApiConfigured
+				&& baseUrlConfigured
+				&& redirectUrlConfigured
+				&& callbackUrlConfigured
+				&& redirectOriginsConfigured
+				&& webhookSharedSecretConfigured
+				&& mockModeConfigured;
 
 		if (!configured) {
 				return {
@@ -56,6 +62,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								authApiConfigured,
 								baseUrlConfigured,
 								redirectUrlConfigured,
+								callbackUrlConfigured,
+								redirectOriginsConfigured,
 								mockMode
 						},
 						privateIdReachable: false,
@@ -75,6 +83,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								authApiConfigured,
 								baseUrlConfigured,
 								redirectUrlConfigured,
+								callbackUrlConfigured,
+								redirectOriginsConfigured,
 								mockMode
 						},
 						privateIdReachable: true,
@@ -90,6 +100,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								authApiConfigured,
 								baseUrlConfigured,
 								redirectUrlConfigured,
+								callbackUrlConfigured,
+								redirectOriginsConfigured,
 								mockMode
 						},
 						privateIdReachable: false,

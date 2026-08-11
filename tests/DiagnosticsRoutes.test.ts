@@ -41,6 +41,8 @@ describe("Diagnostics routes", () => {
 											authApiConfigured: true,
 											baseUrlConfigured: true,
 											redirectUrlConfigured: true,
+											callbackUrlConfigured: true,
+											redirectOriginsConfigured: true,
 											mockMode: true
 								},
 								privateIdReachable: true,

@@ -168,9 +168,14 @@ export class ConfigurationService {
 						return;
 				}
 
-				const redirectUrl = this.get("PRIVATEID_REDIRECT_URL")?.trim();
-				if (!redirectUrl) {
-						throw new Error("Configuration validation failed: PRIVATEID_REDIRECT_URL is required in production");
+				const requiredKeys = ["PRIVATEID_REDIRECT_URL", "PRIVATEID_CALLBACK_URL"];
+				const missingKeys = requiredKeys.filter((key) => {
+						const value = this.get(key)?.trim();
+						return !value;
+				});
+
+				if (missingKeys.length > 0) {
+						throw new Error(`Missing required configuration:\n\n${missingKeys.join("\n\n")}`);
 				}
 		}
 

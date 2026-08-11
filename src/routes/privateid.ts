@@ -16,6 +16,7 @@ type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
 
 const PRIVATEID_WEBHOOK_STATUSES = new Set(["SUCCESS", "FAILURE", "PENDING", "REQUIRES_INPUT", "EXPIRED"]);
+const SENSITIVE_HEADERS = new Set(["x-storythink-webhook-secret", "authorization", "cookie", "set-cookie"]);
 
 function normalizedKey(value: string): string {
 		return value.replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -53,6 +54,36 @@ function pickObjectValue(payload: Record<string, unknown>, aliases: string[]): s
 		return undefined;
 }
 
+function sanitizeHeaders(headers: Record<string, unknown>): Record<string, unknown> {
+		const sanitized: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(headers)) {
+				if (SENSITIVE_HEADERS.has(key.toLowerCase())) {
+						sanitized[key] = "[REDACTED]";
+						continue;
+				}
+
+				sanitized[key] = value;
+		}
+
+		return sanitized;
+}
+
+function readHeader(headers: Record<string, unknown>, key: string): string | undefined {
+		const value = headers[key];
+		if (Array.isArray(value)) {
+				const first = value[0];
+				return typeof first === "string" ? first : undefined;
+		}
+
+		return typeof value === "string" ? value : undefined;
+}
+
+function resolveCorrelationId(requestId: string, headers: Record<string, unknown>): string {
+		return readHeader(headers, "x-correlation-id")
+				?? readHeader(headers, "x-request-id")
+				?? requestId;
+}
+
 function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string): AuthenticatedUser {
 		const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
@@ -66,22 +97,61 @@ function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: str
 }
 
 export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<void> {
+		app.log.info({ method: "POST", path: "/privateid/webhook" }, "PrivateID webhook endpoint registered at POST /privateid/webhook");
+
 		app.post("/privateid/webhook", async (request, reply) => {
+				const timestamp = new Date().toISOString();
 				const headers = request.headers;
 				const body = (request.body ?? {}) as WebhookBody;
+				const requestId = request.id;
+				const correlationId = resolveCorrelationId(requestId, headers as unknown as Record<string, unknown>);
+				const responseContext: {
+						sharedSecretValidated?: boolean;
+						parsedStatus?: string;
+						sessionId?: string;
+						transactionId?: string;
+						resolvedUserId?: string;
+						sessionCompleted?: boolean;
+				} = {};
+
+				const logWebhookResponse = (responseCode: number): void => {
+						app.log.info(
+								{
+									event: "privateid_webhook",
+									timestamp,
+									requestId,
+									correlationId,
+									sessionId: responseContext.sessionId,
+									transactionId: responseContext.transactionId,
+									status: responseContext.parsedStatus,
+									sharedSecretValidated: responseContext.sharedSecretValidated ?? false,
+									resolvedUserId: responseContext.resolvedUserId,
+									sessionCompleted: responseContext.sessionCompleted,
+									responseCode
+								},
+								"PrivateID webhook processed"
+						);
+				};
+
 				app.log.info(
 						{
-								path: request.url,
+								event: "privateid_webhook_received",
+								timestamp,
+								requestId,
+								correlationId,
 								method: request.method,
-								headers,
-								body
+								path: request.url,
+								headers: sanitizeHeaders(headers as unknown as Record<string, unknown>)
 						},
 						"PrivateID webhook received"
 				);
 
 				const configuredSecret = secretProvider.getPrivateIdAuthConfiguration().webhookSharedSecret;
 				if (!configuredSecret) {
+						responseContext.sharedSecretValidated = false;
+						responseContext.sessionCompleted = false;
 					reply.code(500);
+						logWebhookResponse(500);
 					return {
 							error: "server_configuration_error",
 							error_description: "PRIVATEID_WEBHOOK_SHARED_SECRET is not configured"
@@ -91,16 +161,23 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				const receivedSecretHeader = headers["x-storythink-webhook-secret"];
 				const receivedSecret = Array.isArray(receivedSecretHeader) ? receivedSecretHeader[0] : receivedSecretHeader;
 				if (typeof receivedSecret !== "string" || receivedSecret !== configuredSecret) {
+						responseContext.sharedSecretValidated = false;
+						responseContext.sessionCompleted = false;
 					reply.code(401);
+						logWebhookResponse(401);
 					return {
 							error: "unauthorized",
 							error_description: "Invalid webhook secret"
 					};
 				}
+				responseContext.sharedSecretValidated = true;
 
 				const status = pickObjectValue(body, ["status", "reason"]);
+				responseContext.parsedStatus = status;
 				if (!status || !PRIVATEID_WEBHOOK_STATUSES.has(status)) {
+						responseContext.sessionCompleted = false;
 					reply.code(400);
+						logWebhookResponse(400);
 					return {
 							error: "invalid_request",
 							error_description: "Webhook status must be one of SUCCESS, FAILURE, PENDING, REQUIRES_INPUT, EXPIRED"
@@ -109,18 +186,27 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				const sessionId = pickObjectValue(body, ["sessionId", "session_id", "sid"]);
 				const transactionId = pickObjectValue(body, ["transactionId", "transaction_id", "txId", "txnId"]);
+				responseContext.sessionId = sessionId;
+				responseContext.transactionId = transactionId;
 				const record = resolvePrivateIDSessionRecord(sessionId, transactionId);
 				if (!record) {
+						responseContext.sessionCompleted = false;
 					reply.code(202);
+						logWebhookResponse(202);
 					return {
 							status: "pending",
 							message: "Webhook accepted but no active PrivateID session was found yet"
 					};
 				}
+				responseContext.sessionId = record.session.sessionId;
+				responseContext.transactionId = record.session.transactionId;
+				responseContext.resolvedUserId = undefined;
+				responseContext.sessionCompleted = Boolean(record.session.completed);
 
 				if (status === "SUCCESS") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "ready", Date.now());
 						const privateIdUserId = pickObjectValue(body, ["privateIdUserId", "privateiduserid", "userId", "subject"]) ?? record.session.transactionId;
+						responseContext.resolvedUserId = privateIdUserId;
 						const result: PrivateIDResult = {
 								success: true,
 								privateIdUserId,
@@ -141,15 +227,20 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 						const authenticatedUser = createAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId);
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
+						responseContext.sessionCompleted = true;
 				} else if (status === "FAILURE") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
+						responseContext.sessionCompleted = true;
 				} else if (status === "EXPIRED") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "expired", Date.now());
+						responseContext.sessionCompleted = true;
 				} else {
 						updatePrivateIDSessionStatus(record.session.sessionId, "waiting");
+						responseContext.sessionCompleted = false;
 				}
 
 				reply.code(200);
+				logWebhookResponse(200);
 				return {
 						status,
 						sessionId: record.session.sessionId,
@@ -160,21 +251,17 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 		app.get("/privateid/callback", async (request, reply) => {
 				const query = (request.query ?? {}) as QueryRecord;
-				app.log.info(
-						{
-								path: request.url,
-								method: request.method,
-								query,
-								headers: request.headers
-						},
-						"PrivateID callback received"
-				);
+				const requestId = request.id;
+				const correlationId = resolveCorrelationId(requestId, request.headers as unknown as Record<string, unknown>);
 
 				const reason = pickQueryValue(query, ["reason", "status", "result"]);
 				const sessionId = pickQueryValue(query, ["sessionId", "session_id", "sid"]);
 				const transactionId = pickQueryValue(query, ["transactionId", "transaction_id", "txId", "txnId"]);
+				let callbackSessionId = sessionId;
+				let retry = false;
 
 				if (!reason) {
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
 						reply.code(400);
 						return {
 							error: "invalid_request",
@@ -183,6 +270,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				if (reason.trim().toLowerCase() !== "success") {
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
 					reply.code(200);
 					reply.type("text/plain");
 					return "authentication failed";
@@ -191,6 +279,8 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				const resolvedRecord = resolvePrivateIDSessionRecord(sessionId, transactionId);
 
 				if (!resolvedRecord) {
+					retry = true;
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
 					reply.code(202);
 					return {
 							status: "pending",
@@ -201,7 +291,10 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				const isComplete = resolvedRecord.session.status === "ready" && Boolean(resolvedRecord.session.completed);
+				callbackSessionId = resolvedRecord.session.sessionId;
 				if (!isComplete) {
+					retry = true;
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
 					reply.code(202);
 					return {
 							status: resolvedRecord.session.status,
@@ -214,6 +307,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				reply.code(200);
+				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
 				return {
 						status: resolvedRecord.session.status,
 						reason,

@@ -4,6 +4,25 @@ import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("PrivateID callback", () => {
+		it("returns processing when callback has no matching session", async () => {
+				const { app } = await buildOidcTestApp();
+
+				const response = await app.inject({
+						method: "GET",
+						url: "/privateid/callback?reason=success"
+				});
+
+				expect(response.statusCode).toBe(202);
+				const payload = response.json() as Record<string, unknown>;
+				expect(payload).toMatchObject({
+						status: "pending",
+						message: "Authentication still processing...",
+						retry: true
+				});
+
+				await app.close();
+		});
+
 		it("returns processing when callback arrives before webhook completion", async () => {
 				const { app } = await buildOidcTestApp();
 				const client = new PrivateIDClient();
@@ -84,6 +103,98 @@ describe("PrivateID callback", () => {
 						message: "Continue OIDC authorization"
 				});
 
+				await app.close();
+		});
+
+		it("accepts FAILURE webhook and marks session failed", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				const session = await client.createAuthenticationSession();
+
+				const webhookResponse = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "FAILURE",
+								sessionId: session.sessionId,
+								transactionId: session.transactionId
+						}
+				});
+
+				expect(webhookResponse.statusCode).toBe(200);
+				expect((await client.getSession()).status).toBe("failed");
+				await app.close();
+		});
+
+		it("accepts PENDING webhook and keeps session waiting", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				const session = await client.createAuthenticationSession();
+
+				const webhookResponse = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "PENDING",
+								sessionId: session.sessionId,
+								transactionId: session.transactionId
+						}
+				});
+
+				expect(webhookResponse.statusCode).toBe(200);
+				expect((await client.getSession()).status).toBe("waiting");
+				await app.close();
+		});
+
+		it("accepts REQUIRES_INPUT webhook and keeps session waiting", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				const session = await client.createAuthenticationSession();
+
+				const webhookResponse = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "REQUIRES_INPUT",
+								sessionId: session.sessionId,
+								transactionId: session.transactionId
+						}
+				});
+
+				expect(webhookResponse.statusCode).toBe(200);
+				expect((await client.getSession()).status).toBe("waiting");
+				await app.close();
+		});
+
+		it("accepts EXPIRED webhook and marks session expired", async () => {
+				const { app } = await buildOidcTestApp();
+				const client = new PrivateIDClient();
+				const session = await client.createAuthenticationSession();
+
+				const webhookResponse = await app.inject({
+						method: "POST",
+						url: "/privateid/webhook",
+						headers: {
+								"x-storythink-webhook-secret": "privateid-webhook-secret"
+						},
+						payload: {
+								status: "EXPIRED",
+								sessionId: session.sessionId,
+								transactionId: session.transactionId
+						}
+				});
+
+				expect(webhookResponse.statusCode).toBe(200);
+				expect((await client.getSession()).status).toBe("expired");
 				await app.close();
 		});
 

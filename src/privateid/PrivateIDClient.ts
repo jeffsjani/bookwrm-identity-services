@@ -51,7 +51,7 @@ export class PrivateIDClient {
 				const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl.slice(0, -1) : authBaseUrl;
 				const endpoint = `${normalizedAuthBaseUrl}/v2/verification-session`;
 				const redirectUrl = this.resolveRedirectUrl();
-				const callbackUrl = this.resolveCallbackUrl(redirectUrl);
+				const callbackUrl = this.resolveCallbackUrl();
 				const callbackHeaders = this.resolveCallbackHeaders();
 
 				const response = await fetch(endpoint, {
@@ -255,47 +255,28 @@ export class PrivateIDClient {
 		}
 
 		private resolveRedirectUrl(): string {
-				const explicitRedirectUrl = configuration.get("PRIVATEID_REDIRECT_URL")?.trim();
-				if (configuration.isProduction() && !explicitRedirectUrl) {
-						throw new Error("PrivateID redirect URL is required in production: set PRIVATEID_REDIRECT_URL");
+				const redirectUrl = configuration.get("PRIVATEID_REDIRECT_URL")?.trim();
+				if (!redirectUrl) {
+						throw new Error("Missing required configuration: PRIVATEID_REDIRECT_URL");
 				}
 
-				if (explicitRedirectUrl) {
-						return explicitRedirectUrl;
-				}
-
-				const base44RedirectUri = configuration.get("OIDC_BASE44_REDIRECT_URI")?.trim();
-				if (base44RedirectUri) {
-						return base44RedirectUri;
-				}
-
-				const configuredRedirectUris = configuration.get("OIDC_BASE44_REDIRECT_URIS")?.trim();
-				if (configuredRedirectUris) {
-						try {
-								const parsed = JSON.parse(configuredRedirectUris) as string[];
-								if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === "string") {
-										return parsed[0];
-								}
-						} catch {
-								const csvValue = configuredRedirectUris.split(",").map((entry) => entry.trim()).find((entry) => entry.length > 0);
-								if (csvValue) {
-										return csvValue;
-								}
-						}
-				}
-
-				throw new Error("PrivateID session API configuration missing redirect URL: set PRIVATEID_REDIRECT_URL, OIDC_BASE44_REDIRECT_URI, or OIDC_BASE44_REDIRECT_URIS");
+				return redirectUrl;
 		}
 
-		private resolveCallbackUrl(redirectUrl: string): string {
-				return configuration.get("PRIVATEID_CALLBACK_URL", redirectUrl) ?? redirectUrl;
+		private resolveCallbackUrl(): string {
+				const callbackUrl = configuration.get("PRIVATEID_CALLBACK_URL")?.trim();
+				if (!callbackUrl) {
+						throw new Error("Missing required configuration: PRIVATEID_CALLBACK_URL");
+				}
+
+				return callbackUrl;
 		}
 
 		private resolveCallbackHeaders(): Record<string, string> {
 				const headers: Record<string, string> = {};
 				const webhookSharedSecret = secretProvider.getPrivateIdAuthConfiguration().webhookSharedSecret;
 				if (webhookSharedSecret) {
-						headers["x-privateid-webhook-shared-secret"] = webhookSharedSecret;
+					headers["x-storythink-webhook-secret"] = webhookSharedSecret;
 				}
 
 				return headers;
