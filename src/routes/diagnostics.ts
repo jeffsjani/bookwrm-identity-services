@@ -21,6 +21,8 @@ type PrivateIdDiagnosticsResponse = {
 				redirectOriginsConfigured: boolean;
 				mockMode: boolean;
 		};
+		sessionType: "VERIFY";
+		requirements: string[];
 		privateIdReachable: boolean;
 		authenticationSessionCreated: boolean;
 		launchUrlReturned: boolean;
@@ -66,6 +68,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								redirectOriginsConfigured,
 								mockMode
 						},
+						sessionType: "VERIFY",
+						requirements: ["face"],
 						privateIdReachable: false,
 						authenticationSessionCreated: false,
 						launchUrlReturned: false,
@@ -87,6 +91,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								redirectOriginsConfigured,
 								mockMode
 						},
+						sessionType: "VERIFY",
+						requirements: ["face"],
 						privateIdReachable: true,
 						authenticationSessionCreated: true,
 						launchUrlReturned: Boolean(session.launchUrl),
@@ -104,6 +110,8 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 								redirectOriginsConfigured,
 								mockMode
 						},
+						sessionType: "VERIFY",
+						requirements: ["face"],
 						privateIdReachable: false,
 						authenticationSessionCreated: false,
 						launchUrlReturned: false,

@@ -53,6 +53,32 @@ export class PrivateIDClient {
 				const redirectUrl = this.resolveRedirectUrl();
 				const callbackUrl = this.resolveCallbackUrl();
 				const callbackHeaders = this.resolveCallbackHeaders();
+				const requestBody = {
+					type: "VERIFY",
+					requirements: ["face"],
+					redirectURL: redirectUrl,
+					enableDesktop: true,
+					callback: {
+							url: callbackUrl,
+							headers: callbackHeaders
+					}
+				};
+
+				const redactedCallbackHeaders = Object.fromEntries(
+						Object.keys(callbackHeaders).map((key) => [key, "[REDACTED]"])
+				);
+				console.info(
+						"[PrivateID] Session API request body",
+						JSON.stringify({
+								type: requestBody.type,
+								requirements: requestBody.requirements,
+								redirectURL: requestBody.redirectURL,
+								callback: {
+										url: requestBody.callback.url,
+										headers: redactedCallbackHeaders
+								}
+						})
+				);
 
 				const response = await fetch(endpoint, {
 						method: "POST",
@@ -60,15 +86,7 @@ export class PrivateIDClient {
 								"content-type": "application/json",
 								"x-api-key": authConfiguration.authApiKey as string
 						},
-						body: JSON.stringify({
-							type: "SIGN-IN",
-							redirectURL: redirectUrl,
-							enableDesktop: true,
-							callback: {
-									url: callbackUrl,
-									headers: callbackHeaders
-							}
-						})
+						body: JSON.stringify(requestBody)
 				});
 
 				const rawBody = await response.text();

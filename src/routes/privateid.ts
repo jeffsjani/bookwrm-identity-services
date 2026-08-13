@@ -8,6 +8,7 @@ import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
 import {
 		resolvePrivateIDSessionRecord,
 		storePrivateIDAuthenticatedUser,
+		storePrivateIDIdentityContext,
 		storePrivateIDResult,
 		updatePrivateIDSessionStatus
 } from "../privateid/PrivateIDSessionStore.js";
@@ -220,7 +221,8 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						storePrivateIDResult(record.session.sessionId, result);
 
 						try {
-								await identityService.resolveIdentity(privateIdUserId);
+								const identityContext = await identityService.resolveIdentity(privateIdUserId);
+								storePrivateIDIdentityContext(record.session.sessionId, identityContext);
 						} catch (error) {
 								app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
 						}
