@@ -703,9 +703,10 @@ export class OIDCService {
 				const keyConfig = configuration.getOIDCKeyConfiguration();
 				const hasPrivateKeyEnv = keyConfig.privateKey.length > 0;
 				const hasJwksEnv = Boolean(keyConfig.jwksJson);
+				const isLocalDevelopment = configuration.getEnvironment() !== "production";
 
-				if (hasInjectedKeys || hasPrivateKeyEnv || hasJwksEnv) {
-						return;
+				if (hasInjectedKeys || hasPrivateKeyEnv || hasJwksEnv || isLocalDevelopment) {
+					return;
 				}
 
 				throw new Error(

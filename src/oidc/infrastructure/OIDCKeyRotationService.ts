@@ -1,4 +1,4 @@
-import { createHash, createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, type KeyObject } from "node:crypto";
 
 import { configuration } from "../../config/ConfigurationService.js";
 import { oidcRedisKey, getRedisClient } from "./RedisInfrastructure.js";
@@ -28,6 +28,9 @@ export class OIDCKeyRotationService {
 
 				const rawJwks = configuration.get("OIDC_JWKS_JSON")?.trim();
 			if (!rawJwks) {
+				if (configuration.getEnvironment() !== "production") {
+					return [this.createGeneratedKeyRecord(0)];
+				}
 				return [];
 			}
 
@@ -148,6 +151,14 @@ export class OIDCKeyRotationService {
 
 		private normalizePem(raw: string): string {
 			return raw.replace(/\\n/g, "\n").trim();
+		}
+
+		private createGeneratedKeyRecord(index: number): KeyRecord {
+			const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+			const kid = this.createKid(publicKey, index);
+			const privateJwk = privateKey.export({ format: "jwk" }) as JsonWebKey;
+			const publicJwk = publicKey.export({ format: "jwk" }) as JsonWebKey;
+			return { privateJwk, publicJwk, kid };
 		}
 
 		private createKid(publicKey: KeyObject, index: number): string {

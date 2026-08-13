@@ -1,8 +1,84 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("Diagnostics routes", () => {
+		it("queries the Base44 identity API health endpoint with the configured API key", async () => {
+			const originalFetch = global.fetch;
+			const fetchMock = vi.fn().mockResolvedValue(new Response(
+				JSON.stringify({
+					success: true,
+					requestId: "req-123",
+					version: "v1",
+					data: { status: "ok" }
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "application/json" }
+				}
+			));
+			global.fetch = fetchMock as typeof fetch;
+
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+					method: "GET",
+					url: "/diagnostics/identityapi"
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(fetchMock).toHaveBeenCalledWith(
+					"https://identity.example.com/api/identity",
+					expect.objectContaining({
+						method: "POST",
+						headers: expect.objectContaining({
+							Authorization: "Bearer test-key",
+							"Content-Type": "application/json"
+						}),
+						body: JSON.stringify({ version: "v1", action: "health" })
+					})
+				);
+				expect(response.json()).toMatchObject({
+					configured: true,
+					authenticated: true,
+					identityApiReachable: true,
+					response: {
+						success: true,
+						data: { status: "ok" }
+					}
+				});
+			} finally {
+				global.fetch = originalFetch;
+				await app.close();
+			}
+		});
+
+		it("returns the upstream authentication failure body and status without wrapping it", async () => {
+			const originalFetch = global.fetch;
+			const body = JSON.stringify({
+				error: "Unauthorized",
+				message: "Invalid identity API key"
+			});
+			global.fetch = vi.fn().mockResolvedValue(new Response(body, {
+				status: 401,
+				headers: { "content-type": "application/json" }
+			})) as typeof fetch;
+
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+					method: "GET",
+					url: "/diagnostics/identityapi"
+				});
+
+				expect(response.statusCode).toBe(401);
+				expect(response.body).toBe(body);
+				expect(response.headers["content-type"]).toContain("application/json");
+			} finally {
+				global.fetch = originalFetch;
+				await app.close();
+			}
+		});
 		it("exposes the diagnostics and OIDC route catalog", async () => {
 				const { app } = await buildOidcTestApp();
 				try {

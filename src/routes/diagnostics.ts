@@ -126,6 +126,68 @@ export async function registerDiagnosticsRoutes(
 
 		app.get(
 
+				"/diagnostics/identityapi",
+
+				async (_request, reply)=>{
+						const baseUrl = configuration.getBase44BaseUrl();
+						const identityApiPath = configuration.getIdentityApiPath();
+						const identityApiKey = configuration.getIdentityApiKey();
+						const requestBody = JSON.stringify({
+							version: "v1",
+							action: "health"
+						});
+
+						try {
+							const response = await fetch(`${baseUrl}${identityApiPath}`, {
+								method: "POST",
+								headers: {
+									"Content-Type": "application/json",
+									Authorization: `Bearer ${identityApiKey}`
+								},
+								body: requestBody
+							});
+
+							const responseBody = await response.text();
+
+							if (!response.ok) {
+								reply.code(response.status);
+								const contentType = response.headers.get("content-type") ?? "application/json";
+								reply.header("content-type", contentType);
+								return responseBody;
+							}
+
+							let parsedBody: unknown = {};
+							if (responseBody.trim().length > 0) {
+								try {
+									parsedBody = JSON.parse(responseBody) as unknown;
+								} catch {
+									parsedBody = responseBody;
+								}
+							}
+
+							return {
+								configured: true,
+								authenticated: true,
+								identityApiReachable: true,
+								response: parsedBody
+							};
+						} catch (error) {
+							return reply.code(503).send({
+								configured: true,
+								authenticated: false,
+								identityApiReachable: false,
+								response: {
+									error: error instanceof Error ? error.message : "Base44 identity API unreachable"
+								}
+							});
+						}
+
+				}
+
+		);
+
+		app.get(
+
 				"/diagnostics/base44",
 
 				async ()=>{
@@ -285,6 +347,7 @@ export async function registerDiagnosticsRoutes(
 				async ()=>{
 						return {
 								diagnostics: [
+										"/diagnostics/identityapi",
 										"/diagnostics/base44",
 										"/diagnostics/context",
 										"/diagnostics/policies",
