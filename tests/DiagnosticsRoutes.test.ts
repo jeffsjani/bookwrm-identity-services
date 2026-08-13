@@ -1,8 +1,57 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { identityService } from "../src/identity/IdentityService.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("Diagnostics routes", () => {
+		it("routes /diagnostics/identityapi through identityService.health()", async () => {
+			const originalFetch = global.fetch;
+			const fetchMock = vi.fn().mockResolvedValue(new Response(
+				JSON.stringify({
+					success: true,
+					requestId: "req-123",
+					version: "v1",
+					data: { status: "ok" }
+				}),
+				{
+					status: 200,
+					headers: { "content-type": "application/json" }
+				}
+			));
+			global.fetch = fetchMock as typeof fetch;
+			const healthSpy = vi.spyOn(identityService, "health").mockResolvedValue({
+				success: true,
+				requestId: "req-123",
+				version: "v1",
+				data: { status: "ok" }
+			});
+
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+					method: "GET",
+					url: "/diagnostics/identityapi"
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(healthSpy).toHaveBeenCalledTimes(1);
+				expect(fetchMock).not.toHaveBeenCalled();
+				expect(response.json()).toMatchObject({
+					configured: true,
+					authenticated: true,
+					identityApiReachable: true,
+					response: {
+						success: true,
+						data: { status: "ok" }
+					}
+				});
+			} finally {
+				healthSpy.mockRestore();
+				global.fetch = originalFetch;
+				await app.close();
+			}
+		});
+
 		it("queries the Base44 identity API health endpoint with the configured API key", async () => {
 			const originalFetch = global.fetch;
 			const fetchMock = vi.fn().mockResolvedValue(new Response(
@@ -72,8 +121,17 @@ describe("Diagnostics routes", () => {
 				});
 
 				expect(response.statusCode).toBe(401);
-				expect(response.body).toBe(body);
-				expect(response.headers["content-type"]).toContain("application/json");
+				expect(response.json()).toMatchObject({
+					configured: true,
+					authenticated: false,
+					identityApiReachable: false,
+					response: {
+						error: "Unauthorized",
+						details: {
+							statusCode: 401
+						}
+					}
+				});
 			} finally {
 				global.fetch = originalFetch;
 				await app.close();

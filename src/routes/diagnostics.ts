@@ -129,55 +129,32 @@ export async function registerDiagnosticsRoutes(
 				"/diagnostics/identityapi",
 
 				async (_request, reply)=>{
-						const baseUrl = configuration.getBase44BaseUrl();
-						const identityApiPath = configuration.getIdentityApiPath();
-						const identityApiKey = configuration.getIdentityApiKey();
-						const requestBody = JSON.stringify({
-							version: "v1",
-							action: "health"
-						});
-
 						try {
-							const response = await fetch(`${baseUrl}${identityApiPath}`, {
-								method: "POST",
-								headers: {
-									"Content-Type": "application/json",
-									Authorization: `Bearer ${identityApiKey}`
-								},
-								body: requestBody
-							});
-
-							const responseBody = await response.text();
-
-							if (!response.ok) {
-								reply.code(response.status);
-								const contentType = response.headers.get("content-type") ?? "application/json";
-								reply.header("content-type", contentType);
-								return responseBody;
-							}
-
-							let parsedBody: unknown = {};
-							if (responseBody.trim().length > 0) {
-								try {
-									parsedBody = JSON.parse(responseBody) as unknown;
-								} catch {
-									parsedBody = responseBody;
-								}
-							}
+							const response = await identityService.health();
 
 							return {
 								configured: true,
 								authenticated: true,
 								identityApiReachable: true,
-								response: parsedBody
+								response
 							};
 						} catch (error) {
-							return reply.code(503).send({
+							const statusCode = typeof error === "object"
+								&& error !== null
+								&& "statusCode" in error
+								&& typeof error.statusCode === "number"
+								? error.statusCode
+								: 503;
+
+							return reply.code(statusCode).send({
 								configured: true,
 								authenticated: false,
 								identityApiReachable: false,
 								response: {
-									error: error instanceof Error ? error.message : "Base44 identity API unreachable"
+									error: error instanceof Error ? error.message : "Base44 identity API unreachable",
+									details: typeof error === "object" && error !== null && "details" in error
+									? error.details
+									: undefined
 								}
 							});
 						}

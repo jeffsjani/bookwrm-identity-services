@@ -51,8 +51,8 @@ describe("IdentityPlatformClient", () => {
         expect(init.method).toBe("POST");
         const body = JSON.parse(String(init.body));
         expect(body.action).toBe("health");
-        expect(infoSpy).toHaveBeenCalledTimes(1);
-        const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+        expect(infoSpy).toHaveBeenCalledTimes(2);
+        const logged = JSON.parse(String(infoSpy.mock.calls.find(([message]) => String(message).startsWith("{"))[0]));
         expect(logged.RequestId).toBe("req-123");
         expect(logged.Action).toBe("health");
         expect(logged.Success).toBe(true);
@@ -77,7 +77,7 @@ describe("IdentityPlatformClient", () => {
         const result = await client.getPolicies();
         expect(result).toEqual(responsePayload);
         expect(fetchMock).toHaveBeenCalledTimes(2);
-        const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+        const logged = JSON.parse(String(infoSpy.mock.calls.find(([message]) => String(message).startsWith("{"))[0]));
         expect(logged.Success).toBe(true);
         expect(logged.RetryCount).toBe(1);
         expect(logged.Action).toBe("getPolicies");
@@ -93,7 +93,7 @@ describe("IdentityPlatformClient", () => {
             statusCode: 401
         });
         expect(fetchMock).toHaveBeenCalledTimes(1);
-        const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+        const logged = JSON.parse(String(infoSpy.mock.calls.find(([message]) => String(message).startsWith("{"))[0]));
         expect(logged.Success).toBe(false);
         expect(logged.RetryCount).toBe(0);
         expect(logged.Action).toBe("getNotifications");
