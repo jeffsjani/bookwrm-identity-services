@@ -11,9 +11,19 @@ export type AuthenticationStatus = {
 		message?: string;
 };
 
+export type PendingAuthorizationContext = {
+		clientId: string;
+		redirectUri: string;
+		scope: string;
+		nonce: string;
+		codeChallenge: string;
+		state?: string;
+};
+
 export interface AuthenticationProvider {
 		authenticate(): Promise<AuthenticatedUser>;
 		cancel(): Promise<void>;
 		status(): Promise<AuthenticationStatus>;
 		logout(): Promise<void>;
+		setPendingAuthorizationContext?(context: PendingAuthorizationContext): void;
 }

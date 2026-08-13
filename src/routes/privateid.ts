@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
+import { oidcService } from "../oidc/OIDCService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
 import {
@@ -310,6 +311,13 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				reply.code(200);
 				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
+
+				const redirectUrl = await oidcService.resumePendingAuthorization(resolvedRecord.session.sessionId);
+				if (redirectUrl) {
+						reply.redirect(redirectUrl, 302);
+						return;
+				}
+
 				return {
 						status: resolvedRecord.session.status,
 						reason,

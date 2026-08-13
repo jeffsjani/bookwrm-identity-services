@@ -9,7 +9,7 @@ import {
 } from "node:crypto";
 import Provider from "oidc-provider";
 
-import type { AuthenticationProvider } from "../authentication/AuthenticationProvider.js";
+import type { AuthenticationProvider, AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
@@ -34,6 +34,7 @@ import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
 import { PrivateIDAuthenticationProvider } from "../privateid/PrivateIDAuthenticationProvider.js";
+import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser } from "../privateid/PrivateIDSessionStore.js";
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -335,6 +336,15 @@ export class OIDCService {
 										};
 								}
 
+								this.authenticationProvider.setPendingAuthorizationContext?.({
+										clientId,
+										redirectUri,
+										scope: query.scope ?? "",
+										nonce: query.nonce ?? "",
+										codeChallenge: codeChallenge ?? "",
+										state: query.state
+								});
+
 								const user = await this.authenticationProvider.authenticate();
 								userId = user.id;
 								await this.rateLimiter.assertWithinLimits({
@@ -342,26 +352,23 @@ export class OIDCService {
 										clientId,
 										userId
 								});
-								const authorizationCode = this.createAuthorizationCode();
 
-								await this.storeAuthorizationCode({
-								code: authorizationCode,
-								clientId,
-								redirectUri,
-								scope: query.scope ?? "",
-								nonce: query.nonce ?? "",
-								codeChallenge: codeChallenge ?? "",
-								userId: user.id
+								const redirectUrl = await this.issueAuthorizationRedirect(user, {
+										clientId,
+										redirectUri,
+										scope: query.scope ?? "",
+										nonce: query.nonce ?? "",
+										codeChallenge: codeChallenge ?? "",
+										state: query.state
 								});
 
-								const redirectTarget = new URL(redirectUri);
-								redirectTarget.searchParams.set("code", authorizationCode);
-
-								if (query.state) {
-										redirectTarget.searchParams.set("state", query.state);
+								// This request already completed the flow inline; drop any pending entry so a later callback can't resume it again.
+								const authenticationStatus = await this.authenticationProvider.status();
+								if (authenticationStatus.sessionId) {
+										consumePendingAuthorizationRequest(authenticationStatus.sessionId);
 								}
 
-								reply.redirect(redirectTarget.toString(), 302);
+								reply.redirect(redirectUrl, 302);
 						} catch (err) {
 								error = err instanceof Error ? err.message : "unknown_error";
 								throw err;
@@ -861,6 +868,44 @@ export class OIDCService {
 
 		private createAuthorizationCode(): string {
 				return randomBytes(32).toString("base64url");
+		}
+
+		private async issueAuthorizationRedirect(user: AuthenticatedUser, context: PendingAuthorizationContext): Promise<string> {
+				const authorizationCode = this.createAuthorizationCode();
+
+				await this.storeAuthorizationCode({
+						code: authorizationCode,
+						clientId: context.clientId,
+						redirectUri: context.redirectUri,
+						scope: context.scope,
+						nonce: context.nonce,
+						codeChallenge: context.codeChallenge,
+						userId: user.id
+				});
+
+				const redirectTarget = new URL(context.redirectUri);
+				redirectTarget.searchParams.set("code", authorizationCode);
+
+				if (context.state) {
+						redirectTarget.searchParams.set("state", context.state);
+				}
+
+				return redirectTarget.toString();
+		}
+
+		// Resumes the same authorization-code path /authorize uses once a PrivateID session completes.
+		async resumePendingAuthorization(privateIdSessionId: string): Promise<string | null> {
+				const pendingContext = consumePendingAuthorizationRequest(privateIdSessionId);
+				if (!pendingContext) {
+						return null;
+				}
+
+				const user = getPrivateIDAuthenticatedUser(privateIdSessionId);
+				if (!user) {
+						return null;
+				}
+
+				return this.issueAuthorizationRedirect(user, pendingContext);
 		}
 
 		private createOpaqueToken(): string {

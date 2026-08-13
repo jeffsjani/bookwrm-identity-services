@@ -1,10 +1,10 @@
 import { configuration } from "../config/ConfigurationService.js";
-import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus } from "../authentication/AuthenticationProvider.js";
+import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClient.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
-import { getPrivateIDAuthenticatedUser, storePrivateIDAuthenticatedUser } from "./PrivateIDSessionStore.js";
+import { getPrivateIDAuthenticatedUser, storePendingAuthorizationRequest, storePrivateIDAuthenticatedUser } from "./PrivateIDSessionStore.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,6 +27,11 @@ function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessio
 export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		private readonly client = new PrivateIDClient();
 		private statusSnapshot: AuthenticationStatus = { state: "idle" };
+		private pendingAuthorizationContext?: PendingAuthorizationContext;
+
+		setPendingAuthorizationContext(context: PendingAuthorizationContext): void {
+				this.pendingAuthorizationContext = context;
+		}
 
 		async completeCallback(payload: PrivateIDCallbackPayload): Promise<{ session: PrivateIDSession; user: AuthenticatedUser; result?: PrivateIDResult; }> {
 				const session = await this.client.handleCallback(payload);
@@ -49,6 +54,10 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		private async launchSession(): Promise<PrivateIDSession> {
 				this.statusSnapshot = { state: "initializing" };
 				const session = await this.client.createAuthenticationSession();
+				if (this.pendingAuthorizationContext) {
+						storePendingAuthorizationRequest(session.sessionId, this.pendingAuthorizationContext);
+						this.pendingAuthorizationContext = undefined;
+				}
 				this.statusSnapshot = { state: "waiting", sessionId: session.sessionId };
 				return session;
 		}

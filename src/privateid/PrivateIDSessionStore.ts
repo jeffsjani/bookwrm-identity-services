@@ -1,6 +1,6 @@
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
-import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
+import type { AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import type { ApiResponse } from "../models/ApiResponse.js";
 import type { IdentityContext } from "../models/IdentityContext.js";
 
@@ -13,6 +13,7 @@ export type PrivateIDSessionRecord = {
 
 const sessionRecords = new Map<string, PrivateIDSessionRecord>();
 const transactionIndex = new Map<string, string>();
+const pendingAuthorizationRequests = new Map<string, PendingAuthorizationContext>();
 let currentSessionId: string | undefined;
 
 export function storePrivateIDSession(session: PrivateIDSession): void {
@@ -71,6 +72,17 @@ export function storePrivateIDIdentityContext(sessionId: string, identityContext
 
 export function getPrivateIDIdentityContext(sessionId: string): ApiResponse<IdentityContext> | undefined {
 		return sessionRecords.get(sessionId)?.identityContext;
+}
+
+export function storePendingAuthorizationRequest(sessionId: string, context: PendingAuthorizationContext): void {
+		pendingAuthorizationRequests.set(sessionId, context);
+}
+
+// Retrieves and removes the pending request so it can only resume the flow once.
+export function consumePendingAuthorizationRequest(sessionId: string): PendingAuthorizationContext | undefined {
+		const context = pendingAuthorizationRequests.get(sessionId);
+		pendingAuthorizationRequests.delete(sessionId);
+		return context;
 }
 
 export function getCurrentPrivateIDSessionRecord(): PrivateIDSessionRecord | undefined {
