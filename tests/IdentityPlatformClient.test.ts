@@ -39,13 +39,56 @@ describe("IdentityPlatformClient", () => {
 				vi.unstubAllGlobals();
 		});
 
+it("logs the hashed API key and auth status before sending the request", async () => {
+				const responsePayload = {
+						success: true,
+						requestId: "upstream-1",
+						version: "v1",
+						data: {
+							status: "ok"
+						}
+				};
+
+				const fetchMock = vi.fn().mockResolvedValue(okResponse(responsePayload));
+				vi.stubGlobal("fetch", fetchMock);
+				vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue("req-123");
+				const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+				const IdentityPlatformClient = await loadClientClass();
+				const client = new IdentityPlatformClient();
+
+				await client.health();
+
+				expect(fetchMock).toHaveBeenCalledTimes(1);
+				const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+				expect(url).toBe("https://identity.example.com/api/identity");
+				expect(init.method).toBe("POST");
+				const body = JSON.parse(String(init.body));
+				expect(body.action).toBe("health");
+				expect(init.headers).toMatchObject({
+						"Content-Type": "application/json",
+						Authorization: "Bearer test-key"
+				});
+
+				expect(infoSpy).toHaveBeenCalled();
+				const terminalLog = String(infoSpy.mock.calls[0][0]);
+				expect(terminalLog).toContain("Identity API Request");
+				expect(terminalLog).toContain("URL: https://identity.example.com/api/identity");
+				expect(terminalLog).toContain("Action: health");
+				expect(terminalLog).toContain("Authorization Header: present");
+				expect(terminalLog).toMatch(/API Key SHA256: [0-9a-f]{12}/);
+				expect(terminalLog).not.toContain("test-key");
+				expect(terminalLog).not.toContain("Bearer test-key");
+				expect(terminalLog).not.toContain("BOOKWRM_IDENTITY_API_KEY");
+		});
+
 		it("returns JSON on successful health request and logs request metadata", async () => {
 				const responsePayload = {
 						success: true,
 						requestId: "upstream-1",
 						version: "v1",
 						data: {
-								status: "ok"
+							status: "ok"
 						}
 				};
 
@@ -67,8 +110,16 @@ describe("IdentityPlatformClient", () => {
 				const body = JSON.parse(String(init.body));
 				expect(body.action).toBe("health");
 
-				expect(infoSpy).toHaveBeenCalledTimes(1);
-				const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+				expect(infoSpy).toHaveBeenCalledTimes(2);
+				const preflightLog = String(infoSpy.mock.calls[0][0]);
+				expect(preflightLog).toContain("Identity API Request");
+				expect(preflightLog).toContain("URL: https://identity.example.com/api/identity");
+				expect(preflightLog).toContain("Action: health");
+				expect(preflightLog).toContain("Authorization Header: present");
+				expect(preflightLog).toMatch(/API Key SHA256: [0-9a-f]{12}/);
+				expect(preflightLog).not.toContain("test-key");
+
+				const logged = JSON.parse(String(infoSpy.mock.calls[1][0]));
 				expect(logged.RequestId).toBe("req-123");
 				expect(logged.Action).toBe("health");
 				expect(logged.Success).toBe(true);
@@ -98,7 +149,9 @@ describe("IdentityPlatformClient", () => {
 
 				expect(result).toEqual(responsePayload);
 				expect(fetchMock).toHaveBeenCalledTimes(2);
-				const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+				const jsonLog = infoSpy.mock.calls.find((call) => String(call[0]).trim().startsWith("{"));
+				expect(jsonLog).toBeDefined();
+				const logged = JSON.parse(String(jsonLog?.[0]));
 				expect(logged.Success).toBe(true);
 				expect(logged.RetryCount).toBe(1);
 				expect(logged.Action).toBe("getPolicies");
@@ -117,7 +170,9 @@ describe("IdentityPlatformClient", () => {
 						statusCode: 401
 				});
 				expect(fetchMock).toHaveBeenCalledTimes(1);
-				const logged = JSON.parse(String(infoSpy.mock.calls[0][0]));
+				const jsonLog = infoSpy.mock.calls.find((call) => String(call[0]).trim().startsWith("{"));
+				expect(jsonLog).toBeDefined();
+				const logged = JSON.parse(String(jsonLog?.[0]));
 				expect(logged.Success).toBe(false);
 				expect(logged.RetryCount).toBe(0);
 				expect(logged.Action).toBe("getNotifications");

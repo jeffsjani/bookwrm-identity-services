@@ -66,26 +66,38 @@ export class IdentityPlatformClient {
 						const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
 
 						try {
-								const response = await identityCircuitBreaker.execute(async () => {
-										return fetch(
-											`${configuration.getBase44BaseUrl()}${configuration.getIdentityApiPath()}`,
-											{
-												method: "POST",
-												headers: {
-														"Content-Type": "application/json",
-														Authorization:
-															`Bearer ${configuration.getIdentityApiKey()}`
-												},
-												signal: controller.signal,
-												body: JSON.stringify({
-														version: "v1",
-														action,
-														...payload
-												})
-											}
-										);
-								});
+							const apiKey = configuration.getIdentityApiKey();
+							const authorizationHeaderPresent = typeof apiKey === "string" && apiKey.length > 0;
+							const apiKeyHashBytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(apiKey));
+							const apiKeyHash = Array.from(new Uint8Array(apiKeyHashBytes))
+								.map((byte) => byte.toString(16).padStart(2, "0"))
+								.join("")
+								.slice(0, 12);
+							const requestUrl = `${configuration.getBase44BaseUrl()}${configuration.getIdentityApiPath()}`;
 
+							console.info([
+								"Identity API Request",
+								`URL: ${requestUrl}`,
+								`Action: ${action}`,
+								`Authorization Header: ${authorizationHeaderPresent ? "present" : "missing"}`,
+								`API Key SHA256: ${apiKeyHash}`
+							].join("\n"));
+
+							const response = await identityCircuitBreaker.execute(async () => {
+								return fetch(requestUrl, {
+									method: "POST",
+									headers: {
+										"Content-Type": "application/json",
+										Authorization: `Bearer ${apiKey}`
+									},
+									signal: controller.signal,
+									body: JSON.stringify({
+										version: "v1",
+										action,
+										...payload
+									})
+								});
+							});
 								clearTimeout(timeoutId);
 
 								if (!response.ok) {
