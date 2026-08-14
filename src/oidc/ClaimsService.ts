@@ -13,6 +13,10 @@ export class ClaimsService {
 
 		async toOIDCClaims(user: AuthenticatedUser): Promise<OIDCClaimsProfile> {
 				let subject = user.sub;
+				// TEMP-EMAIL-TRACE: Sprint 8.19.2
+				console.info("TEMP-EMAIL-TRACE ClaimsService.toOIDCClaims(entry) AuthenticatedUser", {
+						emailState: user.email === undefined ? "undefined" : user.email.length > 0 ? "present" : "empty"
+				});
 
 				try {
 						const context = await this.identityService.getIdentityContext(user.id);
@@ -23,11 +27,17 @@ export class ClaimsService {
 						// Keep OIDC auth flow available in development even if identity context is unavailable.
 				}
 
-				return {
+				const claims = {
 						sub: subject,
 						email: user.email,
 						emailVerified: user.emailVerified,
 						name: user.name
 				};
+				// TEMP-EMAIL-TRACE: Sprint 8.19.2
+				console.info("TEMP-EMAIL-TRACE ClaimsService.toOIDCClaims(exit) OIDCClaimsProfile", {
+						emailState: claims.email === undefined ? "undefined" : claims.email.length > 0 ? "present" : "empty"
+				});
+
+				return claims;
 		}
 }

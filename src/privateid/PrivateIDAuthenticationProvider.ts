@@ -13,6 +13,11 @@ function sleep(ms: number): Promise<void> {
 
 // Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
 function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
+		// TEMP-EMAIL-TRACE: Sprint 8.19.2
+		console.info("TEMP-EMAIL-TRACE PrivateIDAuthenticationProvider IdentityContext", {
+				emailState: identityContext === undefined ? "undefined" : identityContext.email ? "present" : "empty"
+		});
+
 		if (identityContext?.email) {
 				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
 		}
@@ -30,6 +35,8 @@ function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessio
 		const subjectId = result?.privateIdUserId ?? fallbackTransactionId;
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
 		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
+		// TEMP-EMAIL-TRACE: Sprint 8.19.2
+		console.info("TEMP-EMAIL-TRACE PrivateIDAuthenticationProvider AuthenticatedUser", { emailState: email.length > 0 ? "present" : "empty" });
 
 		return {
 				id: privateIdUserId,

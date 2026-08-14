@@ -1024,6 +1024,10 @@ export class OIDCService {
 			iat: number;
 			exp: number;
 		}): Record<string, unknown> {
+			// TEMP-EMAIL-TRACE: Sprint 8.19.2
+			console.info("TEMP-EMAIL-TRACE buildIdTokenPayload(input)", {
+				emailState: input.email === undefined ? "undefined" : input.email.length > 0 ? "present" : "empty"
+			});
 			return {
 				iss: input.issuer,
 				sub: input.subject,
