@@ -450,12 +450,14 @@ export class OIDCService {
 										userId: user
 								});
 
-								return {
+								const userInfoResponse = {
 										sub: tokenRecord.sub,
 										email: tokenRecord.email,
 										email_verified: tokenRecord.emailVerified,
 										name: tokenRecord.name
 								};
+								app.log.info(userInfoResponse, "TEMP-OIDC-USERINFO");
+								return userInfoResponse;
 						} catch (err) {
 								error = err instanceof Error ? err.message : "unknown_error";
 								throw err;
@@ -647,6 +649,17 @@ export class OIDCService {
 									clientId,
 									scope: codeRecord.scope
 							});
+						app.log.info({
+							sub: codeRecord.userId,
+							email: claims.email,
+							email_verified: claims.emailVerified,
+							name: claims.name,
+							preferred_username: claims.email,
+							iss: issuer,
+							aud: clientId,
+							scope: codeRecord.scope,
+							nonce: codeRecord.nonce
+						}, "TEMP-OIDC-IDTOKEN");
 							const idToken = await this.createIdToken({
 							issuer,
 							subject: codeRecord.userId,
@@ -661,6 +674,11 @@ export class OIDCService {
 
 							reply.code(200);
 							this.metrics.tokensIssued += 1;
+						app.log.info({
+							userId: codeRecord.userId,
+							email: claims.email,
+							emailVerified: claims.emailVerified
+						}, "TEMP-OIDC-TOKEN-ISSUED");
 							return {
 								token_type: "Bearer",
 								expires_in: 300,
