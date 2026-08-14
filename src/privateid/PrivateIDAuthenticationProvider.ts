@@ -35,6 +35,8 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 
 		// Used by the OIDC /authorize flow: creates the session and persists the pending context without polling for completion.
 		async beginAsyncAuthentication(): Promise<{ launchUrl: string; sessionId: string }> {
+				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
+				console.info("ENTER beginAsyncAuthentication");
 				const session = await this.launchSession();
 				return { launchUrl: session.launchUrl, sessionId: session.sessionId };
 		}
@@ -48,11 +50,15 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		}
 
 		async authenticate(): Promise<AuthenticatedUser> {
+				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
+				console.info("ENTER authenticate");
 				const session = await this.launchSession();
 				await this.waitForSession(session);
 
 				const timeoutMs = configuration.getNumber("PRIVATEID_POLL_TIMEOUT_MS", 30_000);
 				const pollIntervalMs = configuration.getNumber("PRIVATEID_POLL_INTERVAL_MS", 1000);
+				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
+				console.info("ENTER pollForResult");
 				const result = await this.pollForResult(session, timeoutMs, pollIntervalMs);
 				return await this.returnResult(result, session);
 		}

@@ -365,6 +365,8 @@ export class OIDCService {
 										throw new Error("Authentication provider does not support asynchronous authorization");
 								}
 
+								// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of which authentication method is invoked.
+								app.log.info("AUTH FLOW: beginAsyncAuthentication");
 								const asyncSession = await beginAsyncAuthentication();
 								app.log.info({ ...auditSnapshot(), stage: "privateid_session_created", sessionId: asyncSession.sessionId }, "PrivateID Session Created");
 								app.log.info({ ...auditSnapshot(), stage: "pending_authorization_stored", sessionId: asyncSession.sessionId }, "Pending Authorization Stored");
