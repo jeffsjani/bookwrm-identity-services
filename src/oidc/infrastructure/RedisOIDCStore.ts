@@ -5,6 +5,7 @@ import { getRedisClient, oidcRedisKey } from "./RedisInfrastructure.js";
 type AccessTokenRecord = {
 		sub: string;
 		email: string;
+		emailVerified: boolean;
 		name: string;
 		clientId: string;
 		expiresAt: number;

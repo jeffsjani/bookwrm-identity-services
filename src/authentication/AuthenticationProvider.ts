@@ -2,6 +2,7 @@ export type AuthenticatedUser = {
 		id: string;
 		sub: string;
 		email: string;
+		emailVerified: boolean;
 		name: string;
 };
 

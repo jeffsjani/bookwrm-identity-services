@@ -24,6 +24,7 @@ export class MockAuthenticationProvider implements AuthenticationProvider {
 						id,
 						sub: id,
 						email,
+						emailVerified: true,
 						name
 				};
 		}

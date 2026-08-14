@@ -1,5 +1,6 @@
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
+import type { IdentityContext } from "../models/IdentityContext.js";
 import { identityService } from "../identity/IdentityService.js";
 import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClient.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
@@ -10,16 +11,31 @@ function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessionId: string, fallbackTransactionId: string): AuthenticatedUser {
+// Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
+function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
+		if (identityContext?.email) {
+				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
+		}
+
+		if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
+				const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
+				return { email: fallbackEmail, emailVerified: true };
+		}
+
+		return { email: "", emailVerified: false };
+}
+
+function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const privateIdUserId = result?.privateIdUserId ?? fallbackSessionId;
 		const subjectId = result?.privateIdUserId ?? fallbackTransactionId;
-		const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
+		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
 
 		return {
 				id: privateIdUserId,
 				sub: subjectId,
-				email: fallbackEmail,
+				email,
+				emailVerified,
 				name: fallbackName
 		};
 }
@@ -113,9 +129,11 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 						return existingAuthenticatedUser;
 				}
 
+				let resolvedIdentityContext: IdentityContext | undefined;
 				if (result?.privateIdUserId) {
 						try {
-								await identityService.resolveIdentity(result.privateIdUserId);
+								const identityContext = await identityService.resolveIdentity(result.privateIdUserId);
+								resolvedIdentityContext = identityContext.data;
 						} catch (error) {
 								this.statusSnapshot = {
 										state: "ready",
@@ -125,7 +143,7 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 						}
 				}
 
-				const authenticatedUser = toAuthenticatedUser(result, session.sessionId, session.transactionId);
+				const authenticatedUser = toAuthenticatedUser(result, session.sessionId, session.transactionId, resolvedIdentityContext);
 				storePrivateIDAuthenticatedUser(session.sessionId, authenticatedUser);
 				return authenticatedUser;
 		}

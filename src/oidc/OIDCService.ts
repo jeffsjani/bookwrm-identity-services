@@ -453,6 +453,7 @@ export class OIDCService {
 								return {
 										sub: tokenRecord.sub,
 										email: tokenRecord.email,
+										email_verified: tokenRecord.emailVerified,
 										name: tokenRecord.name
 								};
 						} catch (err) {
@@ -614,47 +615,51 @@ export class OIDCService {
 								const now = Math.floor(Date.now() / 1000);
 								const issuer = this.resolveIssuer();
 								// Sprint 8.15: the code record already reflects the PrivateID-authenticated user; no re-authentication needed.
-								const authenticatedUser: AuthenticatedUser = {
-										id: codeRecord.userId,
-										sub: codeRecord.userSub,
-										email: codeRecord.userEmail,
-										name: codeRecord.userName
-								};
-								user = authenticatedUser.id;
-								await this.rateLimiter.assertWithinLimits({
-										ip: request.ip,
-										clientId,
-										userId: user
-								});
+							const authenticatedUser: AuthenticatedUser = {
+									id: codeRecord.userId,
+									sub: codeRecord.userSub,
+									email: codeRecord.userEmail,
+									emailVerified: codeRecord.userEmailVerified,
+									name: codeRecord.userName
+							};
+							user = authenticatedUser.id;
+							await this.rateLimiter.assertWithinLimits({
+									ip: request.ip,
+									clientId,
+									userId: user
+							});
 
-								const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
+							const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
-								const accessToken = this.createOpaqueToken();
-								const refreshToken = this.createOpaqueToken();
-								await this.storeAccessToken(accessToken, {
-										sub: claims.sub,
-										email: claims.email,
-										name: claims.name,
-										clientId
-								});
-								await this.storeRefreshToken(refreshToken, {
-										userId: codeRecord.userId,
-										clientId,
-										scope: codeRecord.scope
-								});
-								const idToken = await this.createIdToken({
-								issuer,
-								subject: codeRecord.userId,
-								audience: clientId,
-								nonce: codeRecord.nonce,
-								scope: codeRecord.scope,
-								iat: now,
-								exp: now + 300
-								});
+							const accessToken = this.createOpaqueToken();
+							const refreshToken = this.createOpaqueToken();
+							await this.storeAccessToken(accessToken, {
+									sub: claims.sub,
+									email: claims.email,
+									emailVerified: claims.emailVerified,
+									name: claims.name,
+									clientId
+							});
+							await this.storeRefreshToken(refreshToken, {
+									userId: codeRecord.userId,
+									clientId,
+									scope: codeRecord.scope
+							});
+							const idToken = await this.createIdToken({
+							issuer,
+							subject: codeRecord.userId,
+							audience: clientId,
+							nonce: codeRecord.nonce,
+							scope: codeRecord.scope,
+							email: claims.email,
+							emailVerified: claims.emailVerified,
+							iat: now,
+							exp: now + 300
+						});
 
-								reply.code(200);
-								this.metrics.tokensIssued += 1;
-								return {
+							reply.code(200);
+							this.metrics.tokensIssued += 1;
+							return {
 								token_type: "Bearer",
 								expires_in: 300,
 								access_token: accessToken,
@@ -903,6 +908,7 @@ export class OIDCService {
 						userId: user.id,
 						userSub: user.sub,
 						userEmail: user.email,
+						userEmailVerified: user.emailVerified,
 						userName: user.name
 				});
 
@@ -993,6 +999,8 @@ export class OIDCService {
 				audience: string;
 				nonce: string;
 				scope: string;
+				email: string;
+				emailVerified: boolean;
 				iat: number;
 				exp: number;
 		}): Promise<string> {
@@ -1003,6 +1011,8 @@ export class OIDCService {
 						aud: input.audience,
 						nonce: input.nonce,
 						scope: input.scope,
+						email: input.email,
+						email_verified: input.emailVerified,
 						iat: input.iat,
 						exp: input.exp
 				};

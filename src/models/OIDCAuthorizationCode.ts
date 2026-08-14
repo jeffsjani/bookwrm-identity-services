@@ -8,6 +8,7 @@ export type OIDCAuthorizationCode = {
 		userId: string;
 		userSub: string;
 		userEmail: string;
+		userEmailVerified: boolean;
 		userName: string;
 		expiresAt: number;
 		consumed: boolean;

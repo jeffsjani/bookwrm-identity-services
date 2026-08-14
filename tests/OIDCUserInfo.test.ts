@@ -33,7 +33,7 @@ describe("OIDCUserInfo", () => {
 				vi.unstubAllGlobals();
 		});
 
-		it("returns only sub, email, and name for valid access token", async () => {
+		it("returns sub, email, email_verified, and name for valid access token", async () => {
 				mockIdentityContextFetch();
 				const { app } = await buildOidcTestApp();
 				const verifier = "userinfo-verifier-123456789";
@@ -52,9 +52,10 @@ describe("OIDCUserInfo", () => {
 				expect(userInfoResponse.statusCode).toBe(200);
 				const payload = userInfoResponse.json() as Record<string, unknown>;
 				expect(payload).toEqual({
-						sub: "dev-user-1",
-						email: "dev.user@bookwrm.local",
-						name: "Dev User"
+					sub: "dev-user-1",
+					email: "dev.user@bookwrm.local",
+					email_verified: true,
+					name: "Dev User"
 				});
 
 				await app.close();

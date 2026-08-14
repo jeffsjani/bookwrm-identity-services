@@ -4,6 +4,7 @@ import type { AuthenticatedUser } from "../authentication/AuthenticationProvider
 export type OIDCClaimsProfile = {
 		sub: string;
 		email: string;
+		emailVerified: boolean;
 		name: string;
 };
 
@@ -25,6 +26,7 @@ export class ClaimsService {
 				return {
 						sub: subject,
 						email: user.email,
+						emailVerified: user.emailVerified,
 						name: user.name
 				};
 		}

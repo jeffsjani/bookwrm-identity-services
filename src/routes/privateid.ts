@@ -6,6 +6,7 @@ import { identityService } from "../identity/IdentityService.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
+import type { IdentityContext } from "../models/IdentityContext.js";
 import {
 		resolvePrivateIDSessionRecord,
 		storePrivateIDAuthenticatedUser,
@@ -86,16 +87,31 @@ function resolveCorrelationId(requestId: string, headers: Record<string, unknown
 				?? requestId;
 }
 
-function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string): AuthenticatedUser {
-		const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
+function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
+		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
 
 		return {
 				id: privateIdUserId || fallbackSessionId,
 				sub: privateIdUserId || fallbackTransactionId,
-				email: fallbackEmail,
+				email,
+				emailVerified,
 				name: fallbackName
 		};
+}
+
+// Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
+function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
+		if (identityContext?.email) {
+				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
+		}
+
+		if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
+				const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
+				return { email: fallbackEmail, emailVerified: true };
+		}
+
+		return { email: "", emailVerified: false };
 }
 
 export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<void> {
@@ -221,14 +237,16 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						};
 						storePrivateIDResult(record.session.sessionId, result);
 
-						try {
-								const identityContext = await identityService.resolveIdentity(privateIdUserId);
-								storePrivateIDIdentityContext(record.session.sessionId, identityContext);
-						} catch (error) {
-								app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
-						}
+					let resolvedIdentityContext: IdentityContext | undefined;
+					try {
+							const identityContext = await identityService.resolveIdentity(privateIdUserId);
+							storePrivateIDIdentityContext(record.session.sessionId, identityContext);
+							resolvedIdentityContext = identityContext.data;
+					} catch (error) {
+							app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
+					}
 
-						const authenticatedUser = createAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId);
+					const authenticatedUser = createAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
 				} else if (status === "FAILURE") {
