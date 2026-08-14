@@ -340,6 +340,8 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/oidc",
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/oidc/base44",
+										"/diagnostics/idtoken",
+										"/diagnostics/userinfo",
 										"/diagnostics/routes"
 								],
 								oidc: [
@@ -366,6 +368,54 @@ export async function registerDiagnosticsRoutes(
 				async ()=>{
 						return oidcService.getBase44IntegrationStatus();
 
+				}
+
+		);
+
+		// TEMP-DIAGNOSTIC: Sprint 8.19 - proves the actual runtime ID Token claims for a given access token, unsigned.
+		app.get(
+
+				"/diagnostics/idtoken",
+
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						if (!authorization || !authorization.startsWith("Bearer ")) {
+								reply.code(401);
+								return { error: "invalid_token", error_description: "Bearer access token is required" };
+						}
+
+						const accessToken = authorization.slice("Bearer ".length).trim();
+						const claims = await oidcService.getDiagnosticIdTokenClaims(accessToken);
+						if (!claims) {
+								reply.code(401);
+								return { error: "invalid_token", error_description: "Access token is invalid or expired" };
+						}
+
+						return claims;
+				}
+
+		);
+
+		// TEMP-DIAGNOSTIC: Sprint 8.19 - proves the actual runtime /userinfo response for a given access token.
+		app.get(
+
+				"/diagnostics/userinfo",
+
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						if (!authorization || !authorization.startsWith("Bearer ")) {
+								reply.code(401);
+								return { error: "invalid_token", error_description: "Bearer access token is required" };
+						}
+
+						const accessToken = authorization.slice("Bearer ".length).trim();
+						const claims = await oidcService.getDiagnosticUserInfoClaims(accessToken);
+						if (!claims) {
+								reply.code(401);
+								return { error: "invalid_token", error_description: "Access token is invalid or expired" };
+						}
+
+						return claims;
 				}
 
 		);

@@ -8,6 +8,8 @@ type AccessTokenRecord = {
 		emailVerified: boolean;
 		name: string;
 		clientId: string;
+		nonce: string;
+		scope: string;
 		expiresAt: number;
 };
 

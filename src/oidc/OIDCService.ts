@@ -638,7 +638,9 @@ export class OIDCService {
 									email: claims.email,
 									emailVerified: claims.emailVerified,
 									name: claims.name,
-									clientId
+									clientId,
+									nonce: codeRecord.nonce,
+									scope: codeRecord.scope
 							});
 							await this.storeRefreshToken(refreshToken, {
 									userId: codeRecord.userId,
@@ -993,46 +995,61 @@ export class OIDCService {
 				return true;
 		}
 
-		private async createIdToken(input: {
-				issuer: string;
-				subject: string;
-				audience: string;
-				nonce: string;
-				scope: string;
-				email: string;
-				emailVerified: boolean;
-				iat: number;
-				exp: number;
-		}): Promise<string> {
-				const signing = await this.getSigningMaterial();
-				const payload = {
-						iss: input.issuer,
-						sub: input.subject,
-						aud: input.audience,
-						nonce: input.nonce,
-						scope: input.scope,
-						email: input.email,
-						email_verified: input.emailVerified,
-						iat: input.iat,
-						exp: input.exp
-				};
-
-				const header = {
-						alg: "RS256",
-						typ: "JWT",
-						kid: signing.kid
-				};
-
-				const encodedHeader = this.base64UrlJson(header);
-				const encodedPayload = this.base64UrlJson(payload);
-				const signingInput = `${encodedHeader}.${encodedPayload}`;
-				const signer = createSign("RSA-SHA256");
-				signer.update(signingInput);
-				signer.end();
-				const signature = signer.sign(signing.privateKey).toString("base64url");
-
-				return `${signingInput}.${signature}`;
+		private buildIdTokenPayload(input: {
+			issuer: string;
+			subject: string;
+			audience: string;
+			nonce: string;
+			scope: string;
+			email: string;
+			emailVerified: boolean;
+			iat: number;
+			exp: number;
+		}): Record<string, unknown> {
+			return {
+				iss: input.issuer,
+				sub: input.subject,
+				aud: input.audience,
+				nonce: input.nonce,
+				scope: input.scope,
+				email: input.email,
+				email_verified: input.emailVerified,
+				iat: input.iat,
+				exp: input.exp
+			};
 		}
+
+		private async createIdToken(input: {
+			issuer: string;
+			subject: string;
+			audience: string;
+			nonce: string;
+			scope: string;
+			email: string;
+			emailVerified: boolean;
+			iat: number;
+			exp: number;
+		}): Promise<string> {
+			const signing = await this.getSigningMaterial();
+			const payload = this.buildIdTokenPayload(input);
+
+			const header = {
+				alg: "RS256",
+				typ: "JWT",
+				kid: signing.kid
+			};
+
+			const encodedHeader = this.base64UrlJson(header);
+			const encodedPayload = this.base64UrlJson(payload);
+			const signingInput = `${encodedHeader}.${encodedPayload}`;
+			const signer = createSign("RSA-SHA256");
+			signer.update(signingInput);
+			signer.end();
+			const signature = signer.sign(signing.privateKey).toString("base64url");
+
+			return `${signingInput}.${signature}`;
+		}
+
 
 		// RFC 6749 §2.3.1: decodes an HTTP Basic Authorization header into client_secret_basic credentials.
 		private parseBasicClientCredentials(authorizationHeader?: string): { clientId: string; clientSecret: string } | undefined {
@@ -1096,6 +1113,45 @@ export class OIDCService {
 
 		private async getAccessTokenRecord(accessToken: string): Promise<AccessTokenRecord | null> {
 				return this.redisStore.getAccessTokenRecord(accessToken);
+		}
+
+		// TEMP-DIAGNOSTIC: Sprint 8.19 - returns the unsigned ID Token claims /token would embed for this access token.
+		async getDiagnosticIdTokenClaims(accessToken: string): Promise<Record<string, unknown> | null> {
+				const tokenRecord = await this.getAccessTokenRecord(accessToken);
+				if (!tokenRecord) {
+						return null;
+				}
+
+				const now = Math.floor(Date.now() / 1000);
+				return {
+						...this.buildIdTokenPayload({
+								issuer: this.resolveIssuer(),
+								subject: tokenRecord.sub,
+								audience: tokenRecord.clientId,
+								nonce: tokenRecord.nonce,
+								scope: tokenRecord.scope,
+								email: tokenRecord.email,
+								emailVerified: tokenRecord.emailVerified,
+								iat: now,
+								exp: now + 300
+						}),
+						preferred_username: tokenRecord.email
+				};
+		}
+
+		// TEMP-DIAGNOSTIC: Sprint 8.19 - returns exactly what /userinfo returns for this access token.
+		async getDiagnosticUserInfoClaims(accessToken: string): Promise<{ sub: string; email: string; email_verified: boolean; name: string } | null> {
+				const tokenRecord = await this.getAccessTokenRecord(accessToken);
+				if (!tokenRecord) {
+						return null;
+				}
+
+				return {
+						sub: tokenRecord.sub,
+						email: tokenRecord.email,
+						email_verified: tokenRecord.emailVerified,
+						name: tokenRecord.name
+				};
 		}
 
 		private async storeRefreshToken(refreshToken: string, tokenRecord: Omit<RefreshTokenRecord, "expiresAt">): Promise<void> {
