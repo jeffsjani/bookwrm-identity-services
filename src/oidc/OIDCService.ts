@@ -481,9 +481,13 @@ export class OIDCService {
 						const grantType = body.grant_type;
 						const code = body.code?.trim();
 						const redirectUri = body.redirect_uri?.trim();
-						const clientId = body.client_id?.trim();
-						const clientSecret = body.client_secret?.trim();
 						const codeVerifier = body.code_verifier?.trim();
+
+						// RFC 6749 §2.3.1: client_secret_basic credentials arrive via the Authorization header and take precedence over the request body.
+						const basicCredentials = this.parseBasicClientCredentials(request.headers.authorization);
+						const clientId = basicCredentials?.clientId ?? body.client_id?.trim();
+						const clientSecret = basicCredentials?.clientSecret ?? body.client_secret?.trim();
+						const tokenAuthMethodUsed = basicCredentials ? "client_secret_basic" : "client_secret_post";
 
 						try {
 								await this.rateLimiter.assertWithinLimits({
@@ -501,13 +505,24 @@ export class OIDCService {
 										};
 								}
 
-								if (!code || !redirectUri || !clientId) {
+								if (!code || !redirectUri) {
 										reply.code(400);
-										error = "code, redirect_uri, and client_id are required";
+										error = "code and redirect_uri are required";
 										return {
 												error: "invalid_request",
-												error_description: "code, redirect_uri, and client_id are required"
+												error_description: "code and redirect_uri are required"
 										};
+								}
+
+								// TEMP-AUDIT-LOG: Sprint 8.16 - runtime proof of token endpoint client authentication method.
+								if (clientId) {
+										app.log.info(`TOKEN AUTH METHOD: ${tokenAuthMethodUsed}`);
+								}
+
+								if (!clientId) {
+										reply.code(400);
+										error = "Client authentication failed: no client_id supplied";
+										return { error: "invalid_client", error_description: "Client authentication failed: no client_id supplied" };
 								}
 
 								const codeRecord = await this.lockService.withAuthorizationCodeLock(code, async () => {
@@ -1007,6 +1022,46 @@ export class OIDCService {
 				const signature = signer.sign(signing.privateKey).toString("base64url");
 
 				return `${signingInput}.${signature}`;
+		}
+
+		// RFC 6749 §2.3.1: decodes an HTTP Basic Authorization header into client_secret_basic credentials.
+		private parseBasicClientCredentials(authorizationHeader?: string): { clientId: string; clientSecret: string } | undefined {
+				if (!authorizationHeader || !authorizationHeader.startsWith("Basic ")) {
+						return undefined;
+				}
+
+				const encoded = authorizationHeader.slice("Basic ".length).trim();
+				if (!encoded) {
+						return undefined;
+				}
+
+				let decoded: string;
+				try {
+						decoded = Buffer.from(encoded, "base64").toString("utf8");
+				} catch {
+						return undefined;
+				}
+
+				const separatorIndex = decoded.indexOf(":");
+				if (separatorIndex === -1) {
+						return undefined;
+				}
+
+				const clientId = this.tryDecodeUriComponent(decoded.slice(0, separatorIndex));
+				const clientSecret = this.tryDecodeUriComponent(decoded.slice(separatorIndex + 1));
+				if (!clientId) {
+						return undefined;
+				}
+
+				return { clientId, clientSecret };
+		}
+
+		private tryDecodeUriComponent(value: string): string {
+				try {
+						return decodeURIComponent(value);
+				} catch {
+						return value;
+				}
 		}
 
 		private async getSigningMaterial(): Promise<{ privateKey: KeyObject; kid: string }> {
