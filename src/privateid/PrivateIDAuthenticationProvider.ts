@@ -6,6 +6,7 @@ import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClien
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
 import { getPrivateIDAuthenticatedUser, storePendingAuthorizationRequest, storePrivateIDAuthenticatedUser } from "./PrivateIDSessionStore.js";
+import { linkPrivateIdSession } from "../oidc/CorrelationStore.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
@@ -57,16 +58,30 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 		}
 
 		// Used by the OIDC /authorize flow: creates the session and persists the pending context without polling for completion.
-		async beginAsyncAuthentication(): Promise<{ launchUrl: string; sessionId: string }> {
+		async beginAsyncAuthentication(correlationId: string): Promise<{ launchUrl: string; sessionId: string }> {
 				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
 				console.info("ENTER beginAsyncAuthentication");
-				const session = await this.launchSession();
+				const session = await this.launchSession(correlationId);
+				// Log the exact PrivateID sessionId to compare against incoming webhook sessionIds.
+				console.info("[PrivateID] beginAsyncAuthentication sessionId", { sessionId: session.sessionId, transactionId: session.transactionId, correlationId });
 				return { launchUrl: session.launchUrl, sessionId: session.sessionId };
 		}
 
 		async completeCallback(payload: PrivateIDCallbackPayload): Promise<{ session: PrivateIDSession; user: AuthenticatedUser; result?: PrivateIDResult; }> {
 				const session = await this.client.handleCallback(payload);
 				const result = await this.client.getResult();
+
+				// TEMP-PRIVATEID-RESULT: Sprint 9.4 - identity-only fields returned by PrivateID after face match; no secrets/biometric data.
+				const rawIdentityFields = (result?.rawResponse ?? {}) as Record<string, unknown>;
+				console.info("TEMP-PRIVATEID-RESULT", {
+						privateIdUserId: result?.privateIdUserId,
+						email: rawIdentityFields.email,
+						emailVerified: rawIdentityFields.emailVerified ?? rawIdentityFields.email_verified,
+						name: rawIdentityFields.name,
+						transactionId: result?.transactionId,
+						sessionId: result?.sessionId
+				});
+
 				const user = await this.returnResult(result, session);
 				this.statusSnapshot = { state: "ready", sessionId: session.sessionId };
 				return { session, user, result: result ?? undefined };
@@ -86,12 +101,15 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 				return await this.returnResult(result, session);
 		}
 
-		private async launchSession(): Promise<PrivateIDSession> {
+		private async launchSession(correlationId?: string): Promise<PrivateIDSession> {
 				this.statusSnapshot = { state: "initializing" };
-				const session = await this.client.createAuthenticationSession();
+				const session = await this.client.createAuthenticationSession(correlationId);
 				if (this.pendingAuthorizationContext) {
 						storePendingAuthorizationRequest(session.sessionId, this.pendingAuthorizationContext);
 						this.pendingAuthorizationContext = undefined;
+				}
+				if (correlationId) {
+						linkPrivateIdSession(correlationId, session.sessionId);
 				}
 				this.statusSnapshot = { state: "waiting", sessionId: session.sessionId };
 				return session;

@@ -17,7 +17,7 @@ export type PrivateIDCallbackPayload = {
 export class PrivateIDClient {
 		private currentSessionId?: string;
 
-		async createAuthenticationSession(): Promise<PrivateIDSession> {
+		async createAuthenticationSession(correlationId?: string): Promise<PrivateIDSession> {
 				const now = Date.now();
 				const transactionId = randomUUID();
 				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
@@ -33,8 +33,7 @@ export class PrivateIDClient {
 								created: now
 						};
 						storePrivateIDSession(session);
-						this.currentSessionId = session.sessionId;
-
+						this.currentSessionId = session.sessionId;					console.info("[PrivateID] Created session (mock mode)", { sessionId: session.sessionId, transactionId });
 						return session;
 				}
 
@@ -61,7 +60,9 @@ export class PrivateIDClient {
 					callback: {
 							url: callbackUrl,
 							headers: callbackHeaders
-					}
+					},
+					// No userId/email: identity is unknown at session creation, only correlationId is passed.
+					...(correlationId ? { metadata: { correlationId } } : {})
 				};
 
 				const redactedCallbackHeaders = Object.fromEntries(
@@ -77,6 +78,20 @@ export class PrivateIDClient {
 										url: requestBody.callback.url,
 										headers: redactedCallbackHeaders
 								}
+						})
+				);
+
+				// TEMP: diagnostic-only logging of the exact POST /v2/verification-session payload; no secrets/API keys included.
+				const requestBodyForLogging = requestBody as unknown as Record<string, unknown>;
+				console.info(
+						"TEMP-PRIVATEID-CREATE-SESSION",
+						JSON.stringify({
+								type: requestBodyForLogging.type,
+								requirements: requestBodyForLogging.requirements,
+								redirectURL: requestBodyForLogging.redirectURL,
+								callbackUrl: callbackUrl,
+								metadata: requestBodyForLogging.metadata,
+								sessionType: requestBodyForLogging.sessionType
 						})
 				);
 
@@ -109,6 +124,7 @@ export class PrivateIDClient {
 				}
 				storePrivateIDSession(session);
 				this.currentSessionId = session.sessionId;
+				console.info("[PrivateID] Created session (PrivateID API)", { sessionId: session.sessionId, transactionId });
 
 				return session;
 		}

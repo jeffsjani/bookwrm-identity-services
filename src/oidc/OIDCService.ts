@@ -5,6 +5,7 @@ import {
 		createPublicKey,
 		createSign,
 		randomBytes,
+		randomUUID,
 		type KeyObject
 } from "node:crypto";
 import Provider from "oidc-provider";
@@ -35,6 +36,7 @@ import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
 import { PrivateIDAuthenticationProvider } from "../privateid/PrivateIDAuthenticationProvider.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser } from "../privateid/PrivateIDSessionStore.js";
+import { storeCorrelation } from "./CorrelationStore.js";
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -348,17 +350,22 @@ export class OIDCService {
 										};
 								}
 
-								this.authenticationProvider.setPendingAuthorizationContext?.({
+								const pendingContext: PendingAuthorizationContext = {
 										clientId,
 										redirectUri,
 										scope: query.scope ?? "",
 										nonce: query.nonce ?? "",
 										codeChallenge: codeChallenge ?? "",
 										state: query.state
-								});
+								};
+								this.authenticationProvider.setPendingAuthorizationContext?.(pendingContext);
+
+								// correlationId ties this authorization request to its PrivateID session without depending on Bookwrm.
+								const correlationId = randomUUID();
+								storeCorrelation(correlationId, pendingContext);
 
 								// TEMP-AUDIT-LOG: Sprint 8.15 - non-polling OIDC authorize flow.
-								app.log.info({ ...auditSnapshot(), stage: "oidc_authorize_started" }, "OIDC Authorize Started");
+								app.log.info({ ...auditSnapshot(), stage: "oidc_authorize_started", correlationId }, "OIDC Authorize Started");
 
 								const beginAsyncAuthentication = this.authenticationProvider.beginAsyncAuthentication?.bind(this.authenticationProvider);
 								if (!beginAsyncAuthentication) {
@@ -367,7 +374,7 @@ export class OIDCService {
 
 								// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of which authentication method is invoked.
 								app.log.info("AUTH FLOW: beginAsyncAuthentication");
-								const asyncSession = await beginAsyncAuthentication();
+								const asyncSession = await beginAsyncAuthentication(correlationId);
 								app.log.info({ ...auditSnapshot(), stage: "privateid_session_created", sessionId: asyncSession.sessionId }, "PrivateID Session Created");
 								app.log.info({ ...auditSnapshot(), stage: "pending_authorization_stored", sessionId: asyncSession.sessionId }, "Pending Authorization Stored");
 								app.log.info({ ...auditSnapshot(), stage: "returning_launch_url", sessionId: asyncSession.sessionId }, "Returning Launch URL");
@@ -631,6 +638,13 @@ export class OIDCService {
 									userId: user
 							});
 
+							// TEMP-CLAIMS: Sprint 9.4 - identity fields immediately before ClaimsService.toOIDCClaims().
+							console.info("TEMP-CLAIMS", {
+									sub: authenticatedUser.sub,
+									email: authenticatedUser.email,
+									emailVerified: authenticatedUser.emailVerified,
+									name: authenticatedUser.name
+							});
 							const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
 							const accessToken = this.createOpaqueToken();

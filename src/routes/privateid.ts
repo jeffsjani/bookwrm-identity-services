@@ -9,11 +9,13 @@ import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
 import type { IdentityContext } from "../models/IdentityContext.js";
 import {
 		resolvePrivateIDSessionRecord,
+		storePendingAuthorizationRequest,
 		storePrivateIDAuthenticatedUser,
 		storePrivateIDIdentityContext,
 		storePrivateIDResult,
 		updatePrivateIDSessionStatus
 } from "../privateid/PrivateIDSessionStore.js";
+import { consumeByCorrelationId } from "../oidc/CorrelationStore.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -79,6 +81,17 @@ function readHeader(headers: Record<string, unknown>, key: string): string | und
 		}
 
 		return typeof value === "string" ? value : undefined;
+}
+
+// Reads metadata.correlationId echoed back on the PrivateID webhook body (Task 3/4, Sprint 9.1).
+function readMetadataCorrelationId(body: WebhookBody): string | undefined {
+		const metadata = body.metadata;
+		if (!metadata || typeof metadata !== "object") {
+				return undefined;
+		}
+
+		const correlationId = (metadata as Record<string, unknown>).correlationId;
+		return typeof correlationId === "string" && correlationId.trim().length > 0 ? correlationId.trim() : undefined;
 }
 
 function resolveCorrelationId(requestId: string, headers: Record<string, unknown>): string {
@@ -244,16 +257,33 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						};
 						storePrivateIDResult(record.session.sessionId, result);
 
+					// correlationId (Sprint 9.1) completes the PendingAuthorizationContext without relying on Bookwrm state.
+					const correlationId = readMetadataCorrelationId(body);
+					const correlatedContext = correlationId ? consumeByCorrelationId(correlationId) : undefined;
+					if (correlatedContext) {
+							storePendingAuthorizationRequest(record.session.sessionId, correlatedContext);
+					}
+
 					let resolvedIdentityContext: IdentityContext | undefined;
-					try {
-							const identityContext = await identityService.resolveIdentity(privateIdUserId);
-							storePrivateIDIdentityContext(record.session.sessionId, identityContext);
-							resolvedIdentityContext = identityContext.data;
-					} catch (error) {
-							app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
+					if (!correlationId) {
+							// Legacy path only: OIDC logins driven by a correlationId never depend on Bookwrm's BiometricIdentity platform.
+							try {
+									const identityContext = await identityService.resolveIdentity(privateIdUserId);
+									storePrivateIDIdentityContext(record.session.sessionId, identityContext);
+									resolvedIdentityContext = identityContext.data;
+							} catch (error) {
+									app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
+							}
 					}
 
 					const authenticatedUser = createAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
+					// TEMP-AUTHENTICATED-USER: Sprint 9.4 - exact identity fields produced by createAuthenticatedUser().
+					console.info("TEMP-AUTHENTICATED-USER", {
+							sub: authenticatedUser.sub,
+							email: authenticatedUser.email,
+							emailVerified: authenticatedUser.emailVerified,
+							name: authenticatedUser.name
+					});
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
 				} else if (status === "FAILURE") {

@@ -33,5 +33,6 @@ export interface AuthenticationProvider {
 		logout(): Promise<void>;
 		setPendingAuthorizationContext?(context: PendingAuthorizationContext): void;
 		// Non-blocking session creation used by the OIDC /authorize flow to avoid synchronous polling.
-		beginAsyncAuthentication?(): Promise<AsyncAuthenticationSession>;
+		// correlationId ties the PrivateID session back to the pending authorization request without relying on Bookwrm state.
+		beginAsyncAuthentication?(correlationId: string): Promise<AsyncAuthenticationSession>;
 }
