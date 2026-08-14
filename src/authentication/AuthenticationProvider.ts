@@ -20,10 +20,17 @@ export type PendingAuthorizationContext = {
 		state?: string;
 };
 
+export type AsyncAuthenticationSession = {
+		launchUrl: string;
+		sessionId: string;
+};
+
 export interface AuthenticationProvider {
 		authenticate(): Promise<AuthenticatedUser>;
 		cancel(): Promise<void>;
 		status(): Promise<AuthenticationStatus>;
 		logout(): Promise<void>;
 		setPendingAuthorizationContext?(context: PendingAuthorizationContext): void;
+		// Non-blocking session creation used by the OIDC /authorize flow to avoid synchronous polling.
+		beginAsyncAuthentication?(): Promise<AsyncAuthenticationSession>;
 }

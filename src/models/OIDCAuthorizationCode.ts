@@ -6,6 +6,9 @@ export type OIDCAuthorizationCode = {
 		nonce: string;
 		codeChallenge: string;
 		userId: string;
+		userSub: string;
+		userEmail: string;
+		userName: string;
 		expiresAt: number;
 		consumed: boolean;
 };

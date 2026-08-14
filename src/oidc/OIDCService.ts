@@ -259,7 +259,18 @@ export class OIDCService {
 								.map((scope) => scope.trim())
 								.filter((scope) => scope.length > 0);
 
+						// TEMP-AUDIT-LOG: /authorize 500 investigation - remove once root cause is fixed.
+						const auditSnapshot = () => ({
+								client_id: clientId ?? "(missing)",
+								redirect_uri: redirectUri ?? "(missing)",
+								scope: query.scope ?? "",
+								statePresent: Boolean(query.state),
+								pkceChallengePresent: Boolean(codeChallenge),
+								correlationId: this.correlationIdFor(request)
+						});
+
 						try {
+								app.log.warn({ ...auditSnapshot(), stage: "before_initial_rate_limit_check" }, "authorize audit checkpoint");
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
 										clientId: clientId ?? "",
@@ -278,6 +289,7 @@ export class OIDCService {
 										return { error: "invalid_request", error_description: "redirect_uri is required" };
 								}
 
+								app.log.warn({ ...auditSnapshot(), stage: "before_resolve_client" }, "authorize audit checkpoint");
 								const client = this.resolveClient(clientId);
 								if (!client) {
 										reply.code(400);
@@ -345,30 +357,20 @@ export class OIDCService {
 										state: query.state
 								});
 
-								const user = await this.authenticationProvider.authenticate();
-								userId = user.id;
-								await this.rateLimiter.assertWithinLimits({
-										ip: request.ip,
-										clientId,
-										userId
-								});
+								// TEMP-AUDIT-LOG: Sprint 8.15 - non-polling OIDC authorize flow.
+								app.log.info({ ...auditSnapshot(), stage: "oidc_authorize_started" }, "OIDC Authorize Started");
 
-								const redirectUrl = await this.issueAuthorizationRedirect(user, {
-										clientId,
-										redirectUri,
-										scope: query.scope ?? "",
-										nonce: query.nonce ?? "",
-										codeChallenge: codeChallenge ?? "",
-										state: query.state
-								});
-
-								// This request already completed the flow inline; drop any pending entry so a later callback can't resume it again.
-								const authenticationStatus = await this.authenticationProvider.status();
-								if (authenticationStatus.sessionId) {
-										consumePendingAuthorizationRequest(authenticationStatus.sessionId);
+								const beginAsyncAuthentication = this.authenticationProvider.beginAsyncAuthentication?.bind(this.authenticationProvider);
+								if (!beginAsyncAuthentication) {
+										throw new Error("Authentication provider does not support asynchronous authorization");
 								}
 
-								reply.redirect(redirectUrl, 302);
+								const asyncSession = await beginAsyncAuthentication();
+								app.log.info({ ...auditSnapshot(), stage: "privateid_session_created", sessionId: asyncSession.sessionId }, "PrivateID Session Created");
+								app.log.info({ ...auditSnapshot(), stage: "pending_authorization_stored", sessionId: asyncSession.sessionId }, "Pending Authorization Stored");
+								app.log.info({ ...auditSnapshot(), stage: "returning_launch_url", sessionId: asyncSession.sessionId }, "Returning Launch URL");
+
+								reply.redirect(asyncSession.launchUrl, 302);
 						} catch (err) {
 								error = err instanceof Error ? err.message : "unknown_error";
 								throw err;
@@ -594,19 +596,19 @@ export class OIDCService {
 
 								const now = Math.floor(Date.now() / 1000);
 								const issuer = this.resolveIssuer();
-								const authenticatedUser = await this.authenticationProvider.authenticate();
+								// Sprint 8.15: the code record already reflects the PrivateID-authenticated user; no re-authentication needed.
+								const authenticatedUser: AuthenticatedUser = {
+										id: codeRecord.userId,
+										sub: codeRecord.userSub,
+										email: codeRecord.userEmail,
+										name: codeRecord.userName
+								};
 								user = authenticatedUser.id;
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
 										clientId,
 										userId: user
 								});
-
-								if (authenticatedUser.id !== codeRecord.userId) {
-										reply.code(400);
-										error = "Authorization code user mismatch";
-										return { error: "invalid_grant", error_description: "Authorization code user mismatch" };
-								}
 
 								const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
@@ -881,7 +883,10 @@ export class OIDCService {
 						scope: context.scope,
 						nonce: context.nonce,
 						codeChallenge: context.codeChallenge,
-						userId: user.id
+						userId: user.id,
+						userSub: user.sub,
+						userEmail: user.email,
+						userName: user.name
 				});
 
 				const redirectTarget = new URL(context.redirectUri);

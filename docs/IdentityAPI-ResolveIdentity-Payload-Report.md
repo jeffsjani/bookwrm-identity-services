@@ -17,7 +17,8 @@ async resolveIdentity(privateIdUserId?: string): Promise<ApiResponse<IdentityCon
 }
 ```
 
-It does not add or transform any fields — it just invalidates cache keys and forwards `privateIdUserId` unchanged to `this.client.resolveIdentity(...)`.
+It does not add or transform any fields — it just invalidates cache keys and forwards `privateIdUserId` unchanged to `this.client.resolveIdentity(...)`.Please verify the repository state before we make any code changes.
+
 
 **`IdentityPlatformClient.resolveIdentity()`** (`src/clients/IdentityPlatformClient.ts`):
 

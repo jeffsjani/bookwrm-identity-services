@@ -33,6 +33,12 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 				this.pendingAuthorizationContext = context;
 		}
 
+		// Used by the OIDC /authorize flow: creates the session and persists the pending context without polling for completion.
+		async beginAsyncAuthentication(): Promise<{ launchUrl: string; sessionId: string }> {
+				const session = await this.launchSession();
+				return { launchUrl: session.launchUrl, sessionId: session.sessionId };
+		}
+
 		async completeCallback(payload: PrivateIDCallbackPayload): Promise<{ session: PrivateIDSession; user: AuthenticatedUser; result?: PrivateIDResult; }> {
 				const session = await this.client.handleCallback(payload);
 				const result = await this.client.getResult();

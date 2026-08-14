@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import formbody from "@fastify/formbody";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { configuration } from "../src/config/ConfigurationService.js";
+import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 
 type AuthorizeOptions = {
 		clientId?: string;
@@ -100,15 +101,52 @@ export async function authorizeAndGetCode(
 				throw new Error(`Authorize failed: ${authorizeResponse.statusCode} ${authorizeResponse.body}`);
 		}
 
-		const location = authorizeResponse.headers.location;
-		if (!location) {
-				throw new Error("Authorize response missing redirect location");
+		if (!authorizeResponse.headers.location) {
+				throw new Error("Authorize response missing PrivateID launch redirect");
 		}
 
-		const redirectUrl = new URL(location);
+		// Sprint 8.15: /authorize only launches the PrivateID session now; completion arrives via webhook + callback.
+		const sessionRecord = getCurrentPrivateIDSessionRecord();
+		if (!sessionRecord) {
+				throw new Error("No PrivateID session was created by /authorize");
+		}
+
+		const webhookResponse = await app.inject({
+				method: "POST",
+				url: "/privateid/webhook",
+				headers: {
+						"x-storythink-webhook-secret": "privateid-webhook-secret"
+				},
+				payload: {
+						status: "SUCCESS",
+						sessionId: sessionRecord.session.sessionId,
+						transactionId: sessionRecord.session.transactionId,
+						privateIdUserId: "dev-user-1"
+				}
+		});
+
+		if (webhookResponse.statusCode !== 200) {
+				throw new Error(`PrivateID webhook failed: ${webhookResponse.statusCode} ${webhookResponse.body}`);
+		}
+
+		const callbackResponse = await app.inject({
+				method: "GET",
+				url: `/privateid/callback?reason=success&sessionId=${encodeURIComponent(sessionRecord.session.sessionId)}&transactionId=${encodeURIComponent(sessionRecord.session.transactionId)}`
+		});
+
+		if (callbackResponse.statusCode !== 302) {
+				throw new Error(`Callback failed: ${callbackResponse.statusCode} ${callbackResponse.body}`);
+		}
+
+		const location = callbackResponse.headers.location;
+		if (!location) {
+				throw new Error("Callback response missing redirect location");
+		}
+
+		const redirectUrl = new URL(location as string);
 		const code = redirectUrl.searchParams.get("code");
 		if (!code) {
-				throw new Error("Authorize redirect missing code parameter");
+				throw new Error("Callback redirect missing code parameter");
 		}
 
 		return code;
