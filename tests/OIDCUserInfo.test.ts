@@ -1,40 +1,11 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { authorizeAndGetCode, buildOidcTestApp, exchangeAuthorizationCode } from "./oidcTestHarness.js";
 
-function mockIdentityContextFetch(): void {
-		const responsePayload = {
-				success: true,
-				requestId: "identity-2",
-				version: "v1",
-				data: {
-						userId: "dev-user-1",
-						confidence: 0.95,
-						risk: 0.1,
-						securityLevel: "high",
-						verified: true,
-						trustedDevice: true,
-						verificationRequired: false
-				}
-		};
-
-		vi.stubGlobal(
-				"fetch",
-				vi.fn().mockResolvedValue({
-						ok: true,
-						status: 200,
-						json: vi.fn().mockResolvedValue(responsePayload)
-				} as unknown as Response)
-		);
-}
-
 describe("OIDCUserInfo", () => {
-		afterEach(() => {
-				vi.unstubAllGlobals();
-		});
-
-		it("returns sub, email, email_verified, and name for valid access token", async () => {
-				mockIdentityContextFetch();
+		// Release Patch 5A: OIDC login resolves identity exclusively via IdentityRegistry, never the legacy
+		// Bookwrm IdentityContext API, so `sub` is an IdentityRegistry-issued subject rather than the raw PrivateID user id.
+		it("returns an IdentityRegistry-issued sub for a valid access token", async () => {
 				const { app } = await buildOidcTestApp();
 				const verifier = "userinfo-verifier-123456789";
 				const code = await authorizeAndGetCode(app, verifier);
@@ -51,12 +22,11 @@ describe("OIDCUserInfo", () => {
 
 				expect(userInfoResponse.statusCode).toBe(200);
 				const payload = userInfoResponse.json() as Record<string, unknown>;
-				expect(payload).toEqual({
-					sub: "dev-user-1",
-					email: "dev.user@bookwrm.local",
-					email_verified: true,
-					name: "Dev User"
-				});
+				expect(typeof payload.sub).toBe("string");
+				expect(payload.sub).not.toBe("dev-user-1");
+				expect(payload.email).toBeUndefined();
+				expect(payload.email_verified).toBeUndefined();
+				expect(payload.name).toBeUndefined();
 
 				await app.close();
 		});

@@ -9,6 +9,8 @@ export type PrivateIDSessionRecord = {
 		result?: PrivateIDResult;
 		authenticatedUser?: AuthenticatedUser;
 		identityContext?: ApiResponse<IdentityContext>;
+		// Set at session creation (Release Patch 5A) from whether a correlationId was supplied; never inferred from webhook payload fields.
+		oidcOrigin: boolean;
 };
 
 const sessionRecords = new Map<string, PrivateIDSessionRecord>();
@@ -16,12 +18,13 @@ const transactionIndex = new Map<string, string>();
 const pendingAuthorizationRequests = new Map<string, PendingAuthorizationContext>();
 let currentSessionId: string | undefined;
 
-export function storePrivateIDSession(session: PrivateIDSession): void {
+export function storePrivateIDSession(session: PrivateIDSession, options: { oidcOrigin?: boolean } = {}): void {
 		sessionRecords.set(session.sessionId, {
 			session,
 			result: undefined,
 			authenticatedUser: undefined,
-			identityContext: undefined
+			identityContext: undefined,
+			oidcOrigin: options.oidcOrigin ?? false
 		});
 		transactionIndex.set(session.transactionId, session.sessionId);
 		currentSessionId = session.sessionId;

@@ -16,7 +16,7 @@ import {
 		storePrivateIDResult,
 		updatePrivateIDSessionStatus
 } from "../privateid/PrivateIDSessionStore.js";
-import { consumeByCorrelationId } from "../oidc/CorrelationStore.js";
+import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/CorrelationStore.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -82,17 +82,6 @@ function readHeader(headers: Record<string, unknown>, key: string): string | und
 		}
 
 		return typeof value === "string" ? value : undefined;
-}
-
-// Reads metadata.correlationId echoed back on the PrivateID webhook body (Task 3/4, Sprint 9.1).
-function readMetadataCorrelationId(body: WebhookBody): string | undefined {
-		const metadata = body.metadata;
-		if (!metadata || typeof metadata !== "object") {
-				return undefined;
-		}
-
-		const correlationId = (metadata as Record<string, unknown>).correlationId;
-		return typeof correlationId === "string" && correlationId.trim().length > 0 ? correlationId.trim() : undefined;
 }
 
 function resolveCorrelationId(requestId: string, headers: Record<string, unknown>): string {
@@ -252,15 +241,64 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						};
 						storePrivateIDResult(record.session.sessionId, result);
 
-					// correlationId (Sprint 9.1) completes the PendingAuthorizationContext without relying on Bookwrm state.
-					const correlationId = readMetadataCorrelationId(body);
-					const correlatedContext = correlationId ? consumeByCorrelationId(correlationId) : undefined;
+					// TEMPORARY (Release Patch 5 verification) - logs payload structure only, no sensitive values. Remove after one production test.
+					const metadataValue = body.metadata;
+					const metadataExists = Boolean(metadataValue && typeof metadataValue === "object");
+					const metadataCorrelationIdExists = metadataExists && typeof (metadataValue as Record<string, unknown>).correlationId === "string";
+					app.log.info(
+							{
+									event: "privateid_webhook_success_structure_debug",
+									requestId,
+									topLevelKeys: Object.keys(body),
+									metadataExists,
+									metadataCorrelationIdExists,
+									...(metadataCorrelationIdExists ? {} : {
+											hasContext: Object.prototype.hasOwnProperty.call(body, "context"),
+											hasState: Object.prototype.hasOwnProperty.call(body, "state"),
+											hasClientData: Object.prototype.hasOwnProperty.call(body, "clientData"),
+											hasCustomData: Object.prototype.hasOwnProperty.call(body, "customData"),
+											hasSessionMetadata: Object.prototype.hasOwnProperty.call(body, "sessionMetadata")
+									})
+							},
+							"TEMPORARY: PrivateID SUCCESS webhook structure (remove after one production test)"
+					);
+					// END TEMPORARY
+
+					// Release Patch 5A: OIDC-ness comes from our own session record (set at launch time), never from the webhook body itself.
+					const isOidcSession = record.oidcOrigin;
+					const oidcCorrelationId = isOidcSession ? findCorrelationIdForSession(record.session.sessionId) : undefined;
+					const correlatedContext = oidcCorrelationId ? consumeByCorrelationId(oidcCorrelationId) : undefined;
 					if (correlatedContext) {
 							storePendingAuthorizationRequest(record.session.sessionId, correlatedContext);
 					}
 
 					let authenticatedUser: AuthenticatedUser;
-					if (correlationId) {
+					if (isOidcSession) {
+							if (!oidcCorrelationId) {
+									// Task 2: an OIDC session's SUCCESS webhook that cannot be correlated shall fail explicitly, never fall back to the legacy path.
+									updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
+									responseContext.sessionCompleted = true;
+									app.log.warn(
+											{
+													event: "UNCORRELATED_SUCCESS_WEBHOOK",
+													requestId,
+													sessionId: record.session.sessionId,
+													transactionId: record.session.transactionId,
+													rawResponse: body
+											},
+											"PrivateID SUCCESS webhook could not be correlated to a pending OIDC authorization"
+									);
+									reply.code(200);
+									logWebhookResponse(200);
+									return {
+											status: "FAILURE",
+											sessionId: record.session.sessionId,
+											transactionId: record.session.transactionId,
+											completed: true,
+											message: "Authentication Incomplete"
+									};
+							}
+
 							// OIDC login: identity comes exclusively from IdentityRegistry, never Bookwrm/Base44.
 							try {
 									const candidate = extractIdentityCandidateFromRawResponse(body);

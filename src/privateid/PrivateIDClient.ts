@@ -33,7 +33,7 @@ export class PrivateIDClient {
 								expires: now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000),
 								created: now
 						};
-						storePrivateIDSession(session);
+						storePrivateIDSession(session, { oidcOrigin: Boolean(correlationId) });
 						this.currentSessionId = session.sessionId;					console.info("[PrivateID] Created session (mock mode)", { sessionId: session.sessionId, transactionId });
 						return session;
 				}
@@ -109,7 +109,7 @@ export class PrivateIDClient {
 				if (!session.launchUrl) {
 						throw new Error("PrivateID session API response missing launchUrl");
 				}
-				storePrivateIDSession(session);
+				storePrivateIDSession(session, { oidcOrigin: Boolean(correlationId) });
 				this.currentSessionId = session.sessionId;
 				console.info("[PrivateID] Created session (PrivateID API)", { sessionId: session.sessionId, transactionId });
 
