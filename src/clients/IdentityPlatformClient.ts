@@ -53,11 +53,6 @@ export class IdentityPlatformClient {
 				return this.invoke<TrustedDevice[]>("getTrustedDevices");
 		}
 
-		// TEMPORARY (Sprint 8.20 validation): raw Base44 debugIdentifiers passthrough.
-		async debugIdentifiers(userId: string): Promise<ApiResponse<unknown>> {
-				return this.invoke<unknown>("debugIdentifiers", { userId });
-		}
-
 		private async invoke<T>(
 				action: string,
 				payload: any = {}

@@ -149,7 +149,7 @@ describe("Diagnostics routes", () => {
 
 					const body = response.json() as Record<string, unknown>;
 					expect(body).toMatchObject({
-								diagnostics: expect.arrayContaining(["/diagnostics/oidc", "/diagnostics/privateid", "/diagnostics/routes"]),
+								diagnostics: expect.arrayContaining(["/diagnostics/oidc/dashboard", "/diagnostics/privateid", "/diagnostics/routes"]),
 								oidc: expect.arrayContaining(["/.well-known/openid-configuration", "/authorize", "/jwks", "/userinfo", "/token"]),
 								privateid: expect.arrayContaining(["/privateid/webhook", "/privateid/callback"])
 					});

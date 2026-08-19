@@ -125,14 +125,6 @@ export type OIDCDashboardSnapshot = {
 		};
 };
 
-export type OIDCBase44IntegrationStatus = {
-		issuer: string;
-		clientConfigured: boolean;
-		base44ToOidc: boolean;
-		oidcToBookwrmIdentityServices: boolean;
-		authenticatedSession: boolean;
-};
-
 export class OIDCService {
 		private static readonly DEFAULT_ISSUER = "https://identity.bookwrm.com";
 		private static readonly AUTHORIZATION_CODE_TTL_MS = 60_000;
@@ -261,18 +253,7 @@ export class OIDCService {
 								.map((scope) => scope.trim())
 								.filter((scope) => scope.length > 0);
 
-						// TEMP-AUDIT-LOG: /authorize 500 investigation - remove once root cause is fixed.
-						const auditSnapshot = () => ({
-								client_id: clientId ?? "(missing)",
-								redirect_uri: redirectUri ?? "(missing)",
-								scope: query.scope ?? "",
-								statePresent: Boolean(query.state),
-								pkceChallengePresent: Boolean(codeChallenge),
-								correlationId: this.correlationIdFor(request)
-						});
-
-						try {
-								app.log.warn({ ...auditSnapshot(), stage: "before_initial_rate_limit_check" }, "authorize audit checkpoint");
+					try {
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
 										clientId: clientId ?? "",
@@ -291,7 +272,6 @@ export class OIDCService {
 										return { error: "invalid_request", error_description: "redirect_uri is required" };
 								}
 
-								app.log.warn({ ...auditSnapshot(), stage: "before_resolve_client" }, "authorize audit checkpoint");
 								const client = this.resolveClient(clientId);
 								if (!client) {
 										reply.code(400);
@@ -364,20 +344,12 @@ export class OIDCService {
 								const correlationId = randomUUID();
 								storeCorrelation(correlationId, pendingContext);
 
-								// TEMP-AUDIT-LOG: Sprint 8.15 - non-polling OIDC authorize flow.
-								app.log.info({ ...auditSnapshot(), stage: "oidc_authorize_started", correlationId }, "OIDC Authorize Started");
-
 								const beginAsyncAuthentication = this.authenticationProvider.beginAsyncAuthentication?.bind(this.authenticationProvider);
 								if (!beginAsyncAuthentication) {
 										throw new Error("Authentication provider does not support asynchronous authorization");
 								}
 
-								// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of which authentication method is invoked.
-								app.log.info("AUTH FLOW: beginAsyncAuthentication");
 								const asyncSession = await beginAsyncAuthentication(correlationId);
-								app.log.info({ ...auditSnapshot(), stage: "privateid_session_created", sessionId: asyncSession.sessionId }, "PrivateID Session Created");
-								app.log.info({ ...auditSnapshot(), stage: "pending_authorization_stored", sessionId: asyncSession.sessionId }, "Pending Authorization Stored");
-								app.log.info({ ...auditSnapshot(), stage: "returning_launch_url", sessionId: asyncSession.sessionId }, "Returning Launch URL");
 
 								reply.redirect(asyncSession.launchUrl, 302);
 						} catch (err) {
@@ -463,7 +435,6 @@ export class OIDCService {
 										email_verified: tokenRecord.emailVerified,
 										name: tokenRecord.name
 								};
-								app.log.info(userInfoResponse, "TEMP-OIDC-USERINFO");
 								return userInfoResponse;
 						} catch (err) {
 								error = err instanceof Error ? err.message : "unknown_error";
@@ -497,7 +468,6 @@ export class OIDCService {
 						const basicCredentials = this.parseBasicClientCredentials(request.headers.authorization);
 						const clientId = basicCredentials?.clientId ?? body.client_id?.trim();
 						const clientSecret = basicCredentials?.clientSecret ?? body.client_secret?.trim();
-						const tokenAuthMethodUsed = basicCredentials ? "client_secret_basic" : "client_secret_post";
 
 						try {
 								await this.rateLimiter.assertWithinLimits({
@@ -522,11 +492,6 @@ export class OIDCService {
 												error: "invalid_request",
 												error_description: "code and redirect_uri are required"
 										};
-								}
-
-								// TEMP-AUDIT-LOG: Sprint 8.16 - runtime proof of token endpoint client authentication method.
-								if (clientId) {
-										app.log.info(`TOKEN AUTH METHOD: ${tokenAuthMethodUsed}`);
 								}
 
 								if (!clientId) {
@@ -638,13 +603,6 @@ export class OIDCService {
 									userId: user
 							});
 
-							// TEMP-CLAIMS: Sprint 9.4 - identity fields immediately before ClaimsService.toOIDCClaims().
-							console.info("TEMP-CLAIMS", {
-									sub: authenticatedUser.sub,
-									email: authenticatedUser.email,
-									emailVerified: authenticatedUser.emailVerified,
-									name: authenticatedUser.name
-							});
 							const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
 							const accessToken = this.createOpaqueToken();
@@ -663,17 +621,6 @@ export class OIDCService {
 									clientId,
 									scope: codeRecord.scope
 							});
-						app.log.info({
-							sub: codeRecord.userId,
-							email: claims.email,
-							email_verified: claims.emailVerified,
-							name: claims.name,
-							preferred_username: claims.email,
-							iss: issuer,
-							aud: clientId,
-							scope: codeRecord.scope,
-							nonce: codeRecord.nonce
-						}, "TEMP-OIDC-IDTOKEN");
 							const idToken = await this.createIdToken({
 							issuer,
 							subject: codeRecord.userId,
@@ -688,11 +635,6 @@ export class OIDCService {
 
 							reply.code(200);
 							this.metrics.tokensIssued += 1;
-						app.log.info({
-							userId: codeRecord.userId,
-							email: claims.email,
-							emailVerified: claims.emailVerified
-						}, "TEMP-OIDC-TOKEN-ISSUED");
 							return {
 								token_type: "Bearer",
 								expires_in: 300,
@@ -1038,10 +980,6 @@ export class OIDCService {
 			iat: number;
 			exp: number;
 		}): Record<string, unknown> {
-			// TEMP-EMAIL-TRACE: Sprint 8.19.2
-			console.info("TEMP-EMAIL-TRACE buildIdTokenPayload(input)", {
-				emailState: input.email === undefined ? "undefined" : input.email.length > 0 ? "present" : "empty"
-			});
 			return {
 				iss: input.issuer,
 				sub: input.subject,
@@ -1149,45 +1087,6 @@ export class OIDCService {
 
 		private async getAccessTokenRecord(accessToken: string): Promise<AccessTokenRecord | null> {
 				return this.redisStore.getAccessTokenRecord(accessToken);
-		}
-
-		// TEMP-DIAGNOSTIC: Sprint 8.19 - returns the unsigned ID Token claims /token would embed for this access token.
-		async getDiagnosticIdTokenClaims(accessToken: string): Promise<Record<string, unknown> | null> {
-				const tokenRecord = await this.getAccessTokenRecord(accessToken);
-				if (!tokenRecord) {
-						return null;
-				}
-
-				const now = Math.floor(Date.now() / 1000);
-				return {
-						...this.buildIdTokenPayload({
-								issuer: this.resolveIssuer(),
-								subject: tokenRecord.sub,
-								audience: tokenRecord.clientId,
-								nonce: tokenRecord.nonce,
-								scope: tokenRecord.scope,
-								email: tokenRecord.email,
-								emailVerified: tokenRecord.emailVerified,
-								iat: now,
-								exp: now + 300
-						}),
-						preferred_username: tokenRecord.email
-				};
-		}
-
-		// TEMP-DIAGNOSTIC: Sprint 8.19 - returns exactly what /userinfo returns for this access token.
-		async getDiagnosticUserInfoClaims(accessToken: string): Promise<{ sub: string; email: string; email_verified: boolean; name: string } | null> {
-				const tokenRecord = await this.getAccessTokenRecord(accessToken);
-				if (!tokenRecord) {
-						return null;
-				}
-
-				return {
-						sub: tokenRecord.sub,
-						email: tokenRecord.email,
-						email_verified: tokenRecord.emailVerified,
-						name: tokenRecord.name
-				};
 		}
 
 		private async storeRefreshToken(refreshToken: string, tokenRecord: Omit<RefreshTokenRecord, "expiresAt">): Promise<void> {
@@ -1308,23 +1207,6 @@ export class OIDCService {
 								metricsEnabled: featureFlags.isMetricsEnabled()
 							}
 						}
-				};
-		}
-
-		getBase44IntegrationStatus(): OIDCBase44IntegrationStatus {
-				const issuer = this.resolveIssuer();
-				const clients = this.configureClients();
-				const clientConfigured = clients.length > 0;
-				const base44ToOidc = issuer === OIDCService.DEFAULT_ISSUER && clientConfigured;
-				const oidcToBookwrmIdentityServices = Boolean(this.provider) && this.hasSigningKeyConfiguration();
-				const authenticatedSession = this.metrics.tokensIssued > 0;
-
-				return {
-						issuer,
-						clientConfigured,
-						base44ToOidc,
-						oidcToBookwrmIdentityServices,
-						authenticatedSession
 				};
 		}
 

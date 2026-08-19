@@ -105,8 +105,6 @@ function resolveCorrelationId(requestId: string, headers: Record<string, unknown
 function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
 		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE routes/privateid.ts AuthenticatedUser", { emailState: email.length > 0 ? "present" : "empty" });
 
 		return {
 				id: privateIdUserId || fallbackSessionId,
@@ -119,11 +117,6 @@ function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackS
 
 // Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
 function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE routes/privateid.ts IdentityContext", {
-				emailState: identityContext === undefined ? "undefined" : identityContext.email ? "present" : "empty"
-		});
-
 		if (identityContext?.email) {
 				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
 		}
@@ -300,13 +293,6 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							authenticatedUser = createBookwrmLegacyAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
 					}
 
-					// TEMP-AUTHENTICATED-USER: Sprint 9.4 - exact identity fields produced by the authenticated user builder.
-					console.info("TEMP-AUTHENTICATED-USER", {
-							sub: authenticatedUser.sub,
-							email: authenticatedUser.email,
-							emailVerified: authenticatedUser.emailVerified,
-							name: authenticatedUser.name
-					});
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
 				} else if (status === "FAILURE") {

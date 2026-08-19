@@ -22,8 +22,6 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 
 		// Used by the OIDC /authorize flow: creates the session and persists the pending context without polling for completion.
 		async beginAsyncAuthentication(correlationId: string): Promise<{ launchUrl: string; sessionId: string }> {
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER beginAsyncAuthentication");
 				const session = await this.launchSession(correlationId);
 				// Log the exact PrivateID sessionId to compare against incoming webhook sessionIds.
 				console.info("[PrivateID] beginAsyncAuthentication sessionId", { sessionId: session.sessionId, transactionId: session.transactionId, correlationId });
@@ -34,32 +32,17 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 				const session = await this.client.handleCallback(payload);
 				const result = await this.client.getResult();
 
-				// TEMP-PRIVATEID-RESULT: Sprint 9.4 - identity-only fields returned by PrivateID after face match; no secrets/biometric data.
-				const rawIdentityFields = (result?.rawResponse ?? {}) as Record<string, unknown>;
-				console.info("TEMP-PRIVATEID-RESULT", {
-						privateIdUserId: result?.privateIdUserId,
-						email: rawIdentityFields.email,
-						emailVerified: rawIdentityFields.emailVerified ?? rawIdentityFields.email_verified,
-						name: rawIdentityFields.name,
-						transactionId: result?.transactionId,
-						sessionId: result?.sessionId
-				});
-
 				const user = await this.returnResult(result, session);
 				this.statusSnapshot = { state: "ready", sessionId: session.sessionId };
 				return { session, user, result: result ?? undefined };
 		}
 
 		async authenticate(): Promise<AuthenticatedUser> {
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER authenticate");
 				const session = await this.launchSession();
 				await this.waitForSession(session);
 
 				const timeoutMs = configuration.getNumber("PRIVATEID_POLL_TIMEOUT_MS", 30_000);
 				const pollIntervalMs = configuration.getNumber("PRIVATEID_POLL_INTERVAL_MS", 1000);
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER pollForResult");
 				const result = await this.pollForResult(session, timeoutMs, pollIntervalMs);
 				return await this.returnResult(result, session);
 		}

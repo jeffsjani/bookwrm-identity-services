@@ -9,15 +9,6 @@ import { Notification } from "../models/Notification.js";
 import { SecurityContext } from "../models/SecurityContext.js";
 import { TrustedDevice } from "../models/TrustedDevice.js";
 
-// TEMP-EMAIL-TRACE: Sprint 8.19.2 - classifies a claim value as present/empty/undefined for pipeline tracing.
-function describeEmailState(value: string | undefined): "present" | "empty" | "undefined" {
-		if (value === undefined) {
-				return "undefined";
-		}
-
-		return value.length > 0 ? "present" : "empty";
-}
-
 export class IdentityService {
 		constructor(private readonly client: IdentityPlatformClient = new IdentityPlatformClient()) {}
 
@@ -29,14 +20,10 @@ export class IdentityService {
 				const cacheKey = `identity:${userId ?? "default"}`;
 				const cached = await identityCache.get<ApiResponse<IdentityContext>>(cacheKey);
 				if (cached) {
-						// TEMP-EMAIL-TRACE: Sprint 8.19.2
-						console.info("TEMP-EMAIL-TRACE getIdentityContext(cached)", { emailState: describeEmailState(cached.data?.email) });
 						return cached;
 				}
 
 				const response = await this.client.getIdentityContext(userId);
-				// TEMP-EMAIL-TRACE: Sprint 8.19.2
-				console.info("TEMP-EMAIL-TRACE getIdentityContext(upstream)", { emailState: describeEmailState(response.data?.email) });
 				await identityCache.set(cacheKey, response);
 				return response;
 		}
@@ -45,10 +32,7 @@ export class IdentityService {
 				await identityCache.invalidate(`identity:${privateIdUserId ?? "default"}`);
 				await identityCache.invalidate(`security:${privateIdUserId ?? "default"}`);
 				await identityCache.invalidate(`policies:${privateIdUserId ?? "default"}`);
-				const response = await this.client.resolveIdentity(privateIdUserId);
-				// TEMP-EMAIL-TRACE: Sprint 8.19.2
-				console.info("TEMP-EMAIL-TRACE resolveIdentity(upstream)", { emailState: describeEmailState(response.data?.email) });
-				return response;
+				return this.client.resolveIdentity(privateIdUserId);
 		}
 
 		async reverify(): Promise<ApiResponse<IdentityContext>> {
@@ -92,11 +76,6 @@ export class IdentityService {
 
 		async getTrustedDevices(): Promise<ApiResponse<TrustedDevice[]>> {
 				return this.client.getTrustedDevices();
-		}
-
-		// TEMPORARY (Sprint 8.20 validation): raw Base44 debugIdentifiers passthrough.
-		async debugIdentifiers(userId: string): Promise<ApiResponse<unknown>> {
-				return this.client.debugIdentifiers(userId);
 		}
 }
 
