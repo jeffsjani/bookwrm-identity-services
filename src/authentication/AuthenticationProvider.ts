@@ -1,9 +1,9 @@
 export type AuthenticatedUser = {
 		id: string;
 		sub: string;
-		email: string;
-		emailVerified: boolean;
-		name: string;
+		email?: string;
+		emailVerified?: boolean;
+		name?: string;
 };
 
 export type AuthenticationStatus = {

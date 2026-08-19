@@ -7,9 +7,9 @@ export type OIDCAuthorizationCode = {
 		codeChallenge: string;
 		userId: string;
 		userSub: string;
-		userEmail: string;
-		userEmailVerified: boolean;
-		userName: string;
+		userEmail?: string;
+		userEmailVerified?: boolean;
+		userName?: string;
 		expiresAt: number;
 		consumed: boolean;
 };

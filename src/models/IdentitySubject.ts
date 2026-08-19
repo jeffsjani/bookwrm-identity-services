@@ -13,9 +13,9 @@ export type IdentitySubject = {
 		oidcSubject: string;
 		primaryProvider: IdentityProvider;
 		primaryProviderSubject: string;
-		email: string;
-		emailVerified: boolean;
-		displayName: string;
+		email?: string;
+		emailVerified?: boolean;
+		displayName?: string;
 		status: IdentitySubjectStatus;
 		createdAt: string;
 		updatedAt: string;

@@ -11,9 +11,9 @@ type IdentitySubjectRow = {
 		oidc_subject: string;
 		primary_provider: string;
 		primary_provider_subject: string;
-		email: string;
+		email: string | null;
 		email_verified: boolean;
-		display_name: string;
+		display_name: string | null;
 		status: string;
 		created_at: string | Date;
 		updated_at: string | Date;
@@ -34,9 +34,9 @@ function toIdentitySubject(row: IdentitySubjectRow): IdentitySubject {
 				oidcSubject: row.oidc_subject,
 				primaryProvider: row.primary_provider as IdentityProvider,
 				primaryProviderSubject: row.primary_provider_subject,
-				email: row.email,
+				email: row.email ?? undefined,
 				emailVerified: row.email_verified,
-				displayName: row.display_name,
+				displayName: row.display_name ?? undefined,
 				status: row.status as IdentitySubject["status"],
 				createdAt: toIsoString(row.created_at) as string,
 				updatedAt: toIsoString(row.updated_at) as string,
@@ -76,9 +76,9 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 								input.oidcSubject,
 								input.primaryProvider,
 								input.primaryProviderSubject,
-								input.email,
-								input.emailVerified,
-								input.displayName,
+								input.email ?? null,
+								input.emailVerified ?? null,
+								input.displayName ?? null,
 								input.status,
 								now
 						]
@@ -223,9 +223,9 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 								input.oidcSubject,
 								input.primaryProvider,
 								input.primaryProviderSubject,
-								input.email,
-								input.emailVerified,
-								input.displayName,
+								input.email ?? null,
+								input.emailVerified ?? null,
+								input.displayName ?? null,
 								input.status,
 								now
 						]

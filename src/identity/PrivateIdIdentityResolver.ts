@@ -2,7 +2,7 @@ import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import { identityRegistry } from "./IdentityRegistry.js";
 import { identityMetrics } from "./infrastructure/IdentityMetrics.js";
-import { beginPendingIdentity, markBlocked, markPersisted } from "./PendingIdentity.js";
+import { beginPendingIdentity, markPersisted } from "./PendingIdentity.js";
 
 export type PrivateIdIdentityCandidate = {
 		email?: string;
@@ -46,39 +46,21 @@ export function extractIdentityCandidateFromRawResponse(rawResponse: unknown): P
 		};
 }
 
-function resolveCandidate(candidate: PrivateIdIdentityCandidate): { email: string; emailVerified: boolean; displayName: string } {
-		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
-
-		if (candidate.email) {
-				return {
-						email: candidate.email,
-						emailVerified: candidate.emailVerified ?? false,
-						displayName: candidate.displayName ?? fallbackName
-				};
-		}
-
-		if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
-				const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
-				return { email: fallbackEmail, emailVerified: true, displayName: candidate.displayName ?? fallbackName };
-		}
-
-		return { email: "", emailVerified: false, displayName: candidate.displayName ?? fallbackName };
+function resolveCandidate(candidate: PrivateIdIdentityCandidate): PrivateIdIdentityCandidate {
+		return {
+			email: candidate.email,
+			emailVerified: candidate.emailVerified,
+			displayName: candidate.displayName
+	};
 }
 
 // PrivateID -> privateIdUserId -> IdentityRegistry.resolveOrCreate() -> PendingIdentity -> persisted IdentitySubject.
-// Throws if email is not verified: identity is never created without one (RC1-F).
 export async function resolveAuthenticatedUserFromPrivateId(
 		privateIdUserId: string,
 		candidate: PrivateIdIdentityCandidate
 ): Promise<AuthenticatedUser> {
 		const { email, emailVerified, displayName } = resolveCandidate(candidate);
 		beginPendingIdentity(privateIdUserId, email, emailVerified, displayName);
-
-		if (!emailVerified) {
-				markBlocked(privateIdUserId, "Identity cannot be created without a verified email");
-				identityMetrics.recordOidcFailure();
-				throw new Error("IdentitySubject cannot be created without verified email");
-		}
 
 		let identitySubject;
 		try {

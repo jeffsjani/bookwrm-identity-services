@@ -31,6 +31,10 @@ function hasNoCurrentValue(value: unknown): boolean {
 export function evaluateClaim(input: ClaimEvaluationInput): ClaimDecisionResult {
 		const { claim, currentValue, currentSource, proposedValue, proposedSource } = input;
 
+		if (claim === "email" && hasNoCurrentValue(proposedValue)) {
+				return { decision: "ignore", reason: "No Claim" };
+		}
+
 		if (proposedValue === currentValue) {
 				return { decision: "ignore", reason: "Proposed value matches current value" };
 		}

@@ -113,21 +113,20 @@ describe("Task 5: chaos -- Identity Registry claims stay consistent when depende
 				expect(resolved).toEqual(subject);
 		});
 
-		it("rejects identity creation cleanly (no partial state) when email is unverified", async () => {
+		it("creates a complete identity when email is unverified", async () => {
 				const providerSubject = `chaos-unverified-${randomUUID()}`;
 
-				await expect(
-						identityRegistry.resolveOrCreate({
-								provider: "PrivateID",
-								providerSubject,
-								email: "chaos-unverified@example.com",
-								emailVerified: false,
-								displayName: "Chaos User"
-						})
-				).rejects.toThrow();
+				const subject = await identityRegistry.resolveOrCreate({
+						provider: "PrivateID",
+						providerSubject,
+						email: "chaos-unverified@example.com",
+						emailVerified: false,
+						displayName: "Chaos User"
+				});
 
-				const partial = await identityRegistry.findByProvider("PrivateID", providerSubject);
-				expect(partial).toBeUndefined();
+				const persisted = await identityRegistry.findByProvider("PrivateID", providerSubject);
+				expect(persisted?.oidcSubject).toBe(subject.oidcSubject);
+				expect(persisted?.emailVerified).toBe(false);
 		});
 });
 

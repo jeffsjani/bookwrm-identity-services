@@ -6,9 +6,9 @@ export type PendingIdentityStage = "pending" | "persisted" | "blocked";
 // and "IdentityRegistry has durably persisted an IdentitySubject for them" (RC1 Task 6).
 export type PendingIdentityRecord = {
 		privateIdUserId: string;
-		email: string;
-		emailVerified: boolean;
-		displayName: string;
+		email?: string;
+		emailVerified?: boolean;
+		displayName?: string;
 		stage: PendingIdentityStage;
 		identitySubject?: IdentitySubject;
 		reason?: string;
@@ -18,9 +18,9 @@ const pendingByPrivateIdUserId = new Map<string, PendingIdentityRecord>();
 
 export function beginPendingIdentity(
 		privateIdUserId: string,
-		email: string,
-		emailVerified: boolean,
-		displayName: string
+		email: string | undefined,
+		emailVerified: boolean | undefined,
+		displayName: string | undefined
 ): PendingIdentityRecord {
 		const record: PendingIdentityRecord = { privateIdUserId, email, emailVerified, displayName, stage: "pending" };
 		pendingByPrivateIdUserId.set(privateIdUserId, record);
@@ -39,7 +39,7 @@ export function markPersisted(privateIdUserId: string, identitySubject: Identity
 		return record;
 }
 
-// Email verification did not clear (RC1-F); identity is never created in this state.
+// Reserved for future account activation state; it never blocks identity creation.
 export function markBlocked(privateIdUserId: string, reason: string): PendingIdentityRecord | undefined {
 		const record = pendingByPrivateIdUserId.get(privateIdUserId);
 		if (!record) {
