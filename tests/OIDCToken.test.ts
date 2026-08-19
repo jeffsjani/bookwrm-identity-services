@@ -49,27 +49,4 @@ describe("OIDCToken", () => {
 
 				await app.close();
 		});
-
-		it("validates Base44 integration chain after authenticated session", async () => {
-				mockIdentityContextFetch();
-				const { app } = await buildOidcTestApp();
-				const verifier = "base44-integration-verifier-123";
-				const code = await authorizeAndGetCode(app, verifier);
-				await exchangeAuthorizationCode(app, code, verifier);
-
-				const diagnosticsResponse = await app.inject({
-						method: "GET",
-						url: "/diagnostics/oidc/base44"
-				});
-				expect(diagnosticsResponse.statusCode).toBe(200);
-
-				const diagnostics = diagnosticsResponse.json() as Record<string, unknown>;
-				expect(diagnostics.issuer).toBe("https://identity.bookwrm.com");
-				expect(diagnostics.clientConfigured).toBe(true);
-				expect(diagnostics.base44ToOidc).toBe(true);
-				expect(diagnostics.oidcToBookwrmIdentityServices).toBe(true);
-				expect(diagnostics.authenticatedSession).toBe(true);
-
-				await app.close();
-		});
 });

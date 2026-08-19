@@ -81,20 +81,6 @@ export class PrivateIDClient {
 						})
 				);
 
-				// TEMP: diagnostic-only logging of the exact POST /v2/verification-session payload; no secrets/API keys included.
-				const requestBodyForLogging = requestBody as unknown as Record<string, unknown>;
-				console.info(
-						"TEMP-PRIVATEID-CREATE-SESSION",
-						JSON.stringify({
-								type: requestBodyForLogging.type,
-								requirements: requestBodyForLogging.requirements,
-								redirectURL: requestBodyForLogging.redirectURL,
-								callbackUrl: callbackUrl,
-								metadata: requestBodyForLogging.metadata,
-								sessionType: requestBodyForLogging.sessionType
-						})
-				);
-
 				const response = await fetch(endpoint, {
 						method: "POST",
 						headers: {

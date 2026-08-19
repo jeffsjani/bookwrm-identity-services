@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
+import { extractIdentityCandidateFromRawResponse, resolveAuthenticatedUserFromPrivateId } from "../identity/PrivateIdIdentityResolver.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
@@ -100,11 +101,10 @@ function resolveCorrelationId(requestId: string, headers: Record<string, unknown
 				?? requestId;
 }
 
-function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
+// Legacy Bookwrm-native path only (no correlationId): still sources identity from Base44's IdentityContext, unchanged.
+function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
 		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE routes/privateid.ts AuthenticatedUser", { emailState: email.length > 0 ? "present" : "empty" });
 
 		return {
 				id: privateIdUserId || fallbackSessionId,
@@ -117,11 +117,6 @@ function createAuthenticatedUser(privateIdUserId: string, fallbackSessionId: str
 
 // Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
 function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE routes/privateid.ts IdentityContext", {
-				emailState: identityContext === undefined ? "undefined" : identityContext.email ? "present" : "empty"
-		});
-
 		if (identityContext?.email) {
 				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
 		}
@@ -264,9 +259,29 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							storePendingAuthorizationRequest(record.session.sessionId, correlatedContext);
 					}
 
-					let resolvedIdentityContext: IdentityContext | undefined;
-					if (!correlationId) {
-							// Legacy path only: OIDC logins driven by a correlationId never depend on Bookwrm's BiometricIdentity platform.
+					let authenticatedUser: AuthenticatedUser;
+					if (correlationId) {
+							// OIDC login: identity comes exclusively from IdentityRegistry, never Bookwrm/Base44.
+							try {
+									const candidate = extractIdentityCandidateFromRawResponse(body);
+									authenticatedUser = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, candidate);
+							} catch (error) {
+									updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
+									responseContext.sessionCompleted = true;
+									app.log.warn({ error, privateIdUserId }, "Identity Registry resolution failed during PrivateID webhook processing");
+									reply.code(200);
+									logWebhookResponse(200);
+									return {
+											status: "FAILURE",
+											sessionId: record.session.sessionId,
+											transactionId: record.session.transactionId,
+											completed: true,
+											error: error instanceof Error ? error.message : "Identity resolution failed"
+									};
+							}
+					} else {
+							// Legacy path only: Bookwrm-native BiometricIdentity flows outside OIDC Login are untouched.
+							let resolvedIdentityContext: IdentityContext | undefined;
 							try {
 									const identityContext = await identityService.resolveIdentity(privateIdUserId);
 									storePrivateIDIdentityContext(record.session.sessionId, identityContext);
@@ -274,16 +289,10 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							} catch (error) {
 									app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
 							}
+
+							authenticatedUser = createBookwrmLegacyAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
 					}
 
-					const authenticatedUser = createAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
-					// TEMP-AUTHENTICATED-USER: Sprint 9.4 - exact identity fields produced by createAuthenticatedUser().
-					console.info("TEMP-AUTHENTICATED-USER", {
-							sub: authenticatedUser.sub,
-							email: authenticatedUser.email,
-							emailVerified: authenticatedUser.emailVerified,
-							name: authenticatedUser.name
-					});
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
 				} else if (status === "FAILURE") {

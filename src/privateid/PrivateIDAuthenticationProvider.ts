@@ -1,7 +1,6 @@
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
-import type { IdentityContext } from "../models/IdentityContext.js";
-import { identityService } from "../identity/IdentityService.js";
+import { extractIdentityCandidateFromRawResponse, resolveAuthenticatedUserFromPrivateId } from "../identity/PrivateIdIdentityResolver.js";
 import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClient.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
@@ -10,42 +9,6 @@ import { linkPrivateIdSession } from "../oidc/CorrelationStore.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
-function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE PrivateIDAuthenticationProvider IdentityContext", {
-				emailState: identityContext === undefined ? "undefined" : identityContext.email ? "present" : "empty"
-		});
-
-		if (identityContext?.email) {
-				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
-		}
-
-		if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
-				const fallbackEmail = configuration.get("PRIVATEID_FALLBACK_EMAIL", "privateid.user@bookwrm.local") ?? "privateid.user@bookwrm.local";
-				return { email: fallbackEmail, emailVerified: true };
-		}
-
-		return { email: "", emailVerified: false };
-}
-
-function toAuthenticatedUser(result: PrivateIDResult | undefined, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
-		const privateIdUserId = result?.privateIdUserId ?? fallbackSessionId;
-		const subjectId = result?.privateIdUserId ?? fallbackTransactionId;
-		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
-		const { email, emailVerified } = resolveEmailFromIdentityContext(identityContext);
-		// TEMP-EMAIL-TRACE: Sprint 8.19.2
-		console.info("TEMP-EMAIL-TRACE PrivateIDAuthenticationProvider AuthenticatedUser", { emailState: email.length > 0 ? "present" : "empty" });
-
-		return {
-				id: privateIdUserId,
-				sub: subjectId,
-				email,
-				emailVerified,
-				name: fallbackName
-		};
 }
 
 export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
@@ -59,8 +22,6 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 
 		// Used by the OIDC /authorize flow: creates the session and persists the pending context without polling for completion.
 		async beginAsyncAuthentication(correlationId: string): Promise<{ launchUrl: string; sessionId: string }> {
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER beginAsyncAuthentication");
 				const session = await this.launchSession(correlationId);
 				// Log the exact PrivateID sessionId to compare against incoming webhook sessionIds.
 				console.info("[PrivateID] beginAsyncAuthentication sessionId", { sessionId: session.sessionId, transactionId: session.transactionId, correlationId });
@@ -71,32 +32,17 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 				const session = await this.client.handleCallback(payload);
 				const result = await this.client.getResult();
 
-				// TEMP-PRIVATEID-RESULT: Sprint 9.4 - identity-only fields returned by PrivateID after face match; no secrets/biometric data.
-				const rawIdentityFields = (result?.rawResponse ?? {}) as Record<string, unknown>;
-				console.info("TEMP-PRIVATEID-RESULT", {
-						privateIdUserId: result?.privateIdUserId,
-						email: rawIdentityFields.email,
-						emailVerified: rawIdentityFields.emailVerified ?? rawIdentityFields.email_verified,
-						name: rawIdentityFields.name,
-						transactionId: result?.transactionId,
-						sessionId: result?.sessionId
-				});
-
 				const user = await this.returnResult(result, session);
 				this.statusSnapshot = { state: "ready", sessionId: session.sessionId };
 				return { session, user, result: result ?? undefined };
 		}
 
 		async authenticate(): Promise<AuthenticatedUser> {
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER authenticate");
 				const session = await this.launchSession();
 				await this.waitForSession(session);
 
 				const timeoutMs = configuration.getNumber("PRIVATEID_POLL_TIMEOUT_MS", 30_000);
 				const pollIntervalMs = configuration.getNumber("PRIVATEID_POLL_INTERVAL_MS", 1000);
-				// TEMP-AUDIT-LOG: Sprint 8.15.1 - runtime proof of execution path.
-				console.info("ENTER pollForResult");
 				const result = await this.pollForResult(session, timeoutMs, pollIntervalMs);
 				return await this.returnResult(result, session);
 		}
@@ -154,21 +100,21 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 						return existingAuthenticatedUser;
 				}
 
-				let resolvedIdentityContext: IdentityContext | undefined;
-				if (result?.privateIdUserId) {
-						try {
-								const identityContext = await identityService.resolveIdentity(result.privateIdUserId);
-								resolvedIdentityContext = identityContext.data;
-						} catch (error) {
-								this.statusSnapshot = {
-										state: "ready",
-										sessionId: session.sessionId,
-										message: error instanceof Error ? error.message : "Identity resolution failed"
-								};
-						}
+				const privateIdUserId = result?.privateIdUserId ?? session.sessionId;
+				const candidate = extractIdentityCandidateFromRawResponse(result?.rawResponse);
+
+				let authenticatedUser: AuthenticatedUser;
+				try {
+						authenticatedUser = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, candidate);
+				} catch (error) {
+						this.statusSnapshot = {
+								state: "failed",
+								sessionId: session.sessionId,
+								message: error instanceof Error ? error.message : "Identity resolution failed"
+						};
+						throw error;
 				}
 
-				const authenticatedUser = toAuthenticatedUser(result, session.sessionId, session.transactionId, resolvedIdentityContext);
 				storePrivateIDAuthenticatedUser(session.sessionId, authenticatedUser);
 				return authenticatedUser;
 		}

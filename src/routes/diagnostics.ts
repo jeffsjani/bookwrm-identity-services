@@ -290,24 +290,6 @@ export async function registerDiagnosticsRoutes(
 
 		app.get(
 
-				"/diagnostics/oidc",
-
-				async ()=>{
-						return {
-								discovery: true,
-								jwks: true,
-								authorize: true,
-								token: true,
-								userinfo: true,
-								pkce: true
-						};
-
-				}
-
-		);
-
-		app.get(
-
 				"/diagnostics/oidc/dashboard",
 
 				async ()=>{
@@ -337,11 +319,8 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/privateid",
 										"/privateid/webhook",
 										"/privateid/callback",
-										"/diagnostics/oidc",
 										"/diagnostics/oidc/dashboard",
-										"/diagnostics/oidc/base44",
-										"/diagnostics/idtoken",
-										"/diagnostics/userinfo",									"/diagnostics/debugIdentifiers/:identifier",										"/diagnostics/routes"
+										"/diagnostics/routes"
 								],
 								oidc: [
 										"/.well-known/openid-configuration",
@@ -357,77 +336,6 @@ export async function registerDiagnosticsRoutes(
 						};
 
 				}
-
-		);
-
-		app.get(
-
-			"/diagnostics/oidc/base44",
-
-			async ()=>{
-				return oidcService.getBase44IntegrationStatus();
-
-		}
-
-		);
-
-		// TEMP-DIAGNOSTIC: Sprint 8.19 - proves the actual runtime ID Token claims for a given access token, unsigned.
-		app.get(
-
-			"/diagnostics/idtoken",
-
-			async (request, reply) => {
-				const authorization = request.headers.authorization;
-				if (!authorization || !authorization.startsWith("Bearer ")) {
-					reply.code(401);
-					return { error: "invalid_token", error_description: "Bearer access token is required" };
-				}
-
-				const accessToken = authorization.slice("Bearer ".length).trim();
-				const claims = await oidcService.getDiagnosticIdTokenClaims(accessToken);
-				if (!claims) {
-					reply.code(401);
-					return { error: "invalid_token", error_description: "Access token is invalid or expired" };
-				}
-
-				return claims;
-			}
-
-		);
-
-		// TEMP-DIAGNOSTIC: Sprint 8.19 - proves the actual runtime /userinfo response for a given access token.
-		app.get(
-
-			"/diagnostics/userinfo",
-
-			async (request, reply) => {
-				const authorization = request.headers.authorization;
-				if (!authorization || !authorization.startsWith("Bearer ")) {
-					reply.code(401);
-					return { error: "invalid_token", error_description: "Bearer access token is required" };
-				}
-
-				const accessToken = authorization.slice("Bearer ".length).trim();
-				const claims = await oidcService.getDiagnosticUserInfoClaims(accessToken);
-				if (!claims) {
-					reply.code(401);
-					return { error: "invalid_token", error_description: "Access token is invalid or expired" };
-				}
-
-				return claims;
-			}
-
-		);
-
-		// TEMP-DIAGNOSTIC (Sprint 8.20 validation): raw Base44 debugIdentifiers passthrough, remove after validation.
-		app.get(
-
-			"/diagnostics/debugIdentifiers/:identifier",
-
-			async (request) => {
-				const { identifier } = request.params as { identifier: string };
-				return identityService.debugIdentifiers(identifier);
-			}
 
 		);
 

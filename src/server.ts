@@ -8,6 +8,7 @@ import { registerHealthRoutes } from "./routes/health.js";
 import { registerDiagnosticsRoutes } from "./routes/diagnostics.js";
 import { registerPrivateIdRoutes } from "./routes/privateid.js";
 import { registerIdentityRoutes } from "./routes/identity.js";
+import { registerIdentityAdminRoutes } from "./routes/identityAdmin.js";
 import { oidcService } from "./oidc/OIDCService.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
@@ -37,6 +38,7 @@ registerHealthRoutes(app);
 await registerDiagnosticsRoutes(app);
 await registerPrivateIdRoutes(app);
 await registerIdentityRoutes(app);
+await registerIdentityAdminRoutes(app);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {
