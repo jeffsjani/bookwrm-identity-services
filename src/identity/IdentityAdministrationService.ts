@@ -5,7 +5,7 @@ import { getIdentityAudit, type IdentityAuditEntry } from "./IdentityAudit.js";
 import { getCorrelationStoreSize } from "../oidc/CorrelationStore.js";
 import { getPendingIdentityStats } from "./PendingIdentity.js";
 import { identityRegistry } from "./IdentityRegistry.js";
-import { getPostgresPool } from "./infrastructure/PostgresInfrastructure.js";
+import { getPostgresPool, getSchemaVersionInfo, type SchemaVersionInfo } from "./infrastructure/PostgresInfrastructure.js";
 import type { IdentityProvider, IdentitySubject } from "../models/IdentitySubject.js";
 import { getRedisClient } from "../oidc/infrastructure/RedisInfrastructure.js";
 import { oidcService } from "../oidc/OIDCService.js";
@@ -47,6 +47,8 @@ export type IdentityAdministrationHealth = {
 		privateId: ComponentHealth;
 		correlation: ComponentHealth & { pendingCount: number };
 		pendingIdentity: ComponentHealth & { total: number; pending: number; blocked: number };
+		schemaVersion: string | null;
+		migrationStatus: SchemaVersionInfo["migrationStatus"];
 };
 
 function toHistory(subject: IdentitySubject): IdentityHistory {
@@ -169,6 +171,18 @@ function checkPendingIdentity(): ComponentHealth & { total: number; pending: num
 		return { status: "healthy", ...stats };
 }
 
+async function checkSchemaVersion(): Promise<SchemaVersionInfo> {
+		if (configuration.getIdentityRegistryDriver() !== "postgres") {
+				return { schemaVersion: null, migrationStatus: "unknown" };
+		}
+
+		try {
+				return await getSchemaVersionInfo();
+		} catch {
+				return { schemaVersion: null, migrationStatus: "unknown" };
+		}
+}
+
 // Read-only aggregation over IdentityRegistry + governance metadata for the Identity Administration API (Phase 4).
 export class IdentityAdministrationService {
 		async listSubjects(): Promise<IdentitySubject[]> {
@@ -204,7 +218,12 @@ export class IdentityAdministrationService {
 		}
 
 		async getHealth(): Promise<IdentityAdministrationHealth> {
-				const [registry, redis, postgresql] = await Promise.all([checkRegistry(), checkRedis(), checkPostgres()]);
+				const [registry, redis, postgresql, schemaVersionInfo] = await Promise.all([
+						checkRegistry(),
+						checkRedis(),
+						checkPostgres(),
+						checkSchemaVersion()
+				]);
 				return {
 						registry,
 						redis,
@@ -213,7 +232,9 @@ export class IdentityAdministrationService {
 						jwks: checkJwks(),
 						privateId: checkPrivateId(),
 						correlation: checkCorrelation(),
-						pendingIdentity: checkPendingIdentity()
+						pendingIdentity: checkPendingIdentity(),
+						schemaVersion: schemaVersionInfo.schemaVersion,
+						migrationStatus: schemaVersionInfo.migrationStatus
 				};
 		}
 }

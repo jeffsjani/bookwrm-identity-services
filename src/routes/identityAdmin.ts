@@ -83,7 +83,8 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 
 		app.get("/identity/admin/health", async (_request, reply) => {
 				const health = await identityAdministrationService.getHealth();
-				const unhealthy = Object.values(health).some((component) => component.status === "unhealthy");
+				const { schemaVersion, migrationStatus, ...componentHealthEntries } = health;
+				const unhealthy = Object.values(componentHealthEntries).some((component) => component.status === "unhealthy");
 				if (unhealthy) {
 						reply.code(503);
 				}

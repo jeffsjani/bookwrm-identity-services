@@ -14,3 +14,10 @@ CREATE TABLE IF NOT EXISTS identity_subjects (
 		CONSTRAINT identity_subjects_oidc_subject_key UNIQUE (oidc_subject),
 		CONSTRAINT identity_subjects_provider_identity_key UNIQUE (primary_provider, primary_provider_subject)
 );
+
+-- Formal schema version tracking (Sprint 5.1).
+CREATE TABLE IF NOT EXISTS schema_migrations (
+		version TEXT PRIMARY KEY,
+		description TEXT,
+		applied_at TIMESTAMP NOT NULL
+);

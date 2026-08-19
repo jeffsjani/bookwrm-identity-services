@@ -17,6 +17,15 @@ export interface PostgresClient {
 let pool: pg.Pool | undefined;
 let schemaEnsured = false;
 
+// Current Identity Registry schema version (Task 3, Sprint 5.1).
+export const CURRENT_SCHEMA_VERSION = "1.0.0";
+const CURRENT_SCHEMA_DESCRIPTION = "Initial Identity Registry";
+
+export type SchemaVersionInfo = {
+		schemaVersion: string | null;
+		migrationStatus: "current" | "pending" | "unknown";
+};
+
 function buildPool(): pg.Pool {
 		const connectionString = configuration.require("DATABASE_URL");
 		return new Pool({ connectionString });
@@ -39,7 +48,33 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 		const schemaPath = join(dirname(fileURLToPath(import.meta.url)), "..", "schema.sql");
 		const ddl = readFileSync(schemaPath, "utf8");
 		await client.query(ddl);
+
+		// Record the current version exactly once; never duplicated on subsequent startups.
+		await client.query(
+				`INSERT INTO schema_migrations (version, description, applied_at)
+				 VALUES ($1, $2, $3)
+				 ON CONFLICT (version) DO NOTHING`,
+				[CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION, new Date()]
+		);
+
 		schemaEnsured = true;
+}
+
+// Read-only for health reporting (Task 4); never mutates schema_migrations.
+export async function getSchemaVersionInfo(client: PostgresClient = getPostgresPool()): Promise<SchemaVersionInfo> {
+		const result = await client.query<{ version: string }>(
+				`SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1`
+		);
+
+		const latestVersion = result.rows[0]?.version ?? null;
+		if (!latestVersion) {
+				return { schemaVersion: null, migrationStatus: "unknown" };
+		}
+
+		return {
+				schemaVersion: latestVersion,
+				migrationStatus: latestVersion === CURRENT_SCHEMA_VERSION ? "current" : "pending"
+		};
 }
 
 export async function closePostgresPool(): Promise<void> {
