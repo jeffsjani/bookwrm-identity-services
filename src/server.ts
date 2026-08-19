@@ -9,6 +9,7 @@ import { registerDiagnosticsRoutes } from "./routes/diagnostics.js";
 import { registerPrivateIdRoutes } from "./routes/privateid.js";
 import { registerIdentityRoutes } from "./routes/identity.js";
 import { registerIdentityAdminRoutes } from "./routes/identityAdmin.js";
+import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
 import { oidcService } from "./oidc/OIDCService.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
@@ -20,6 +21,16 @@ const app = Fastify({
 });
 
 configuration.validatePrivateIdConfiguration();
+
+// Bootstrap the Identity Registry schema (identity_subjects, schema_migrations) before serving traffic.
+// Non-fatal: a transient DB issue here surfaces via /identity/admin/health instead of blocking boot.
+if (configuration.getIdentityRegistryDriver() === "postgres") {
+		try {
+				await ensureIdentitySchema();
+		} catch (error) {
+				app.log.error({ error }, "Failed to bootstrap Identity Registry schema at startup");
+		}
+}
 
 // Security
 await app.register(helmet);

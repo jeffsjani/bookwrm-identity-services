@@ -13,7 +13,7 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
   - `PRIVATEID_*` — PrivateID API credentials, redirect/callback URLs, webhook shared secret.
   - `BASE44_BASE_URL`, `IDENTITY_API_PATH`, `BOOKWRM_IDENTITY_API_KEY` — legacy Bookwrm-facing routes only (`routes/identity.ts`); not used by the OIDC login path since Phase 3.
 - On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` and `GET /identity/admin/health` gate readiness.
-- The `identity_subjects` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` on first Postgres repository use — no separate migration step is required for this table today.
+- The `identity_subjects` and `schema_migrations` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` at process startup in `server.ts` — no separate migration step is required for this table today.
 
 ## 2. Backup
 
