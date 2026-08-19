@@ -11,9 +11,9 @@ import type { IdentitySubjectRepository, UpdateIdentitySubjectInput } from "./Id
 export type IdentityLinkRequest = {
 		provider: IdentityProvider;
 		providerSubject: string;
-		email: string;
-		emailVerified: boolean;
-		displayName: string;
+		email?: string;
+		emailVerified?: boolean;
+		displayName?: string;
 };
 
 function defaultRepository(): IdentitySubjectRepository {
@@ -47,12 +47,6 @@ export class IdentityRegistry {
 		// Reuses the existing subject for a known provider identity, or mints a new one on first authentication.
 		// Atomicity under concurrent calls is guaranteed by the repository (database uniqueness), not by this method.
 		async resolveOrCreate(request: IdentityLinkRequest): Promise<IdentitySubject> {
-				if (!request.emailVerified) {
-						identityMetrics.recordEmailVerificationFailure();
-						identityMetrics.recordFailedLinking();
-						throw new Error("IdentitySubject cannot be created without verified email");
-				}
-
 				try {
 						const existing = await this.repository.findByProviderSubject(request.provider, request.providerSubject);
 						const subject = await this.repository.resolveOrCreate({

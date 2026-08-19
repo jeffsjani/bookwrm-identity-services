@@ -609,9 +609,9 @@ export class OIDCService {
 							const refreshToken = this.createOpaqueToken();
 							await this.storeAccessToken(accessToken, {
 									sub: claims.sub,
-									email: claims.email,
-									emailVerified: claims.emailVerified,
-									name: claims.name,
+										...(claims.email !== undefined ? { email: claims.email } : {}),
+										...(claims.emailVerified !== undefined ? { emailVerified: claims.emailVerified } : {}),
+										...(claims.name !== undefined ? { name: claims.name } : {}),
 									clientId,
 									nonce: codeRecord.nonce,
 									scope: codeRecord.scope
@@ -623,12 +623,13 @@ export class OIDCService {
 							});
 							const idToken = await this.createIdToken({
 							issuer,
-							subject: codeRecord.userId,
+								subject: codeRecord.userSub,
 							audience: clientId,
 							nonce: codeRecord.nonce,
 							scope: codeRecord.scope,
-							email: claims.email,
-							emailVerified: claims.emailVerified,
+							...(claims.email !== undefined ? { email: claims.email } : {}),
+							...(claims.emailVerified !== undefined ? { emailVerified: claims.emailVerified } : {}),
+								...(claims.name !== undefined ? { name: claims.name } : {}),
 							iat: now,
 							exp: now + 300
 						});
@@ -975,8 +976,9 @@ export class OIDCService {
 			audience: string;
 			nonce: string;
 			scope: string;
-			email: string;
-			emailVerified: boolean;
+		email?: string;
+			emailVerified?: boolean;
+			name?: string;
 			iat: number;
 			exp: number;
 		}): Record<string, unknown> {
@@ -986,8 +988,9 @@ export class OIDCService {
 				aud: input.audience,
 				nonce: input.nonce,
 				scope: input.scope,
-				email: input.email,
-				email_verified: input.emailVerified,
+				...(input.email !== undefined ? { email: input.email } : {}),
+				...(input.emailVerified !== undefined ? { email_verified: input.emailVerified } : {}),
+				...(input.name !== undefined ? { name: input.name } : {}),
 				iat: input.iat,
 				exp: input.exp
 			};
@@ -999,8 +1002,9 @@ export class OIDCService {
 			audience: string;
 			nonce: string;
 			scope: string;
-			email: string;
-			emailVerified: boolean;
+			email?: string;
+			emailVerified?: boolean;
+			name?: string;
 			iat: number;
 			exp: number;
 		}): Promise<string> {

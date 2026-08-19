@@ -76,18 +76,31 @@ describe("IdentityRegistry", () => {
 				expect(byProvider?.oidcSubject).toBe(first.oidcSubject);
 		});
 
-		it("refuses to create an identity without a verified email", async () => {
+		it("creates an identity with an unverified email", async () => {
 				const registry = buildRegistry();
 
-				await expect(
-						registry.resolveOrCreate({
-								provider: "PrivateID",
-								providerSubject: "privateid-user-unverified",
-								email: "unverified@example.com",
-								emailVerified: false,
-								displayName: "Unverified User"
-						})
-				).rejects.toThrow("verified email");
+				const subject = await registry.resolveOrCreate({
+						provider: "PrivateID",
+						providerSubject: "privateid-user-unverified",
+						email: "unverified@example.com",
+						emailVerified: false,
+						displayName: "Unverified User"
+				});
+
+				expect(subject.emailVerified).toBe(false);
+		});
+
+		it("creates an identity without email", async () => {
+				const registry = buildRegistry();
+
+				const subject = await registry.resolveOrCreate({
+						provider: "PrivateID",
+						providerSubject: "privateid-user-no-email",
+						displayName: undefined
+				});
+
+				expect(subject.oidcSubject).toBeTruthy();
+				expect(subject.email).toBeUndefined();
 		});
 
 		it("updates lastAuthenticatedAt on repeat authentication without changing the subject", async () => {

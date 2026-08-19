@@ -42,7 +42,7 @@ describe("OIDC login identity resolution (RC1 Phase 3)", () => {
 				expect(authenticatedUser).toBeDefined();
 				expect(authenticatedUser?.sub).not.toBe(privateIdUserId);
 				expect(authenticatedUser?.sub).not.toBe(session.transactionId);
-				expect(authenticatedUser?.email.length).toBeGreaterThan(0);
+				expect(authenticatedUser?.email).toBeUndefined();
 
 				await app.close();
 		});

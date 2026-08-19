@@ -5,9 +5,9 @@ export type CreateIdentitySubjectInput = {
 		oidcSubject: string;
 		primaryProvider: IdentityProvider;
 		primaryProviderSubject: string;
-		email: string;
-		emailVerified: boolean;
-		displayName: string;
+		email?: string;
+		emailVerified?: boolean;
+		displayName?: string;
 		status: IdentitySubjectStatus;
 };
 

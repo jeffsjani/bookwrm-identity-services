@@ -38,15 +38,25 @@ describe("resolveAuthenticatedUserFromPrivateId (RC1 Phase 3, Task 8)", () => {
 				expect(afterRestart.sub).toBe(beforeRestart.sub);
 		});
 
-		it("refuses to create an identity without a verified email", async () => {
+		it("creates an identity when email is unverified", async () => {
 				const privateIdUserId = `resolver-unverified-${randomUUID()}`;
 
-				await expect(
-						resolveAuthenticatedUserFromPrivateId(privateIdUserId, {
-								email: "resolver-unverified@example.com",
-								emailVerified: false,
-								displayName: "Resolver Unverified"
-						})
-				).rejects.toThrow("verified email");
+				const user = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, {
+						email: "resolver-unverified@example.com",
+						emailVerified: false,
+						displayName: "Resolver Unverified"
+				});
+
+				expect(user.sub).not.toBe(privateIdUserId);
+				expect(user.emailVerified).toBe(false);
+		});
+
+		it("creates an identity without email", async () => {
+				const user = await resolveAuthenticatedUserFromPrivateId(`resolver-no-email-${randomUUID()}`, {});
+
+				expect(user.sub).toBeTruthy();
+				expect(user.email).toBeUndefined();
+				expect(user.emailVerified).toBeUndefined();
+				expect(user.name).toBeUndefined();
 		});
 });

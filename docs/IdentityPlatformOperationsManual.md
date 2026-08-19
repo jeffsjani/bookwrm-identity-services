@@ -15,6 +15,30 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
 - On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` and `GET /identity/admin/health` gate readiness.
 - The `identity_subjects` and `schema_migrations` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` at process startup in `server.ts` — no separate migration step is required for this table today.
 
+## 1.1 Identity First, Account Second
+
+Successful biometric authentication creates an `IdentitySubject` immediately, even when PrivateID has not supplied an email or has supplied `emailVerified: false`. Email, email verification, and display name are optional claims and may be linked or updated later through the claim policy. Pending account activation state must never prevent the stable OIDC `sub` from being issued.
+
+```mermaid
+sequenceDiagram
+  participant P as PrivateID
+  participant W as Webhook
+  participant R as IdentityRegistry
+  participant I as IdentitySubject
+  participant C as Claims
+  participant T as OIDC Token Endpoint
+
+  P->>W: Successful biometric authentication
+  W->>R: resolveOrCreate(privateIdUserId, optional claims)
+  R->>I: Create or reuse stable IdentitySubject
+  I-->>R: Stable oidcSubject (sub)
+  R-->>W: AuthenticatedUser with sub
+  W->>T: Authorization code flow
+  T->>C: Build sub and available claims
+  C-->>T: sub plus optional email, email_verified, name
+  T-->>P: ID Token
+```
+
 ## 2. Backup
 
 - The Identity Registry (`identity_subjects` table) is the only durable state that must be backed up. Redis holds nothing durable by design (Task 4/RC1-K).
@@ -62,7 +86,7 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
 | Symptom | Likely cause | Where to look |
 |---|---|---|
 | Login succeeds but user gets a different `sub` each time | `resolveOrCreate` is creating duplicate rows for the same person | Check `(primary_provider, primary_provider_subject)` uniqueness in `identity_subjects`; verify the same `privateIdUserId` is being sent by PrivateID each time |
-| `POST /privateid/webhook` returns `FAILURE` with an identity error | Unverified email from PrivateID (RC1-F) | `PendingIdentity` stage will show `blocked`; check `identity_email_verification_failures_total` metric |
+| `POST /privateid/webhook` returns `FAILURE` with an identity error | Identity Registry or database failure | Check the webhook error and Identity Registry health; missing or unverified email does not block subject creation |
 | `GET /identity/admin/subject/:id` returns 404 for a real subject | Malformed `oidcSubject` (must be UUID) | Fixed in Phase 5 — malformed IDs return 404, not 500; confirm the ID being queried is correct |
 | `/identity/admin/health` reports `postgresql: not_configured` | `IDENTITY_REGISTRY_DRIVER` is not `postgres` | Check environment configuration; this should never be `memory` outside tests |
 | Claim update silently ignored | `IdentityClaimPolicy` rejected a conflicting/duplicate proposal (by design) | Check `identity_claim_updates_total{decision="reject"}` and `GET /identity/admin/subject/:id/audit` for the `reason` |

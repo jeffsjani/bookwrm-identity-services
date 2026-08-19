@@ -29,6 +29,19 @@ describe("IdentityClaimPolicy", () => {
 				expect(result.decision).toBe("accept");
 		});
 
+			it("treats a missing email as no claim", () => {
+					const result = evaluateClaim({
+							claim: "email",
+							currentValue: undefined,
+							currentSource: undefined,
+							proposedValue: undefined,
+							proposedSource: "PRIVATE_ID"
+					});
+
+					expect(result.decision).toBe("ignore");
+					expect(result.reason).toBe("No Claim");
+			});
+
 		it("rejects a conflicting proposal from a different source than the one that owns the current value", () => {
 				const result = evaluateClaim({
 						claim: "email",
