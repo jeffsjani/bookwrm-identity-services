@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql",
     "start": "node dist/server.js"
   },
   "dependencies": {
