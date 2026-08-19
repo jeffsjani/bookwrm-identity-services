@@ -41,7 +41,8 @@ const DEFAULTS = {
 		MOCK_AUTH_ENABLED: "true",
 		REDIS_ENABLED: "true",
 		CACHE_ENABLED: "true",
-		METRICS_ENABLED: "true"
+		METRICS_ENABLED: "true",
+		IDENTITY_REGISTRY_DRIVER: "postgres"
 } as const;
 
 export class ConfigurationService {
@@ -157,6 +158,16 @@ export class ConfigurationService {
 
 		getFeatureFlag(key: string, fallback: boolean): boolean {
 				return this.getBoolean(key, fallback);
+		}
+
+		// Production always uses Postgres; the in-memory driver exists only for tests (Task 7).
+		getIdentityRegistryDriver(): "postgres" | "memory" {
+				const override = this.get("IDENTITY_REGISTRY_DRIVER")?.trim().toLowerCase();
+				if (override === "memory" || override === "postgres") {
+						return override;
+				}
+
+				return this.isTest() ? "memory" : "postgres";
 		}
 
 		getDefaults(): typeof DEFAULTS {

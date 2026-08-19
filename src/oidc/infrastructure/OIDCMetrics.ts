@@ -9,6 +9,11 @@ type OIDCMetricLabels = {
 const registry = new Registry();
 collectDefaultMetrics({ register: registry });
 
+// Shared with IdentityMetrics.ts so /metrics exposes both OIDC and Identity Registry metrics from one registry.
+export function getSharedMetricsRegistry(): Registry {
+		return registry;
+}
+
 const oidcRequestCounter = new Counter({
 		name: "oidc_requests_total",
 		help: "Total OIDC requests",

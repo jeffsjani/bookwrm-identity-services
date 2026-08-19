@@ -43,3 +43,8 @@ export function consumeByCorrelationId(correlationId: string): PendingAuthorizat
 export function findCorrelationIdForSession(sessionId: string): string | undefined {
 		return correlationIdBySessionId.get(sessionId);
 }
+
+// Health/observability only (Phase 5 Task 1); not used for any decision logic.
+export function getCorrelationStoreSize(): number {
+		return recordsByCorrelationId.size;
+}
