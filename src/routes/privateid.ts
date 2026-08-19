@@ -227,7 +227,11 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				if (status === "SUCCESS") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "ready", Date.now());
-						const privateIdUserId = pickObjectValue(body, ["privateIdUserId", "privateiduserid", "userId", "subject"]) ?? record.session.transactionId;
+						// Release Patch 6: "puid" is PrivateID's stable per-person identifier (stable across VERIFY sessions);
+						// "guid" is per-session/per-request only and must never be used as the provider subject. Legacy aliases
+						// kept for backward compatibility with mock/test payloads that predate the real production field names.
+						// The transactionId fallback guarantees primary_provider_subject is never null.
+						const privateIdUserId = pickObjectValue(body, ["puid", "privateIdUserId", "privateiduserid", "userId", "subject"]) ?? record.session.transactionId;
 						responseContext.resolvedUserId = privateIdUserId;
 						const result: PrivateIDResult = {
 								success: true,
