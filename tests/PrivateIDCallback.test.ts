@@ -16,7 +16,7 @@ describe("PrivateID callback", () => {
 				const payload = response.json() as Record<string, unknown>;
 				expect(payload).toMatchObject({
 						status: "pending",
-						message: "Authentication still processing...",
+						message: "Authentication Incomplete",
 						retry: true
 				});
 
@@ -39,7 +39,7 @@ describe("PrivateID callback", () => {
 						status: "created",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						message: "Authentication still processing...",
+						message: "Authentication Incomplete",
 						retry: true
 				});
 

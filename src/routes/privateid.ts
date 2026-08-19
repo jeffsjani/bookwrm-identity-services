@@ -352,12 +352,14 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 					return {
 							status: "pending",
 							reason,
-							message: "Authentication still processing...",
+							message: "Authentication Incomplete",
 							retry: true
 					};
 				}
 
-				const isComplete = resolvedRecord.session.status === "ready" && Boolean(resolvedRecord.session.completed);
+				const isComplete = resolvedRecord.session.status === "ready"
+						&& Boolean(resolvedRecord.session.completed)
+						&& Boolean(resolvedRecord.result);
 				callbackSessionId = resolvedRecord.session.sessionId;
 				if (!isComplete) {
 					retry = true;
@@ -368,7 +370,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							reason,
 							sessionId: resolvedRecord.session.sessionId,
 							transactionId: resolvedRecord.session.transactionId,
-							message: "Authentication still processing...",
+							message: "Authentication Incomplete",
 							retry: true
 					};
 				}

@@ -7,6 +7,7 @@ import type { PrivateIDSession, PrivateIDSessionStatus } from "./PrivateIDSessio
 import { findPrivateIDSession, getCurrentPrivateIDSessionRecord, storePrivateIDResult, storePrivateIDSession } from "./PrivateIDSessionStore.js";
 
 type PrivateIDSessionApiResponse = Record<string, unknown>;
+const PRIVATEID_WEBHOOK_CALLBACK_URL = "https://identity.bookwrm.com/privateid/webhook";
 
 export type PrivateIDCallbackPayload = {
 		reason: string;
@@ -284,12 +285,7 @@ export class PrivateIDClient {
 		}
 
 		private resolveCallbackUrl(): string {
-				const callbackUrl = configuration.get("PRIVATEID_CALLBACK_URL")?.trim();
-				if (!callbackUrl) {
-						throw new Error("Missing required configuration: PRIVATEID_CALLBACK_URL");
-				}
-
-				return callbackUrl;
+				return PRIVATEID_WEBHOOK_CALLBACK_URL;
 		}
 
 		private resolveCallbackHeaders(): Record<string, string> {
