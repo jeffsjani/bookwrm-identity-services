@@ -2,11 +2,10 @@ import type { OIDCAuthorizationCode } from "../../models/OIDCAuthorizationCode.j
 import type { OIDCLogEntry } from "../types.js";
 import { getRedisClient, oidcRedisKey } from "./RedisInfrastructure.js";
 
+// Release Patch 6.1: no email/emailVerified/name here -- /userinfo re-resolves current claims from the
+// Identity Registry by `sub` so it never serves a stale snapshot from token-issuance time.
 type AccessTokenRecord = {
 		sub: string;
-		email?: string;
-		emailVerified?: boolean;
-		name?: string;
 		clientId: string;
 		nonce: string;
 		scope: string;

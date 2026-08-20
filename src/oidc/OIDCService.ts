@@ -15,6 +15,7 @@ import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
+import { identityRegistry } from "../identity/IdentityRegistry.js";
 import type { OIDCAuthorizationCode } from "../models/OIDCAuthorizationCode.js";
 import { ClaimsService } from "./ClaimsService.js";
 import { oidcClaims } from "./claims.js";
@@ -429,11 +430,13 @@ export class OIDCService {
 										userId: user
 								});
 
+								// Release Patch 6.1: resolve current claims live from the Identity Registry, not from the access token record.
+								const currentClaims = await this.resolveCurrentClaims(tokenRecord.sub);
 								const userInfoResponse = {
 										sub: tokenRecord.sub,
-										email: tokenRecord.email,
-										email_verified: tokenRecord.emailVerified,
-										name: tokenRecord.name
+										...(currentClaims.email !== undefined ? { email: currentClaims.email } : {}),
+										...(currentClaims.emailVerified !== undefined ? { email_verified: currentClaims.emailVerified } : {}),
+										...(currentClaims.name !== undefined ? { name: currentClaims.name } : {})
 								};
 								return userInfoResponse;
 						} catch (err) {
@@ -588,13 +591,15 @@ export class OIDCService {
 
 								const now = Math.floor(Date.now() / 1000);
 								const issuer = this.resolveIssuer();
-								// Sprint 8.15: the code record already reflects the PrivateID-authenticated user; no re-authentication needed.
+								// Release Patch 6.1: the code only carries userId/userSub -- mutable claims are re-resolved live from the
+								// Identity Registry here, so an Identity Registry update after code issuance is never missed.
+							const currentClaims = await this.resolveCurrentClaims(codeRecord.userSub);
 							const authenticatedUser: AuthenticatedUser = {
 									id: codeRecord.userId,
 									sub: codeRecord.userSub,
-									email: codeRecord.userEmail,
-									emailVerified: codeRecord.userEmailVerified,
-									name: codeRecord.userName
+									email: currentClaims.email,
+									emailVerified: currentClaims.emailVerified,
+									name: currentClaims.name
 							};
 							user = authenticatedUser.id;
 							await this.rateLimiter.assertWithinLimits({
@@ -609,9 +614,6 @@ export class OIDCService {
 							const refreshToken = this.createOpaqueToken();
 							await this.storeAccessToken(accessToken, {
 									sub: claims.sub,
-										...(claims.email !== undefined ? { email: claims.email } : {}),
-										...(claims.emailVerified !== undefined ? { emailVerified: claims.emailVerified } : {}),
-										...(claims.name !== undefined ? { name: claims.name } : {}),
 									clientId,
 									nonce: codeRecord.nonce,
 									scope: codeRecord.scope
@@ -875,6 +877,8 @@ export class OIDCService {
 		private async issueAuthorizationRedirect(user: AuthenticatedUser, context: PendingAuthorizationContext): Promise<string> {
 				const authorizationCode = this.createAuthorizationCode();
 
+				// Release Patch 6.1: the code carries only stable protocol fields (sub/client/nonce/scope/PKCE/expiration);
+				// mutable claims are re-resolved from the Identity Registry at /token time, never snapshotted here.
 				await this.storeAuthorizationCode({
 						code: authorizationCode,
 						clientId: context.clientId,
@@ -883,10 +887,7 @@ export class OIDCService {
 						nonce: context.nonce,
 						codeChallenge: context.codeChallenge,
 						userId: user.id,
-						userSub: user.sub,
-						userEmail: user.email,
-						userEmailVerified: user.emailVerified,
-						userName: user.name
+						userSub: user.sub
 				});
 
 				const redirectTarget = new URL(context.redirectUri);
@@ -912,6 +913,21 @@ export class OIDCService {
 				}
 
 				return this.issueAuthorizationRedirect(user, pendingContext);
+		}
+
+		// Release Patch 6.1: sole point where /token and /userinfo pull mutable claims -- always a live
+		// Identity Registry read by oidcSubject, never a cached/snapshotted value.
+		private async resolveCurrentClaims(oidcSubject: string): Promise<{ email?: string; emailVerified?: boolean; name?: string }> {
+				const subject = await identityRegistry.findByOidcSubject(oidcSubject);
+				if (!subject) {
+						return {};
+				}
+
+				return {
+						email: subject.email,
+						emailVerified: subject.emailVerified,
+						name: subject.displayName
+				};
 		}
 
 		private createOpaqueToken(): string {
