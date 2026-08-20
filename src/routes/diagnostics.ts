@@ -4,6 +4,8 @@ import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
+import { identityRegistry } from "../identity/IdentityRegistry.js";
+import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 
@@ -13,6 +15,8 @@ type ResolveBody = {
 
 type ClaimsDiagnosticsBody = {
 		subject?: string;
+		provider?: IdentityProvider;
+		providerSubject?: string;
 };
 
 type PrivateIdDiagnosticsResponse = {
@@ -319,12 +323,32 @@ export async function registerDiagnosticsRoutes(
 
 						const body = request.body as ClaimsDiagnosticsBody;
 						const subject = body?.subject?.trim();
-						if (!subject) {
-								reply.code(400);
-								return { error: "invalid_request", error_description: "subject is required" };
+						let oidcSubject = subject;
+						let identitySubject;
+						if (!oidcSubject && body?.provider && body?.providerSubject?.trim()) {
+							identitySubject = await identityRegistry.findByProvider(body.provider, body.providerSubject.trim());
+							if (!identitySubject) {
+								reply.code(404);
+								return { error: "not_found", error_description: "Identity subject not found" };
+							}
+
+							oidcSubject = identitySubject.oidcSubject;
 						}
 
-						return oidcService.getClaimsSnapshot(subject);
+						if (!oidcSubject) {
+								reply.code(400);
+							return { error: "invalid_request", error_description: "subject or provider and providerSubject are required" };
+						}
+
+						identitySubject ??= await identityRegistry.findByOidcSubject(oidcSubject);
+						const snapshot = await oidcService.getClaimsSnapshot(oidcSubject);
+						return {
+							...snapshot,
+							identityRegistry: {
+								...snapshot.identityRegistry,
+								...(identitySubject ? { primaryProviderSubject: identitySubject.primaryProviderSubject } : {})
+							}
+						};
 				}
 
 		);

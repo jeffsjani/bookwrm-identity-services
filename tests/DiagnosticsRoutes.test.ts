@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityService } from "../src/identity/IdentityService.js";
+import { oidcService } from "../src/oidc/OIDCService.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("Diagnostics routes", () => {
@@ -187,5 +189,48 @@ describe("Diagnostics routes", () => {
 				} finally {
 						await app.close();
 				}
+		});
+
+		it("resolves claims diagnostics by provider subject", async () => {
+			const identitySubject = {
+				id: "identity-id",
+				oidcSubject: "oidc-subject",
+				primaryProvider: "PrivateID" as const,
+				primaryProviderSubject: "puid-123",
+				email: "user@example.com",
+				emailVerified: true,
+				displayName: "Example User",
+				status: "ACTIVE" as const,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				updatedAt: "2026-01-01T00:00:00.000Z"
+			};
+			const findByProviderSpy = vi.spyOn(identityRegistry, "findByProvider").mockResolvedValue(identitySubject);
+			const findByOidcSubjectSpy = vi.spyOn(identityRegistry, "findByOidcSubject").mockResolvedValue(identitySubject);
+			const claimsSnapshot = {
+				identityRegistry: { sub: "oidc-subject", primaryProviderSubject: "puid-123", email: "user@example.com", emailVerified: true },
+				idTokenClaims: { sub: "oidc-subject", email: "user@example.com", email_verified: true },
+				userInfoClaims: { sub: "oidc-subject", email: "user@example.com", email_verified: true }
+			};
+			const claimsSnapshotSpy = vi.spyOn(oidcService, "getClaimsSnapshot").mockResolvedValue(claimsSnapshot);
+
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+					method: "POST",
+					url: "/diagnostics/claims",
+					headers: { authorization: "Bearer test-key" },
+					payload: { provider: "PrivateID", providerSubject: "puid-123" }
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(findByProviderSpy).toHaveBeenCalledWith("PrivateID", "puid-123");
+				expect(claimsSnapshotSpy).toHaveBeenCalledWith("oidc-subject");
+				expect(response.json()).toEqual(claimsSnapshot);
+			} finally {
+				findByProviderSpy.mockRestore();
+				findByOidcSubjectSpy.mockRestore();
+				claimsSnapshotSpy.mockRestore();
+				await app.close();
+			}
 		});
 });
