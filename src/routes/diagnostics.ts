@@ -11,6 +11,10 @@ type ResolveBody = {
 		privateIdUserId?: string;
 };
 
+type ClaimsDiagnosticsBody = {
+		subject?: string;
+};
+
 type PrivateIdDiagnosticsResponse = {
 		configuration: {
 				configured: boolean;
@@ -299,6 +303,32 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
+		// Release Patch 6.2: temporary read-only endpoint to verify what /token and /userinfo would issue
+		// for a given oidcSubject, ahead of the production PAT-1 rollout. Remove after verification.
+		app.post(
+
+				"/diagnostics/claims",
+
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const body = request.body as ClaimsDiagnosticsBody;
+						const subject = body?.subject?.trim();
+						if (!subject) {
+								reply.code(400);
+								return { error: "invalid_request", error_description: "subject is required" };
+						}
+
+						return oidcService.getClaimsSnapshot(subject);
+				}
+
+		);
+
 		app.get(
 
 				"/diagnostics/routes",
@@ -320,6 +350,7 @@ export async function registerDiagnosticsRoutes(
 										"/privateid/webhook",
 										"/privateid/callback",
 										"/diagnostics/oidc/dashboard",
+										"/diagnostics/claims",
 										"/diagnostics/routes"
 								],
 								oidc: [

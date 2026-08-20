@@ -930,6 +930,39 @@ export class OIDCService {
 				};
 		}
 
+		// Release Patch 6.2: read-only diagnostics snapshot for /diagnostics/claims -- reuses resolveCurrentClaims
+		// and claimsService.toOIDCClaims (the exact code paths /token and /userinfo run) rather than duplicating them.
+		async getClaimsSnapshot(oidcSubject: string): Promise<{
+				identityRegistry: { sub: string; email?: string; emailVerified?: boolean; name?: string };
+				idTokenClaims: { sub: string; email?: string; email_verified?: boolean; name?: string };
+				userInfoClaims: { sub: string; email?: string; email_verified?: boolean; name?: string };
+		}> {
+				const currentClaims = await this.resolveCurrentClaims(oidcSubject);
+				const claims = await this.claimsService.toOIDCClaims({
+						id: oidcSubject,
+						sub: oidcSubject,
+						email: currentClaims.email,
+						emailVerified: currentClaims.emailVerified,
+						name: currentClaims.name
+				});
+
+				return {
+						identityRegistry: { sub: oidcSubject, ...currentClaims },
+						idTokenClaims: {
+								sub: claims.sub,
+								...(claims.email !== undefined ? { email: claims.email } : {}),
+								...(claims.emailVerified !== undefined ? { email_verified: claims.emailVerified } : {}),
+								...(claims.name !== undefined ? { name: claims.name } : {})
+						},
+						userInfoClaims: {
+								sub: oidcSubject,
+								...(currentClaims.email !== undefined ? { email: currentClaims.email } : {}),
+								...(currentClaims.emailVerified !== undefined ? { email_verified: currentClaims.emailVerified } : {}),
+								...(currentClaims.name !== undefined ? { name: currentClaims.name } : {})
+						}
+				};
+		}
+
 		private createOpaqueToken(): string {
 				return randomBytes(32).toString("base64url");
 		}
