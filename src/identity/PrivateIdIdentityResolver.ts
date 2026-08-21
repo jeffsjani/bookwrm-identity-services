@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import { identityRegistry } from "./IdentityRegistry.js";
@@ -54,6 +56,10 @@ function resolveCandidate(candidate: PrivateIdIdentityCandidate): PrivateIdIdent
 	};
 }
 
+function hashProviderSubject(providerSubject: string): string {
+		return createHash("sha256").update(providerSubject).digest("hex");
+}
+
 // PrivateID -> privateIdUserId -> IdentityRegistry.resolveOrCreate() -> PendingIdentity -> persisted IdentitySubject.
 export async function resolveAuthenticatedUserFromPrivateId(
 		privateIdUserId: string,
@@ -64,13 +70,34 @@ export async function resolveAuthenticatedUserFromPrivateId(
 
 		let identitySubject;
 		try {
+				const providerSubject = privateIdUserId;
 				identitySubject = await identityRegistry.resolveOrCreate({
 						provider: "PrivateID",
-						providerSubject: privateIdUserId,
+						providerSubject,
 						email,
 						emailVerified,
 						displayName
 				});
+
+				const verification = await identityRegistry.findByProvider("PrivateID", providerSubject);
+				if (!verification) {
+						console.error("IDENTITY_REGISTRY_PERSISTENCE_FAILED");
+				} else {
+						// TEMPORARY RELEASE PATCH 6.2.3
+						// REMOVE AFTER PRODUCTION PAT VERIFICATION
+						const emailPresent = typeof verification.email === "string" && verification.email.length > 0;
+						const emailVerifiedFlag = verification.emailVerified === true;
+						console.info(
+								[
+										"Persistence Verification",
+										"provider = PrivateID",
+										`providerSubject = ${hashProviderSubject(providerSubject)}`,
+										`oidcSubject = ${verification.oidcSubject}`,
+										`emailPresent = ${emailPresent}`,
+										`emailVerified = ${emailVerifiedFlag}`
+								].join("\n")
+						);
+				}
 		} catch (error) {
 				identityMetrics.recordOidcFailure();
 				throw error;

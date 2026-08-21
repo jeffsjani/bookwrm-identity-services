@@ -90,6 +90,14 @@ function resolveCorrelationId(requestId: string, headers: Record<string, unknown
 				?? requestId;
 }
 
+function redactProviderSubject(providerSubject: string): string {
+		if (providerSubject.length <= 8) {
+				return `${providerSubject}...`;
+		}
+
+		return `${providerSubject.slice(0, 8)}...`;
+}
+
 // Legacy Bookwrm-native path only (no correlationId): still sources identity from Base44's IdentityContext, unchanged.
 function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
@@ -337,6 +345,11 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
+						// TEMPORARY RELEASE PATCH 6.2.3
+						// REMOVE AFTER PRODUCTION PAT VERIFICATION
+						app.log.info(
+								`providerSubject=${redactProviderSubject(privateIdUserId)} oidcSubject=${authenticatedUser.sub} emailPresent=${typeof authenticatedUser.email === "string" && authenticatedUser.email.length > 0} emailVerified=${authenticatedUser.emailVerified === true}`
+						);
 				} else if (status === "FAILURE") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
 						responseContext.sessionCompleted = true;
