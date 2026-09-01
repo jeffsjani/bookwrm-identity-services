@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
@@ -354,4 +354,55 @@ describe("PrivateID callback", () => {
 		});
 
 		await app.close();
-	});});
+	});
+
+	it("Production session creation preserves locally generated transactionId", async () => {
+		const originalFetch = global.fetch;
+		const originalMockMode = process.env.PRIVATEID_MOCK_MODE;
+		
+		const mockApiResponse = {
+			sessionId: "api-session-123",
+			status: "created",
+			launchUrl: "https://privateid.example.com/launch/abc123",
+			expires: Date.now() + 300000,
+			created: Date.now()
+		};
+		
+		const fetchMock = vi.fn().mockResolvedValue(new Response(
+			JSON.stringify(mockApiResponse),
+			{
+				status: 200,
+				headers: { "content-type": "application/json" }
+			}
+		));
+		
+		global.fetch = fetchMock as typeof fetch;
+		process.env.PRIVATEID_MOCK_MODE = "false";
+		
+		try {
+			// Reload configuration to pick up the new PRIVATEID_MOCK_MODE setting
+			const { configuration } = await import("../src/config/ConfigurationService.js");
+			configuration.reload();
+			
+			// Create client in non-mock mode
+			const client = new PrivateIDClient();
+			
+			// Create session - this should call the mocked API
+			const session = await client.createAuthenticationSession();
+			
+			// Verify the locally generated transactionId is preserved in the returned session
+			expect(session.transactionId).toBeDefined();
+			expect(session.transactionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i); // UUID format
+			
+			// Verify the API response fields are also preserved
+			expect(session.sessionId).toBe("api-session-123");
+			expect(session.launchUrl).toBe("https://privateid.example.com/launch/abc123");
+			expect(session.status).toBe("created");
+		} finally {
+			global.fetch = originalFetch;
+			process.env.PRIVATEID_MOCK_MODE = originalMockMode;
+			const { configuration } = await import("../src/config/ConfigurationService.js");
+			configuration.reload();
+		}
+	});
+});

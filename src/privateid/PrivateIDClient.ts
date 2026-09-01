@@ -132,7 +132,10 @@ export class PrivateIDClient {
 						throw new Error(`PrivateID session API request failed (${response.status}): ${rawBody || response.statusText}`);
 				}
 
-				const session = responsePayload as PrivateIDSession;
+			const session = {
+				...responsePayload,
+				transactionId
+			} as PrivateIDSession;
 				if (!session.launchUrl) {
 						throw new Error("PrivateID session API response missing launchUrl");
 				}
