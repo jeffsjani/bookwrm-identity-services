@@ -233,4 +233,125 @@ describe("PrivateID callback", () => {
 
 				await app.close();
 		});
-});
+	// Release Patch 7.0: PrivateID Contract Alignment tests
+	it("session creation generates and stores transactionID", async () => {
+		const { app } = await buildOidcTestApp();
+		const client = new PrivateIDClient();
+		const session = await client.createAuthenticationSession();
+
+		expect(session.transactionId).toBeDefined();
+		expect(session.transactionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i); // UUID format
+		expect(session.sessionId).toBeDefined();
+
+		await app.close();
+	});
+
+	it("webhook correlation succeeds using transactionID", async () => {
+		const { app } = await buildOidcTestApp();
+		const client = new PrivateIDClient();
+		const session = await client.createAuthenticationSession();
+
+		const webhookResponse = await app.inject({
+			method: "POST",
+			url: "/privateid/webhook",
+			headers: {
+				"x-storythink-webhook-secret": "privateid-webhook-secret"
+			},
+			payload: {
+				status: "SUCCESS",
+				sessionId: session.sessionId,
+				transactionId: session.transactionId,
+				privateIdUserId: "dev-user-1",
+				puid: "stable-user-id",
+				guid: "session-unique-id"
+			}
+		});
+
+		expect(webhookResponse.statusCode).toBe(200);
+		const payload = webhookResponse.json() as Record<string, unknown>;
+		expect(payload).toMatchObject({
+			status: "SUCCESS",
+			sessionId: session.sessionId,
+			transactionId: session.transactionId,
+			completed: true
+		});
+		expect((await client.getSession()).status).toBe("ready");
+
+		await app.close();
+	});
+
+	it("webhook accepts legacy metadata.correlationId if transactionID is absent", async () => {
+		const { app } = await buildOidcTestApp();
+		const client = new PrivateIDClient();
+		const session = await client.createAuthenticationSession();
+
+		// Simulate legacy webhook payload without transactionID but with metadata.correlationId
+		const webhookResponse = await app.inject({
+			method: "POST",
+			url: "/privateid/webhook",
+			headers: {
+				"x-storythink-webhook-secret": "privateid-webhook-secret"
+			},
+			payload: {
+				status: "SUCCESS",
+				sessionId: session.sessionId,
+				// Omit transactionId to test legacy fallback
+				// Include legacy metadata.correlationId instead
+				metadata: {
+					correlationId: session.transactionId
+				},
+				privateIdUserId: "dev-user-1",
+				puid: "stable-user-id",
+				guid: "session-unique-id"
+			}
+		});
+
+		expect(webhookResponse.statusCode).toBe(200);
+		const payload = webhookResponse.json() as Record<string, unknown>;
+		expect(payload).toMatchObject({
+			status: "SUCCESS",
+			sessionId: session.sessionId,
+			completed: true
+		});
+		expect((await client.getSession()).status).toBe("ready");
+
+		await app.close();
+	});
+
+	it("webhook prefers transactionID over legacy metadata.correlationId", async () => {
+		const { app } = await buildOidcTestApp();
+		const client = new PrivateIDClient();
+		const session = await client.createAuthenticationSession();
+
+		// Send webhook with both transactionID and metadata.correlationId
+		// Should prefer transactionID
+		const webhookResponse = await app.inject({
+			method: "POST",
+			url: "/privateid/webhook",
+			headers: {
+				"x-storythink-webhook-secret": "privateid-webhook-secret"
+			},
+			payload: {
+				status: "SUCCESS",
+				sessionId: session.sessionId,
+				transactionId: session.transactionId, // Preferred field
+				metadata: {
+					correlationId: "different-id" // Should be ignored
+				},
+				privateIdUserId: "dev-user-1",
+				puid: "stable-user-id",
+				guid: "session-unique-id"
+			}
+		});
+
+		expect(webhookResponse.statusCode).toBe(200);
+		const payload = webhookResponse.json() as Record<string, unknown>;
+		expect(payload).toMatchObject({
+			status: "SUCCESS",
+			sessionId: session.sessionId,
+			transactionId: session.transactionId, // Verified correct transactionId in response
+			completed: true
+		});
+
+		await app.close();
+	});});

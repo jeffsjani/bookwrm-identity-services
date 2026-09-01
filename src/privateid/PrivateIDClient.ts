@@ -53,6 +53,8 @@ export class PrivateIDClient {
 				const redirectUrl = this.resolveRedirectUrl();
 				const callbackUrl = this.resolveCallbackUrl();
 				const callbackHeaders = this.resolveCallbackHeaders();
+				// Release Patch 7.0: Send transactionID to PrivateID API (preferred contract field).
+				// No userId/email: identity is unknown at session creation.
 				const requestBody = {
 					type: "VERIFY",
 					requirements: ["face"],
@@ -62,8 +64,7 @@ export class PrivateIDClient {
 							url: callbackUrl,
 							headers: callbackHeaders
 					},
-					// No userId/email: identity is unknown at session creation, only correlationId is passed.
-					...(correlationId ? { metadata: { correlationId } } : {})
+					transactionID: transactionId
 				};
 
 				const redactedCallbackHeaders = Object.fromEntries(

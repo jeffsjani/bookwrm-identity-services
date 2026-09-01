@@ -215,7 +215,39 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				const sessionId = pickObjectValue(body, ["sessionId", "session_id", "sid"]);
-				const transactionId = pickObjectValue(body, ["transactionId", "transaction_id", "txId", "txnId"]);
+				// Release Patch 7.0: Read transactionID (preferred) with legacy metadata.correlationId fallback.
+				let transactionId = pickObjectValue(body, ["transactionId", "transaction_id", "txId", "txnId"]);
+				let transactionIdSource = "transactionID";
+				if (!transactionId) {
+					// Legacy fallback: support metadata.correlationId from previous contract versions
+					const metadataValue = body.metadata;
+					if (metadataValue && typeof metadataValue === "object") {
+						transactionId = (metadataValue as Record<string, unknown>).correlationId as string | undefined;
+						if (transactionId && typeof transactionId === "string" && transactionId.trim().length > 0) {
+							transactionIdSource = "metadata.correlationId (legacy)";
+							app.log.info(
+								{
+									event: "privateid_webhook_legacy_correlation",
+									requestId,
+									sessionId,
+									message: "Using legacy metadata.correlationId for transactionID - please update PrivateID contract to send transactionID field"
+								},
+								"PrivateID webhook used legacy metadata.correlationId"
+							);
+						}
+					}
+				} else {
+					// Log successful use of the new preferred field
+					app.log.info(
+						{
+							event: "privateid_webhook_transactionid_correlation",
+							requestId,
+							sessionId,
+							message: "Using preferred transactionID field from PrivateID contract"
+						},
+						"PrivateID webhook used transactionID"
+					);
+				}
 				responseContext.sessionId = sessionId;
 				responseContext.transactionId = transactionId;
 				const record = resolvePrivateIDSessionRecord(sessionId, transactionId);
@@ -273,6 +305,21 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 									})
 							},
 							"TEMPORARY: PrivateID SUCCESS webhook structure (remove after one production test)"
+					);
+					// END TEMPORARY
+
+					// TEMPORARY (Release Patch 7.0 verification) - logs PrivateID session details, no secrets.
+					// REMOVE AFTER PRODUCTION CERTIFICATION.
+					const puid = pickObjectValue(body, ["puid", "privateIdUserId", "privateiduserid", "userId", "subject"]);
+					const guid = pickObjectValue(body, ["guid", "gid"]);
+					const status_value = status;
+					app.log.info(
+							{
+									event: "privateid_session_patch_7_0_verification",
+									requestId,
+									message: `PrivateID Session: transactionID=${record.session.transactionId}, sessionId=${record.session.sessionId}, status=${status_value}, puid=${puid ? "[present]" : "[absent]"}, guid=${guid ? "[present]" : "[absent]"}`
+							},
+							"TEMPORARY: PrivateID Session verification (Release Patch 7.0) - REMOVE AFTER PRODUCTION CERTIFICATION"
 					);
 					// END TEMPORARY
 
