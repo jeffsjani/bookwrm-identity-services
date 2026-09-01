@@ -83,6 +83,32 @@ export class PrivateIDClient {
 						})
 				);
 
+				// Release Patch 7.1: Log exact serialized request payload before HTTP POST (diagnostics only).
+				// Mask sensitive headers (API key, webhook secret) but preserve all business-critical fields.
+				const sanitizedHeaders = {
+					"content-type": "application/json",
+					"x-api-key": "[REDACTED]"
+				};
+				const sanitizedCallbackHeaders = Object.fromEntries(
+					Object.entries(callbackHeaders).map(([key, value]) => [key, "[REDACTED]"])
+				);
+				const diagnosticPayload = {
+					endpoint,
+					method: "POST",
+					headers: sanitizedHeaders,
+					body: {
+						...requestBody,
+						callback: {
+							...requestBody.callback,
+							headers: sanitizedCallbackHeaders
+						}
+					}
+				};
+				console.info(
+					"[PrivateID] Session API - exact request to be sent (Release Patch 7.1 diagnostics)",
+					JSON.stringify(diagnosticPayload, null, 2)
+				);
+
 				const response = await fetch(endpoint, {
 						method: "POST",
 						headers: {
