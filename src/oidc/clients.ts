@@ -13,6 +13,12 @@ export type RegisteredOIDCClient = {
 
 const DEFAULT_SCOPES = ["openid", "profile", "email"];
 const DEFAULT_GRANT_TYPES = ["authorization_code", "refresh_token"];
+const BOOKWRM_BASE44_PRODUCTION_CLIENT_ID = "bookwrm-base44-production";
+const BOOKWRM_BASE44_PRODUCTION_REDIRECT_URIS = [
+		"https://app.base44.com/api/apps/6a1120e649a9d350fef35074/auth/sso/callback",
+		"https://bookwrm.com/api/apps/6a1120e649a9d350fef35074/auth/sso/callback",
+		"https://www.bookwrm.com/api/apps/6a1120e649a9d350fef35074/auth/sso/callback"
+];
 
 function parseCsv(value: string | undefined, fallback: string[]): string[] {
 		if (!value || value.trim().length === 0) {
@@ -58,6 +64,17 @@ function resolveRedirectUris(): string[] {
 		return [];
 }
 
+function resolveClientRedirectUris(clientId: string): string[] {
+		const configuredRedirectUris = resolveRedirectUris();
+
+		if (clientId !== BOOKWRM_BASE44_PRODUCTION_CLIENT_ID) {
+				return configuredRedirectUris;
+		}
+
+		// RELEASE PATCH 6.6: retain Railway-configured URIs while registering all production Base44 callbacks.
+		return [...new Set([...configuredRedirectUris, ...BOOKWRM_BASE44_PRODUCTION_REDIRECT_URIS])];
+}
+
 export function registerOIDCClients(): RegisteredOIDCClient[] {
 		const clientId = configuration.get("OIDC_BASE44_CLIENT_ID")?.trim();
 		const clientSecret = configuration.get("OIDC_BASE44_CLIENT_SECRET")?.trim();
@@ -66,7 +83,7 @@ export function registerOIDCClients(): RegisteredOIDCClient[] {
 				return [];
 		}
 
-		const redirectUris = resolveRedirectUris();
+		const redirectUris = resolveClientRedirectUris(clientId);
 		if (redirectUris.length === 0) {
 				throw new Error(
 						"OIDC client configuration missing: set OIDC_BASE44_REDIRECT_URI or OIDC_BASE44_REDIRECT_URIS"
