@@ -19,6 +19,11 @@ type ClaimsDiagnosticsBody = {
 		providerSubject?: string;
 };
 
+type IdentityRecordBody = {
+		provider: IdentityProvider;
+		providerSubject: string;
+};
+
 type PrivateIdDiagnosticsResponse = {
 		configuration: {
 				configured: boolean;
@@ -353,6 +358,49 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
+		// Release Patch 6.4: temporary endpoint to retrieve the actual IdentitySubject row stored
+		// in the Identity Registry for production verification. Remove after verification.
+		app.post(
+
+				"/diagnostics/identity-record",
+
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const body = request.body as IdentityRecordBody;
+						const provider = body?.provider;
+						const providerSubject = body?.providerSubject?.trim();
+
+						if (!provider || !providerSubject) {
+								reply.code(400);
+								return { error: "invalid_request", error_description: "provider and providerSubject are required" };
+						}
+
+						const identitySubject = await identityRegistry.findByProvider(provider, providerSubject);
+						if (!identitySubject) {
+								reply.code(404);
+								return { error: "not_found", error_description: "Identity subject not found" };
+						}
+
+						return {
+								oidcSubject: identitySubject.oidcSubject,
+								primaryProvider: identitySubject.primaryProvider,
+								primaryProviderSubject: identitySubject.primaryProviderSubject,
+								email: identitySubject.email,
+								emailVerified: identitySubject.emailVerified,
+								displayName: identitySubject.displayName,
+								createdAt: identitySubject.createdAt,
+								updatedAt: identitySubject.updatedAt
+						};
+				}
+
+		);
+
 		app.get(
 
 				"/diagnostics/routes",
@@ -375,6 +423,7 @@ export async function registerDiagnosticsRoutes(
 										"/privateid/callback",
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/claims",
+										"/diagnostics/identity-record",
 										"/diagnostics/routes"
 								],
 								oidc: [
