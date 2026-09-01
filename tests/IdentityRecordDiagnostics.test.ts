@@ -13,7 +13,7 @@ import {
 } from "../src/privateid/PrivateIDSessionStore.js";
 import type { PrivateIDSession } from "../src/privateid/PrivateIDSession.js";
 
-describe("POST /diagnostics/identity-record (Release Patch 6.4.1)", () => {
+describe("POST /diagnostics/identity-record (Release Patch 6.4.2)", () => {
 	let app: FastifyInstance;
 	let testIdentitySubject: IdentitySubject;
 	const apiKey = "test-api-key";
@@ -169,7 +169,7 @@ describe("POST /diagnostics/identity-record (Release Patch 6.4.1)", () => {
 			expect(body.identitySubject.primaryProvider).toBe("PrivateID");
 		});
 
-		it("returns 404 when sessionId is not found", async () => {
+		it("returns session_expired when sessionId is not found", async () => {
 			const response = await app.inject({
 				method: "POST",
 				url: "/diagnostics/identity-record",
@@ -184,8 +184,10 @@ describe("POST /diagnostics/identity-record (Release Patch 6.4.1)", () => {
 
 			expect(response.statusCode).toBe(404);
 			const body = JSON.parse(response.payload);
-			expect(body.error).toBe("not_found");
-			expect(body.error_description).toContain("session");
+			expect(body).toEqual({
+				error: "session_expired",
+				message: "The requested PrivateID session is no longer available in memory. Run the diagnostics immediately after a new authentication."
+			});
 		});
 	});
 

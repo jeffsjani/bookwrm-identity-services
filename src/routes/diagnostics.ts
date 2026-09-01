@@ -8,7 +8,7 @@ import { identityRegistry } from "../identity/IdentityRegistry.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
-import { resolvePrivateIDSessionRecord, findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
+import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
 
 type ResolveBody = {
 		privateIdUserId?: string;
@@ -38,6 +38,12 @@ type IdentityRecordResponse = {
 			createdAt: string;
 			updatedAt: string;
 		};
+};
+
+type IdentityRecordErrorResponse = {
+		error: string;
+		error_description?: string;
+		message?: string;
 };
 
 type PrivateIdDiagnosticsResponse = {
@@ -374,17 +380,17 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
-// Release Patch 6.4.1: temporary endpoint to retrieve the actual IdentitySubject row stored
+// Release Patch 6.4.2: temporary endpoint to retrieve the actual IdentitySubject row stored
 		// in the Identity Registry for production verification. Supports three lookup methods:
 		// 1. By oidcSubject
 		// 2. By provider + providerSubject
 		// 3. By sessionId (resolves to providerSubject via PrivateIDSessionStore)
-		// TEMPORARY RELEASE PATCH 6.4.1 — REMOVE AFTER PRODUCTION CERTIFICATION
+		// TEMPORARY RELEASE PATCH 6.4.2 - REMOVE AFTER PRODUCTION CERTIFICATION
 		app.post(
 
 				"/diagnostics/identity-record",
 
-			async (request, reply): Promise<IdentityRecordResponse | { error: string; error_description: string }> => {
+			async (request, reply): Promise<IdentityRecordResponse | IdentityRecordErrorResponse> => {
 					const authorization = request.headers.authorization;
 					const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
 					if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
@@ -417,7 +423,10 @@ export async function registerDiagnosticsRoutes(
 						const sessionRecord = findPrivateIDSession(sessionId);
 						if (!sessionRecord) {
 								reply.code(404);
-								return { error: "not_found", error_description: "PrivateID session not found" };
+								return {
+									error: "session_expired",
+									message: "The requested PrivateID session is no longer available in memory. Run the diagnostics immediately after a new authentication."
+								};
 						}
 						const result = sessionRecord.result;
 						if (!result || !result.privateIdUserId) {

@@ -281,7 +281,16 @@ export class OIDCService {
 								}
 
 								const allowedRedirectUris = this.extractRedirectUris(client);
+								// TEMPORARY RELEASE PATCH 6.5 - REMOVE AFTER PRODUCTION CERTIFICATION
+								app.log.info(
+										{ clientId, requestedRedirectUri: redirectUri, registeredRedirectUris: allowedRedirectUris },
+										"OIDC Redirect Validation"
+								);
 								if (allowedRedirectUris.length > 0 && !allowedRedirectUris.includes(redirectUri)) {
+										app.log.warn(
+												{ clientId, requestedRedirectUri: redirectUri },
+												"OIDC_REDIRECT_URI_MISMATCH"
+										);
 										reply.code(400);
 										error = "redirect_uri is not registered for client";
 										return { error: "invalid_request", error_description: "redirect_uri is not registered for client" };
