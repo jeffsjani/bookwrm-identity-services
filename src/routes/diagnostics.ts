@@ -8,6 +8,7 @@ import { identityRegistry } from "../identity/IdentityRegistry.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
+import { resolvePrivateIDSessionRecord, findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
 
 type ResolveBody = {
 		privateIdUserId?: string;
@@ -20,8 +21,23 @@ type ClaimsDiagnosticsBody = {
 };
 
 type IdentityRecordBody = {
-		provider: IdentityProvider;
-		providerSubject: string;
+		oidcSubject?: string;
+		provider?: IdentityProvider;
+		providerSubject?: string;
+		sessionId?: string;
+};
+
+type IdentityRecordResponse = {
+		identitySubject: {
+			oidcSubject: string;
+			primaryProvider: IdentityProvider;
+			primaryProviderSubject: string;
+			email?: string;
+			emailVerified?: boolean;
+			displayName?: string;
+			createdAt: string;
+			updatedAt: string;
+		};
 };
 
 type PrivateIdDiagnosticsResponse = {
@@ -358,36 +374,69 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
-		// Release Patch 6.4: temporary endpoint to retrieve the actual IdentitySubject row stored
-		// in the Identity Registry for production verification. Remove after verification.
+// Release Patch 6.4.1: temporary endpoint to retrieve the actual IdentitySubject row stored
+		// in the Identity Registry for production verification. Supports three lookup methods:
+		// 1. By oidcSubject
+		// 2. By provider + providerSubject
+		// 3. By sessionId (resolves to providerSubject via PrivateIDSessionStore)
+		// TEMPORARY RELEASE PATCH 6.4.1 — REMOVE AFTER PRODUCTION CERTIFICATION
 		app.post(
 
 				"/diagnostics/identity-record",
 
-				async (request, reply) => {
-						const authorization = request.headers.authorization;
-						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
-						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
-								reply.code(401);
-								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+			async (request, reply): Promise<IdentityRecordResponse | { error: string; error_description: string }> => {
+					const authorization = request.headers.authorization;
+					const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+					if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+							reply.code(401);
+							return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+					}
+
+					const body = request.body as IdentityRecordBody;
+					let identitySubject = undefined;
+
+					// Method 1: By oidcSubject
+					if (body?.oidcSubject?.trim()) {
+							identitySubject = await identityRegistry.findByOidcSubject(body.oidcSubject.trim());
+							if (!identitySubject) {
+									reply.code(404);
+									return { error: "not_found", error_description: "Identity subject not found" };
+							}
+					}
+					// Method 2: By provider + providerSubject
+					else if (body?.provider && body?.providerSubject?.trim()) {
+							identitySubject = await identityRegistry.findByProvider(body.provider, body.providerSubject.trim());
+							if (!identitySubject) {
+									reply.code(404);
+									return { error: "not_found", error_description: "Identity subject not found" };
+							}
+					}
+					// Method 3: By sessionId → providerSubject via PrivateIDSessionStore
+					else if (body?.sessionId?.trim()) {
+						const sessionId = body.sessionId.trim();
+						const sessionRecord = findPrivateIDSession(sessionId);
+						if (!sessionRecord) {
+								reply.code(404);
+								return { error: "not_found", error_description: "PrivateID session not found" };
 						}
-
-						const body = request.body as IdentityRecordBody;
-						const provider = body?.provider;
-						const providerSubject = body?.providerSubject?.trim();
-
-						if (!provider || !providerSubject) {
-								reply.code(400);
-								return { error: "invalid_request", error_description: "provider and providerSubject are required" };
+						const result = sessionRecord.result;
+						if (!result || !result.privateIdUserId) {
+								reply.code(404);
+								return { error: "not_found", error_description: "PrivateID session has no authenticated result" };
 						}
-
-						const identitySubject = await identityRegistry.findByProvider(provider, providerSubject);
+						identitySubject = await identityRegistry.findByProvider("PrivateID", result.privateIdUserId);
 						if (!identitySubject) {
 								reply.code(404);
 								return { error: "not_found", error_description: "Identity subject not found" };
 						}
+					}
+					else {
+							reply.code(400);
+							return { error: "invalid_request", error_description: "oidcSubject, provider+providerSubject, or sessionId is required" };
+					}
 
-						return {
+					return {
+							identitySubject: {
 								oidcSubject: identitySubject.oidcSubject,
 								primaryProvider: identitySubject.primaryProvider,
 								primaryProviderSubject: identitySubject.primaryProviderSubject,
@@ -396,6 +445,7 @@ export async function registerDiagnosticsRoutes(
 								displayName: identitySubject.displayName,
 								createdAt: identitySubject.createdAt,
 								updatedAt: identitySubject.updatedAt
+							}
 						};
 				}
 
