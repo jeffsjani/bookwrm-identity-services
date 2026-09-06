@@ -106,6 +106,17 @@ Related required environment variables:
 - `IDENTITY_API_PATH`
 - `BOOKWRM_IDENTITY_API_KEY`
 
+## HAPI Service Bridge
+
+The private service-to-service bridge is separate from the public `/identity/*` API and requires `Authorization: Bearer <HAPI_PLATFORM_SERVICE_KEY>`. `HAPI_PLATFORM_SERVICE_KEY` is distinct from `BOOKWRM_IDENTITY_API_KEY`, which is used only for this service's upstream Identity Platform requests.
+
+| Method | Route | Request body |
+| --- | --- | --- |
+| POST | /internal/hapi/identity/context | `{ "userId": "string" }` |
+| POST | /internal/hapi/identity/resolve | `{ "privateIdUserId": "string" }` |
+
+Both request fields must be non-empty after trimming, but their original values are passed downstream unchanged. The bridge does not create HAPI identities; `userId` is treated as opaque and is not assumed to be an OIDC subject. Explicit per-user security context is not supported in this phase, so `/internal/hapi/identity/security-context` is intentionally not available.
+
 ## Logging
 
 Every client request emits a structured log entry with:

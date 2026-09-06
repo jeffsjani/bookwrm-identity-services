@@ -1,41 +1,46 @@
 import type { FastifyInstance } from "fastify";
 
-import { identityService } from "../identity/IdentityService.js";
+import { IdentityService, identityService } from "../identity/IdentityService.js";
 
-export async function registerIdentityRoutes(app: FastifyInstance): Promise<void> {
+type PublicIdentityService = Pick<
+		IdentityService,
+		"health" | "getIdentityContext" | "resolveIdentity" | "reverify" | "getSecurityContext" | "getPolicies" | "getTimeline" | "getNotifications" | "getTrustedDevices"
+>;
+
+export async function registerIdentityRoutes(app: FastifyInstance, service: PublicIdentityService = identityService): Promise<void> {
 		app.get("/identity/health", async () => {
-				return identityService.health();
+				return service.health();
 		});
 
 		app.get("/identity/context", async () => {
-				return identityService.getIdentityContext();
+				return service.getIdentityContext();
 		});
 
 		app.post("/identity/resolve", async () => {
-				return identityService.resolveIdentity();
+				return service.resolveIdentity();
 		});
 
 		app.post("/identity/reverify", async () => {
-				return identityService.reverify();
+				return service.reverify();
 		});
 
 		app.get("/identity/security-context", async () => {
-				return identityService.getSecurityContext();
+				return service.getSecurityContext();
 		});
 
 		app.get("/identity/policies", async () => {
-				return identityService.getPolicies();
+				return service.getPolicies();
 		});
 
 		app.get("/identity/timeline", async () => {
-				return identityService.getTimeline();
+				return service.getTimeline();
 		});
 
 		app.get("/identity/notifications", async () => {
-				return identityService.getNotifications();
+				return service.getNotifications();
 		});
 
 		app.get("/identity/trusted-devices", async () => {
-				return identityService.getTrustedDevices();
+				return service.getTrustedDevices();
 		});
 }

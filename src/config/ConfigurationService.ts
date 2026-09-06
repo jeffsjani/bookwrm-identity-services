@@ -130,6 +130,10 @@ export class ConfigurationService {
 				return this.require("BOOKWRM_IDENTITY_API_KEY");
 		}
 
+		getHapiPlatformServiceKey(): string | undefined {
+				return this.get("HAPI_PLATFORM_SERVICE_KEY");
+		}
+
 		getOidcIssuer(defaultIssuer: string): string {
 				return this.get("OIDC_ISSUER", defaultIssuer) ?? defaultIssuer;
 		}
