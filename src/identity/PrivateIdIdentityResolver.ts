@@ -42,10 +42,28 @@ export function extractIdentityCandidateFromRawResponse(rawResponse: unknown): P
 
 		const source = rawResponse as Record<string, unknown>;
 		const contactInformation = source.contactInformation;
+		console.info(
+				"CONTACT_EMAIL_ANALYSIS",
+				(() => {
+						const exists = Boolean(contactInformation && typeof contactInformation === "object" && !Array.isArray(contactInformation)
+								&& Object.prototype.hasOwnProperty.call(contactInformation, "email"));
+						const value = exists ? (contactInformation as Record<string, unknown>).email : undefined;
+						const stringValue = typeof value === "string" ? value : undefined;
+						return {
+								exists,
+								...(exists ? { type: value === null ? "null" : typeof value } : {}),
+								...(exists && stringValue === undefined ? { nonEmpty: false } : {}),
+								...(stringValue !== undefined
+										? { nonEmpty: stringValue.trim().length > 0, trimLength: stringValue.trim().length }
+										: {})
+						};
+				})()
+		);
 		const contactRecord = contactInformation && typeof contactInformation === "object" && !Array.isArray(contactInformation)
 				? contactInformation as Record<string, unknown>
 				: undefined;
 		const contactEmail = contactRecord ? pickString(contactRecord, ["email"]) : undefined;
+		console.info("CONTACT_EMAIL_RESULT", { resolved: contactEmail !== undefined });
 		const contactFirstName = contactRecord ? pickString(contactRecord, ["firstName"]) : undefined;
 		const contactLastName = contactRecord ? pickString(contactRecord, ["lastName"]) : undefined;
 		const contactDisplayName = [contactFirstName, contactLastName].filter(Boolean).join(" ") || undefined;
