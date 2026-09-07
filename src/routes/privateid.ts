@@ -251,7 +251,17 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 				responseContext.sessionId = sessionId;
 				responseContext.transactionId = transactionId;
+				app.log.info({ event: "WEBHOOK_ENTER", sessionId, transactionID: transactionId, status }, "WEBHOOK_ENTER");
 				const record = resolvePrivateIDSessionRecord(sessionId, transactionId);
+				app.log.info(
+						{
+							event: record ? "WEBHOOK_SESSION_FOUND" : "WEBHOOK_SESSION_NOT_FOUND",
+							sessionId,
+							transactionID: transactionId,
+							status
+						},
+						record ? "WEBHOOK_SESSION_FOUND" : "WEBHOOK_SESSION_NOT_FOUND"
+				);
 				if (!record) {
 						responseContext.sessionCompleted = false;
 					reply.code(202);
@@ -268,12 +278,43 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				if (status === "SUCCESS") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "ready", Date.now());
-						await privateIdWebhookDiagnosticsRepository.capture(
-								new Date(),
-								record.session.sessionId,
-								record.session.transactionId,
-								body
+						app.log.info(
+								{
+									event: "WEBHOOK_CAPTURE_BEGIN",
+									sessionId: record.session.sessionId,
+									transactionID: record.session.transactionId,
+									status
+								},
+								"WEBHOOK_CAPTURE_BEGIN"
 						);
+						try {
+								await privateIdWebhookDiagnosticsRepository.capture(
+										new Date(),
+										record.session.sessionId,
+										record.session.transactionId,
+										body
+								);
+								app.log.info(
+										{
+											event: "WEBHOOK_CAPTURE_SUCCESS",
+											sessionId: record.session.sessionId,
+											transactionID: record.session.transactionId,
+											status
+										},
+										"WEBHOOK_CAPTURE_SUCCESS"
+								);
+						} catch (error) {
+								app.log.error(
+										{
+											event: "WEBHOOK_CAPTURE_FAILED",
+											sessionId: record.session.sessionId,
+											transactionID: record.session.transactionId,
+											status
+										},
+										"WEBHOOK_CAPTURE_FAILED"
+								);
+								throw error;
+						}
 						// Release Patch 6: "puid" is PrivateID's stable per-person identifier (stable across VERIFY sessions);
 						// "guid" is per-session/per-request only and must never be used as the provider subject. Legacy aliases
 						// kept for backward compatibility with mock/test payloads that predate the real production field names.
