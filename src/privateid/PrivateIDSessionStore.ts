@@ -11,6 +11,7 @@ export type PrivateIDSessionRecord = {
 		identityContext?: ApiResponse<IdentityContext>;
 		// Set at session creation (Release Patch 5A) from whether a correlationId was supplied; never inferred from webhook payload fields.
 		oidcOrigin: boolean;
+		enrollmentTransactionId?: string;
 };
 
 const sessionRecords = new Map<string, PrivateIDSessionRecord>();
@@ -52,6 +53,13 @@ export function storePrivateIDResult(sessionId: string, result: PrivateIDResult)
 		const record = sessionRecords.get(sessionId);
 		if (record) {
 				record.result = result;
+		}
+}
+
+export function markPrivateIDEnrollmentSession(sessionId: string, enrollmentTransactionId: string): void {
+		const record = sessionRecords.get(sessionId);
+		if (record) {
+			record.enrollmentTransactionId = enrollmentTransactionId;
 		}
 }
 

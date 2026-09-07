@@ -18,6 +18,7 @@ export type UpdateIdentitySubjectInput = Partial<
 // Storage contract for IdentitySubject. No OIDC/claims logic belongs here.
 export interface IdentitySubjectRepository {
 		create(input: CreateIdentitySubjectInput): Promise<IdentitySubject>;
+	findById(id: string): Promise<IdentitySubject | undefined>;
 		findByOidcSubject(oidcSubject: string): Promise<IdentitySubject | undefined>;
 		findByProviderSubject(provider: IdentityProvider, providerSubject: string): Promise<IdentitySubject | undefined>;
 		update(oidcSubject: string, changes: UpdateIdentitySubjectInput): Promise<IdentitySubject | undefined>;

@@ -10,6 +10,7 @@ import { registerPrivateIdRoutes } from "./routes/privateid.js";
 import { registerIdentityRoutes } from "./routes/identity.js";
 import { registerIdentityAdminRoutes } from "./routes/identityAdmin.js";
 import { registerHapiIdentityBridgeRoutes } from "./routes/hapiIdentityBridge.js";
+import { registerPrivateIDEnrollmentRoutes } from "./routes/privateidEnrollment.js";
 import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
 import { oidcService } from "./oidc/OIDCService.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
@@ -52,6 +53,7 @@ await registerPrivateIdRoutes(app);
 await registerIdentityRoutes(app);
 await registerIdentityAdminRoutes(app);
 await registerHapiIdentityBridgeRoutes(app);
+await registerPrivateIDEnrollmentRoutes(app);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {

@@ -87,6 +87,12 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 				return toIdentitySubject(result.rows[0]);
 		}
 
+		async findById(id: string): Promise<IdentitySubject | undefined> {
+			if (!isValidUuid(id)) return undefined;
+			const result = await this.client.query<IdentitySubjectRow>(`SELECT * FROM identity_subjects WHERE id = $1`, [id]);
+			return result.rows[0] ? toIdentitySubject(result.rows[0]) : undefined;
+		}
+
 		async findByOidcSubject(oidcSubject: string): Promise<IdentitySubject | undefined> {
 				if (!isValidUuid(oidcSubject)) {
 						return undefined;

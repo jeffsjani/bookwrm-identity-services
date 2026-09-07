@@ -19,8 +19,16 @@ export class PrivateIDClient {
 		private currentSessionId?: string;
 
 		async createAuthenticationSession(correlationId?: string): Promise<PrivateIDSession> {
+			return this.createSession(correlationId);
+		}
+
+		async createEnrollmentSession(providerTransactionId: string): Promise<PrivateIDSession> {
+			return this.createSession(undefined, providerTransactionId);
+		}
+
+		private async createSession(correlationId?: string, providedTransactionId?: string): Promise<PrivateIDSession> {
 				const now = Date.now();
-				const transactionId = randomUUID();
+				const transactionId = providedTransactionId ?? randomUUID();
 				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
 
 				if (configuration.getBoolean("PRIVATEID_MOCK_MODE", false)) {
@@ -295,6 +303,7 @@ export class PrivateIDClient {
 						transactionId: session.transactionId,
 						rawResponse: {
 							status: session.status,
+							puid: fallbackUserId,
 							sessionId: session.sessionId,
 							transactionId: session.transactionId,
 							launchUrl: session.launchUrl,

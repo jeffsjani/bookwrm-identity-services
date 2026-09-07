@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PrivateIDAuthenticationProvider } from "../src/privateid/PrivateIDAuthenticationProvider.js";
 import { storeCorrelation } from "../src/oidc/CorrelationStore.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 import { resolvePrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import type { PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
@@ -43,11 +44,13 @@ function postSuccessWebhook(
 }
 
 describe("Release Patch 6 - puid provider subject mapping", () => {
-		it("maps the production SUCCESS webhook's puid field into IdentitySubject.primaryProviderSubject", async () => {
+		it("maps the production SUCCESS webhook's puid field into the known authenticator", async () => {
 				const { app } = await buildOidcTestApp();
 				const correlationId = randomUUID();
 				const session = await createOidcSession(correlationId);
 				const puid = `puid-${randomUUID()}`;
+				const subject = await identityRegistry.resolveOrCreate({ provider: "PrivateID", providerSubject: `seed-${randomUUID()}`, status: undefined, email: "known@example.test", emailVerified: true, displayName: "Known User" });
+				await inMemoryUserAuthenticatorRepository.create({ id: randomUUID(), userId: subject.id, provider: "privateid", providerSubject: puid, authenticatorType: "face", status: "active" });
 
 				// Production SUCCESS webhook shape: sessionId, status, puid, guid, identityInformation, contactInformation.
 				const response = await postSuccessWebhook(app, {
@@ -62,14 +65,13 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 
 				expect(response.statusCode).toBe(200);
 
-				const subject = await identityRegistry.findByProvider("PrivateID", puid);
-				expect(subject).toBeDefined();
-				expect(subject?.primaryProviderSubject).toBe(puid);
+				const authenticatedUser = resolvePrivateIDSessionRecord(session.sessionId)?.authenticatedUser;
+				expect(authenticatedUser?.id).toBe(subject.id);
 
 				await app.close();
 		});
 
-		it("never resolves a null/empty primary_provider_subject when puid is absent", async () => {
+		it("denies a face login when puid is absent", async () => {
 				const { app } = await buildOidcTestApp();
 				const correlationId = randomUUID();
 				const session = await createOidcSession(correlationId);
@@ -83,11 +85,7 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 
 				expect(response.statusCode).toBe(200);
 				const payload = response.json() as Record<string, unknown>;
-				expect(payload.completed).toBe(true);
-
-				const subject = await identityRegistry.findByProvider("PrivateID", session.transactionId);
-				expect(subject).toBeDefined();
-				expect(subject?.primaryProviderSubject).toBeTruthy();
+				expect(payload.status).toBe("FAILURE");
 
 				await app.close();
 		});
@@ -98,6 +96,8 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 				const session = await createOidcSession(correlationId);
 				const puid = `puid-${randomUUID()}`;
 				const guid = `guid-${randomUUID()}`;
+				const subject = await identityRegistry.resolveOrCreate({ provider: "PrivateID", providerSubject: `seed-${randomUUID()}`, email: "known@example.test", emailVerified: true, displayName: "Known User" });
+				await inMemoryUserAuthenticatorRepository.create({ id: randomUUID(), userId: subject.id, provider: "privateid", providerSubject: puid, authenticatorType: "face", status: "active" });
 
 				await postSuccessWebhook(app, {
 						status: "SUCCESS",
@@ -107,12 +107,8 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 						guid
 				});
 
-				const byGuid = await identityRegistry.findByProvider("PrivateID", guid);
-				const byPuid = await identityRegistry.findByProvider("PrivateID", puid);
-
-				expect(byGuid).toBeUndefined();
-				expect(byPuid).toBeDefined();
-				expect(byPuid?.primaryProviderSubject).toBe(puid);
+				const authenticatedUser = resolvePrivateIDSessionRecord(session.sessionId)?.authenticatedUser;
+				expect(authenticatedUser?.id).toBe(subject.id);
 
 				await app.close();
 		});

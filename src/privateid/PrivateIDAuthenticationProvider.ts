@@ -1,6 +1,6 @@
 import { configuration } from "../config/ConfigurationService.js";
 import type { AuthenticationProvider, AuthenticatedUser, AuthenticationStatus, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
-import { extractIdentityCandidateFromRawResponse, resolveAuthenticatedUserFromPrivateId } from "../identity/PrivateIdIdentityResolver.js";
+import { authenticatorLoginResolver } from "../identity/AuthenticatorLoginResolver.js";
 import { PrivateIDClient, type PrivateIDCallbackPayload } from "./PrivateIDClient.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
@@ -9,6 +9,12 @@ import { linkPrivateIdSession } from "../oidc/CorrelationStore.js";
 
 function sleep(ms: number): Promise<void> {
 		return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function extractProviderSubject(rawResponse: unknown): string | undefined {
+		if (!rawResponse || typeof rawResponse !== "object") return undefined;
+		const puid = (rawResponse as Record<string, unknown>).puid;
+		return typeof puid === "string" && puid.trim().length > 0 ? puid.trim() : undefined;
 }
 
 export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
@@ -100,17 +106,23 @@ export class PrivateIDAuthenticationProvider implements AuthenticationProvider {
 						return existingAuthenticatedUser;
 				}
 
-				const privateIdUserId = result?.privateIdUserId ?? session.sessionId;
-				const candidate = extractIdentityCandidateFromRawResponse(result?.rawResponse);
-
 				let authenticatedUser: AuthenticatedUser;
 				try {
-						authenticatedUser = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, candidate);
+					const providerSubject = extractProviderSubject(result?.rawResponse);
+					if (!providerSubject) throw new Error("Authentication Failed");
+					const user = await authenticatorLoginResolver.resolveLogin("privateid", session.transactionId, providerSubject);
+					authenticatedUser = {
+						id: user.id,
+						sub: user.oidcSubject,
+						email: user.email,
+						emailVerified: user.emailVerified,
+						name: user.displayName
+					};
 				} catch (error) {
 						this.statusSnapshot = {
 								state: "failed",
 								sessionId: session.sessionId,
-								message: error instanceof Error ? error.message : "Identity resolution failed"
+								message: error instanceof Error ? error.message : "Authentication Failed"
 						};
 						throw error;
 				}

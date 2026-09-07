@@ -39,6 +39,11 @@ export class InMemoryIdentitySubjectRepository implements IdentitySubjectReposit
 				return { ...subject };
 		}
 
+		async findById(id: string): Promise<IdentitySubject | undefined> {
+			const subject = this.subjectsById.get(id);
+			return subject ? { ...subject } : undefined;
+		}
+
 		async findByOidcSubject(oidcSubject: string): Promise<IdentitySubject | undefined> {
 				const id = this.idByOidcSubject.get(oidcSubject);
 				const subject = id ? this.subjectsById.get(id) : undefined;
@@ -143,3 +148,5 @@ export class InMemoryIdentitySubjectRepository implements IdentitySubjectReposit
 				return this.create(input);
 		}
 }
+
+export const inMemoryIdentitySubjectRepository = new InMemoryIdentitySubjectRepository();

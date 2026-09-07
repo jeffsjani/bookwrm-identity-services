@@ -4,7 +4,7 @@ import { configuration } from "../config/ConfigurationService.js";
 import { identityMetrics } from "./infrastructure/IdentityMetrics.js";
 import { recordIdentityAudit } from "./IdentityAudit.js";
 import type { IdentityProvider, IdentitySubject } from "../models/IdentitySubject.js";
-import { InMemoryIdentitySubjectRepository } from "./InMemoryIdentitySubjectRepository.js";
+import { inMemoryIdentitySubjectRepository } from "./InMemoryIdentitySubjectRepository.js";
 import { PostgresIdentitySubjectRepository } from "./PostgresIdentitySubjectRepository.js";
 import type { IdentitySubjectRepository, UpdateIdentitySubjectInput } from "./IdentitySubjectRepository.js";
 
@@ -18,7 +18,7 @@ export type IdentityLinkRequest = {
 
 function defaultRepository(): IdentitySubjectRepository {
 		return configuration.getIdentityRegistryDriver() === "memory"
-				? new InMemoryIdentitySubjectRepository()
+					? inMemoryIdentitySubjectRepository
 				: new PostgresIdentitySubjectRepository();
 }
 
@@ -29,6 +29,10 @@ export class IdentityRegistry {
 
 		findByProvider(provider: IdentityProvider, providerSubject: string): Promise<IdentitySubject | undefined> {
 				return this.repository.findByProviderSubject(provider, providerSubject);
+		}
+
+		findById(id: string): Promise<IdentitySubject | undefined> {
+			return this.repository.findById(id);
 		}
 
 		findByOidcSubject(oidcSubject: string): Promise<IdentitySubject | undefined> {

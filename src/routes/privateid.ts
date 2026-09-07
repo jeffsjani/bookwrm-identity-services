@@ -3,7 +3,6 @@ import type { FastifyInstance } from "fastify";
 import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
-import { extractIdentityCandidateFromRawResponse, resolveAuthenticatedUserFromPrivateId } from "../identity/PrivateIdIdentityResolver.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
@@ -18,6 +17,8 @@ import {
 } from "../privateid/PrivateIDSessionStore.js";
 import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/CorrelationStore.js";
 import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
+import { privateIDEnrollmentService } from "../identity/PrivateIDEnrollmentService.js";
+import { AuthenticatorLoginError, authenticatorLoginResolver } from "../identity/AuthenticatorLoginResolver.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -113,7 +114,7 @@ function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackS
 		};
 }
 
-// Production email comes from IdentityContext; PRIVATEID_FALLBACK_EMAIL only backstops mock mode.
+// Deprecated compatibility fallback: Bookwrm Identity owns email; this only backstops legacy mock mode.
 function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { email: string; emailVerified: boolean } {
 		if (identityContext?.email) {
 				return { email: identityContext.email, emailVerified: Boolean(identityContext.emailVerified) };
@@ -333,6 +334,37 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						};
 						storePrivateIDResult(record.session.sessionId, result);
 
+						if (record.enrollmentTransactionId) {
+							const puid = pickObjectValue(body, ["puid"]);
+							if (!puid) {
+								updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
+								responseContext.sessionCompleted = true;
+								reply.code(400);
+								logWebhookResponse(400);
+								return { error: "invalid_request", error_description: "Enrollment SUCCESS webhook is missing puid" };
+							}
+
+							const enrollment = await privateIDEnrollmentService.completeEnrollment(record.session.transactionId, puid);
+							if (!enrollment) {
+								updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
+								responseContext.sessionCompleted = true;
+								reply.code(409);
+								logWebhookResponse(409);
+								return { error: "enrollment_not_pending", error_description: "No pending enrollment transaction matches this webhook" };
+							}
+
+							responseContext.resolvedUserId = enrollment.userId;
+							responseContext.sessionCompleted = true;
+							reply.code(200);
+							logWebhookResponse(200);
+							return {
+								status: "SUCCESS",
+								sessionId: record.session.sessionId,
+								transactionId: record.session.transactionId,
+								completed: true
+							};
+						}
+
 					// TEMPORARY (Release Patch 5 verification) - logs payload structure only, no sensitive values. Remove after one production test.
 					const metadataValue = body.metadata;
 					const metadataExists = Boolean(metadataValue && typeof metadataValue === "object");
@@ -379,7 +411,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							storePendingAuthorizationRequest(record.session.sessionId, correlatedContext);
 					}
 
-					let authenticatedUser: AuthenticatedUser;
+						let authenticatedUser: AuthenticatedUser;
 					if (isOidcSession) {
 							if (!oidcCorrelationId) {
 									// Task 2: an OIDC session's SUCCESS webhook that cannot be correlated shall fail explicitly, never fall back to the legacy path.
@@ -406,19 +438,23 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 									};
 							}
 
-							// OIDC login: identity comes exclusively from IdentityRegistry, never Bookwrm/Base44.
+							// Face login resolves a pre-existing privateid authenticator and its canonical Bookwrm user.
 							try {
-									const candidate = extractIdentityCandidateFromRawResponse(body);
-									app.log.info({
-										email: candidate.email ? "[PRESENT]" : "[ABSENT]",
-										emailVerified: candidate.emailVerified ?? null,
-										displayName: candidate.displayName ? "[PRESENT]" : "[ABSENT]"
-									});
-									authenticatedUser = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, candidate);
+								const provider = "privateid" as const;
+								const providerSubject = pickObjectValue(body, ["puid"]);
+								if (!providerSubject) throw new AuthenticatorLoginError("AUTHENTICATION_FAILED");
+								const user = await authenticatorLoginResolver.resolveLogin(provider, record.session.transactionId, providerSubject);
+								authenticatedUser = {
+									id: user.id,
+									sub: user.oidcSubject,
+									email: user.email,
+									emailVerified: user.emailVerified,
+									name: user.displayName
+								};
 							} catch (error) {
 									updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
 									responseContext.sessionCompleted = true;
-									app.log.warn({ error, privateIdUserId }, "Identity Registry resolution failed during PrivateID webhook processing");
+								app.log.warn({ error }, "Authenticator login resolution failed during PrivateID webhook processing");
 									reply.code(200);
 									logWebhookResponse(200);
 									return {
@@ -426,7 +462,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 											sessionId: record.session.sessionId,
 											transactionId: record.session.transactionId,
 											completed: true,
-											error: error instanceof Error ? error.message : "Identity resolution failed"
+									error: error instanceof Error ? error.message : "Authentication Failed"
 									};
 							}
 					} else {
