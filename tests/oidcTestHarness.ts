@@ -121,7 +121,11 @@ export async function authorizeAndGetCode(
 						status: "SUCCESS",
 						sessionId: sessionRecord.session.sessionId,
 						transactionId: sessionRecord.session.transactionId,
-						privateIdUserId: "dev-user-1"
+						privateIdUserId: "dev-user-1",
+						contactInformation: {
+								email: "dev.user@bookwrm.local",
+								phone: "[TEST-ONLY]"
+						}
 				}
 		});
 

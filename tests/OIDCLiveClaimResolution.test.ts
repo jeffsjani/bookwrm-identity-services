@@ -39,6 +39,10 @@ async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp
 						sessionId,
 						transactionId: record.session.transactionId,
 						privateIdUserId,
+						contactInformation: {
+								email: "user@example.com",
+								phone: "[TEST-ONLY]"
+						},
 						metadata: { correlationId }
 				}
 		});

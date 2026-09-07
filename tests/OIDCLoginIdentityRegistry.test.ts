@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import { PrivateIDAuthenticationProvider } from "../src/privateid/PrivateIDAuthenticationProvider.js";
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { storeCorrelation } from "../src/oidc/CorrelationStore.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 import { getPrivateIDAuthenticatedUser, resolvePrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
@@ -47,6 +48,12 @@ async function sendSuccessWebhook(
 						sessionId,
 						transactionId,
 						privateIdUserId,
+						contactInformation: {
+								email: "user@example.com",
+								firstName: "Verified",
+								lastName: "User",
+								phone: "[TEST-ONLY]"
+						},
 						metadata: { correlationId }
 				}
 		});
@@ -66,7 +73,25 @@ describe("OIDC login identity resolution (RC1 Phase 3)", () => {
 				expect(authenticatedUser).toBeDefined();
 				expect(authenticatedUser?.sub).not.toBe(privateIdUserId);
 				expect(authenticatedUser?.sub).not.toBe(session.transactionId);
-				expect(authenticatedUser?.email).toBeUndefined();
+				expect(authenticatedUser?.email).toBe("user@example.com");
+				expect(authenticatedUser?.emailVerified).toBe(true);
+				expect(authenticatedUser?.name).toBe("Verified User");
+
+				const subject = await identityRegistry.findByProvider("PrivateID", privateIdUserId);
+				expect(subject?.email).toBe("user@example.com");
+				expect(subject?.emailVerified).toBe(true);
+
+				const claimsResponse = await app.inject({
+						method: "POST",
+						url: "/diagnostics/claims",
+						headers: { authorization: "Bearer test-key" },
+						payload: { subject: subject?.oidcSubject }
+				});
+				expect(claimsResponse.statusCode).toBe(200);
+				const claims = claimsResponse.json() as Record<string, any>;
+				expect(claims.identityRegistry.email).toBe("user@example.com");
+				expect(claims.idTokenClaims.email).toBe("user@example.com");
+				expect(claims.userInfoClaims.email).toBe("user@example.com");
 
 				await app.close();
 		});
@@ -112,6 +137,7 @@ describe("OIDC login identity resolution (RC1 Phase 3)", () => {
 								sessionId: secondSession.sessionId,
 								transactionId: secondSession.transactionId,
 								privateIdUserId,
+								contactInformation: { email: "different-candidate-email@example.com" },
 								email: "different-candidate-email@example.com",
 								emailVerified: true,
 								metadata: { correlationId: secondCorrelationId }

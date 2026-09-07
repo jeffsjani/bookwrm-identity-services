@@ -1,9 +1,33 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
-import { resolveAuthenticatedUserFromPrivateId } from "../src/identity/PrivateIdIdentityResolver.js";
+import { extractIdentityCandidateFromRawResponse, resolveAuthenticatedUserFromPrivateId } from "../src/identity/PrivateIdIdentityResolver.js";
 
 describe("resolveAuthenticatedUserFromPrivateId (RC1 Phase 3, Task 8)", () => {
+		it("maps verified contact information before top-level email aliases", () => {
+			const candidate = extractIdentityCandidateFromRawResponse({
+				contactInformation: {
+					email: "contact@example.com",
+					firstName: "Contact",
+					lastName: "User",
+					phone: "555-0100"
+				},
+				email: "top-level@example.com",
+				userEmail: "legacy@example.com"
+			});
+
+			expect(candidate).toEqual({
+				email: "contact@example.com",
+				emailVerified: true,
+				displayName: "Contact User"
+			});
+		});
+
+		it("uses one available contact name and preserves top-level fallbacks", () => {
+			expect(extractIdentityCandidateFromRawResponse({ contactInformation: { firstName: "Only" } }).displayName).toBe("Only");
+			expect(extractIdentityCandidateFromRawResponse({ contactInformation: {}, name: "Fallback Name" }).displayName).toBe("Fallback Name");
+		});
+
 		it("new user: mints a fresh IdentitySubject-backed sub, never the PrivateID id", async () => {
 				const privateIdUserId = `resolver-new-${randomUUID()}`;
 

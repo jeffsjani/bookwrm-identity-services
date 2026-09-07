@@ -41,10 +41,18 @@ export function extractIdentityCandidateFromRawResponse(rawResponse: unknown): P
 		}
 
 		const source = rawResponse as Record<string, unknown>;
+		const contactInformation = source.contactInformation;
+		const contactRecord = contactInformation && typeof contactInformation === "object" && !Array.isArray(contactInformation)
+				? contactInformation as Record<string, unknown>
+				: undefined;
+		const contactEmail = contactRecord ? pickString(contactRecord, ["email"]) : undefined;
+		const contactFirstName = contactRecord ? pickString(contactRecord, ["firstName"]) : undefined;
+		const contactLastName = contactRecord ? pickString(contactRecord, ["lastName"]) : undefined;
+		const contactDisplayName = [contactFirstName, contactLastName].filter(Boolean).join(" ") || undefined;
 		return {
-				email: pickString(source, ["email", "userEmail"]),
-				emailVerified: pickBoolean(source, ["emailVerified", "email_verified"]),
-				displayName: pickString(source, ["name", "displayName", "fullName"])
+				email: contactEmail ?? pickString(source, ["email", "userEmail"]),
+				emailVerified: contactEmail ? true : pickBoolean(source, ["emailVerified", "email_verified"]),
+				displayName: contactDisplayName ?? pickString(source, ["name", "displayName", "fullName"])
 		};
 }
 

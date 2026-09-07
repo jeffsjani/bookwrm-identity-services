@@ -11,6 +11,9 @@ describe("OIDCUserInfo", () => {
 				const code = await authorizeAndGetCode(app, verifier);
 				const tokenResponse = await exchangeAuthorizationCode(app, code, verifier);
 				const tokens = tokenResponse.json() as Record<string, unknown>;
+				const idTokenPayload = JSON.parse(Buffer.from(String(tokens.id_token).split(".")[1], "base64url").toString("utf8")) as Record<string, unknown>;
+				expect(idTokenPayload.email).toBe("dev.user@bookwrm.local");
+				expect(idTokenPayload.email_verified).toBe(true);
 
 				const userInfoResponse = await app.inject({
 						method: "GET",
@@ -24,8 +27,8 @@ describe("OIDCUserInfo", () => {
 				const payload = userInfoResponse.json() as Record<string, unknown>;
 				expect(typeof payload.sub).toBe("string");
 				expect(payload.sub).not.toBe("dev-user-1");
-				expect(payload.email).toBeUndefined();
-				expect(payload.email_verified).toBeUndefined();
+				expect(payload.email).toBe("dev.user@bookwrm.local");
+				expect(payload.email_verified).toBe(true);
 				expect(payload.name).toBeUndefined();
 
 				await app.close();

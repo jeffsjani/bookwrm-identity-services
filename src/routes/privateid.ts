@@ -75,10 +75,6 @@ function sanitizeHeaders(headers: Record<string, unknown>): Record<string, unkno
 		return sanitized;
 }
 
-function sanitizeContactInformation(contactInformation: Record<string, unknown>): Record<string, string> {
-		return Object.fromEntries(Object.keys(contactInformation).map((key) => [key, "[PRESENT]"]));
-}
-
 function readHeader(headers: Record<string, unknown>, key: string): string | undefined {
 		const value = headers[key];
 		if (Array.isArray(value)) {
@@ -281,28 +277,6 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				responseContext.sessionCompleted = Boolean(record.session.completed);
 
 				if (status === "SUCCESS") {
-						const contactInformation = body.contactInformation;
-						if (contactInformation && typeof contactInformation === "object" && !Array.isArray(contactInformation)) {
-							const contactInformationRecord = contactInformation as Record<string, unknown>;
-							app.log.info(
-									{
-										event: "CONTACT_INFORMATION_STRUCTURE",
-										sessionId: record.session.sessionId,
-										transactionID: record.session.transactionId,
-										keys: Object.keys(contactInformationRecord)
-									},
-									"CONTACT_INFORMATION_STRUCTURE"
-							);
-							app.log.info(
-									{
-										event: "CONTACT_INFORMATION_SANITIZED",
-										sessionId: record.session.sessionId,
-										transactionID: record.session.transactionId,
-										contactInformation: sanitizeContactInformation(contactInformationRecord)
-									},
-									"CONTACT_INFORMATION_SANITIZED"
-							);
-						}
 						updatePrivateIDSessionStatus(record.session.sessionId, "ready", Date.now());
 						app.log.info(
 								{
