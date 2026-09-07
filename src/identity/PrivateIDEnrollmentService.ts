@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import type { AuthenticatedPrincipal } from "../authentication/AuthenticatedPrincipal.js";
 import type { PrivateIDEnrollmentTransaction } from "../models/PrivateIDEnrollmentTransaction.js";
 import type { PrivateIDSession } from "../privateid/PrivateIDSession.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
@@ -29,12 +30,12 @@ export class PrivateIDEnrollmentService {
 		private readonly createSession: EnrollmentSessionCreator = (transactionId) => new PrivateIDClient().createEnrollmentSession(transactionId)
 	) {}
 
-	async startEnrollment(userId: string): Promise<{ transaction: PrivateIDEnrollmentTransaction; session: PrivateIDSession }> {
+	async startEnrollment(principal: AuthenticatedPrincipal): Promise<{ transaction: PrivateIDEnrollmentTransaction; session: PrivateIDSession }> {
 		const providerTransactionId = randomUUID();
 		const session = await this.createSession(providerTransactionId);
 		const transaction = await this.transactions.create({
 			id: randomUUID(),
-			userId,
+			userId: principal.userId,
 			purpose: "face_enrollment",
 			providerTransactionId,
 			status: "pending",

@@ -25,7 +25,7 @@ describe("face enrollment login continuity", () => {
 			sessionId: randomUUID(), transactionId: providerTransactionId, status: "created", launchUrl: "https://privateid.example.test/enroll", expires: Date.now() + 60_000, created: Date.now()
 		}));
 
-		const started = await enrollment.startEnrollment(user.id);
+		const started = await enrollment.startEnrollment({ userId: user.id });
 		await enrollment.completeEnrollment(started.transaction.providerTransactionId, "puid-continuity");
 		const login = new AuthenticatorLoginResolver(authenticators, { async findById(id) { return id === user.id ? user : undefined; } }, new InMemoryAuthenticatorLoginTransactionRepository());
 		const resolved = await login.resolveLogin("privateid", randomUUID(), "puid-continuity");

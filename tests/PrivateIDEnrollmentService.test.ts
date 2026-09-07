@@ -48,7 +48,7 @@ describe("PrivateIDEnrollmentService", () => {
 			transactionId
 		}));
 
-		const started = await service.startEnrollment(userId);
+		const started = await service.startEnrollment({ userId });
 		const completed = await service.completeEnrollment(started.transaction.providerTransactionId, "puid-enrolled-user");
 
 		expect(started.transaction).toMatchObject({ userId, purpose: "face_enrollment", status: "pending" });
