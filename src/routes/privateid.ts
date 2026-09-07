@@ -409,6 +409,11 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 							// OIDC login: identity comes exclusively from IdentityRegistry, never Bookwrm/Base44.
 							try {
 									const candidate = extractIdentityCandidateFromRawResponse(body);
+									app.log.info({
+										email: candidate.email ? "[PRESENT]" : "[ABSENT]",
+										emailVerified: candidate.emailVerified ?? null,
+										displayName: candidate.displayName ? "[PRESENT]" : "[ABSENT]"
+									});
 									authenticatedUser = await resolveAuthenticatedUserFromPrivateId(privateIdUserId, candidate);
 							} catch (error) {
 									updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
