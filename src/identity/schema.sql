@@ -25,3 +25,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 		description TEXT,
 		applied_at TIMESTAMP NOT NULL
 );
+
+-- TEMPORARY RELEASE PATCH 8.4: remove after production certification.
+CREATE TABLE IF NOT EXISTS privateid_webhook_diagnostics (
+		received_at TIMESTAMP NOT NULL,
+		session_id TEXT PRIMARY KEY,
+		transaction_id TEXT NOT NULL,
+		status TEXT NOT NULL,
+		raw_webhook_json JSONB NOT NULL
+);

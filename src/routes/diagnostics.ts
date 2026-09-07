@@ -9,6 +9,10 @@ import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
+import {
+		privateIdWebhookDiagnosticsRepository,
+		PrivateIdWebhookDiagnosticsConnectionError
+} from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 
 type ResolveBody = {
 		privateIdUserId?: string;
@@ -196,6 +200,52 @@ export async function registerDiagnosticsRoutes(
 
 				}
 
+		);
+
+		// TEMPORARY RELEASE PATCH 8.4 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.get(
+				"/diagnostics/privateid-webhook/:sessionId",
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const { sessionId } = request.params as { sessionId?: string };
+						const diagnostic = sessionId?.trim() ? await privateIdWebhookDiagnosticsRepository.findActiveBySessionId(sessionId.trim()) : undefined;
+						if (!diagnostic) {
+							reply.code(404);
+							return { error: "not_found", error_description: "No active SUCCESS webhook found for this sessionId" };
+						}
+
+						return { rawWebhook: diagnostic.raw_webhook_json };
+				}
+		);
+
+		// TEMPORARY RELEASE PATCH 8.5 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.get(
+				"/diagnostics/privateid-webhook-recent",
+				async (_request, reply) => {
+						const authorization = _request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+							reply.code(401);
+							return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						try {
+							const rows = await privateIdWebhookDiagnosticsRepository.findRecent();
+							return { status: "ok", count: rows.length, rows };
+						} catch (error) {
+							if (error instanceof PrivateIdWebhookDiagnosticsConnectionError) {
+								return { status: "connection_error", message: "Unable to query diagnostics database" };
+							}
+
+							return { status: "database_error", message: "Query failed" };
+						}
+				}
 		);
 
 		app.get(
@@ -483,6 +533,8 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/claims",
 										"/diagnostics/identity-record",
+										"/diagnostics/privateid-webhook/{sessionId}",
+										"/diagnostics/privateid-webhook-recent",
 										"/diagnostics/routes"
 								],
 								oidc: [

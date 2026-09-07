@@ -17,6 +17,7 @@ import {
 		updatePrivateIDSessionStatus
 } from "../privateid/PrivateIDSessionStore.js";
 import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/CorrelationStore.js";
+import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -267,6 +268,12 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				if (status === "SUCCESS") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "ready", Date.now());
+						await privateIdWebhookDiagnosticsRepository.capture(
+								new Date(),
+								record.session.sessionId,
+								record.session.transactionId,
+								body
+						);
 						// Release Patch 6: "puid" is PrivateID's stable per-person identifier (stable across VERIFY sessions);
 						// "guid" is per-session/per-request only and must never be used as the provider subject. Legacy aliases
 						// kept for backward compatibility with mock/test payloads that predate the real production field names.

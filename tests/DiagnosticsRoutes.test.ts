@@ -2,10 +2,118 @@ import { describe, expect, it, vi } from "vitest";
 
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityService } from "../src/identity/IdentityService.js";
+import { privateIdWebhookDiagnosticsRepository } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
+import { PrivateIdWebhookDiagnosticsConnectionError } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 import { oidcService } from "../src/oidc/OIDCService.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("Diagnostics routes", () => {
+		it("returns recent PrivateID webhook diagnostic rows", async () => {
+			const recentSpy = vi.spyOn(privateIdWebhookDiagnosticsRepository, "findRecent").mockResolvedValue([
+				{
+					receivedAt: "2026-09-07T12:00:00.000Z",
+					sessionId: "session-1",
+					transactionId: "transaction-1",
+					status: "SUCCESS"
+				}
+			]);
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+						method: "GET",
+						url: "/diagnostics/privateid-webhook-recent",
+						headers: { authorization: "Bearer test-key" }
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.json()).toEqual({
+						status: "ok",
+						count: 1,
+						rows: [{
+								receivedAt: "2026-09-07T12:00:00.000Z",
+								sessionId: "session-1",
+								transactionId: "transaction-1",
+								status: "SUCCESS"
+						}]
+				});
+			} finally {
+				recentSpy.mockRestore();
+				await app.close();
+			}
+		});
+
+		it("returns an empty list when no recent PrivateID webhook diagnostics exist", async () => {
+			const recentSpy = vi.spyOn(privateIdWebhookDiagnosticsRepository, "findRecent").mockResolvedValue([]);
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+						method: "GET",
+						url: "/diagnostics/privateid-webhook-recent",
+						headers: { authorization: "Bearer test-key" }
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.json()).toEqual({ status: "ok", count: 0, rows: [] });
+			} finally {
+				recentSpy.mockRestore();
+				await app.close();
+			}
+		});
+
+		it("returns a sanitized database error for a query failure", async () => {
+			const recentSpy = vi.spyOn(privateIdWebhookDiagnosticsRepository, "findRecent").mockRejectedValue(new Error("secret SQL details"));
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+						method: "GET",
+						url: "/diagnostics/privateid-webhook-recent",
+						headers: { authorization: "Bearer test-key" }
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.json()).toEqual({ status: "database_error", message: "Query failed" });
+			} finally {
+				recentSpy.mockRestore();
+				await app.close();
+			}
+		});
+
+		it("returns a sanitized connection error", async () => {
+			const recentSpy = vi.spyOn(privateIdWebhookDiagnosticsRepository, "findRecent").mockRejectedValue(new PrivateIdWebhookDiagnosticsConnectionError());
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+						method: "GET",
+						url: "/diagnostics/privateid-webhook-recent",
+						headers: { authorization: "Bearer test-key" }
+				});
+
+				expect(response.statusCode).toBe(200);
+				expect(response.json()).toEqual({ status: "connection_error", message: "Unable to query diagnostics database" });
+			} finally {
+				recentSpy.mockRestore();
+				await app.close();
+			}
+		});
+
+		it("enforces authentication for recent PrivateID webhook diagnostics", async () => {
+			const { app } = await buildOidcTestApp();
+			try {
+				const response = await app.inject({
+						method: "GET",
+						url: "/diagnostics/privateid-webhook-recent"
+				});
+
+				expect(response.statusCode).toBe(401);
+				expect(response.json()).toEqual({
+						error: "unauthorized",
+						error_description: "Valid admin/service API key required"
+				});
+			} finally {
+				await app.close();
+			}
+		});
+
 		it("routes /diagnostics/identityapi through identityService.health()", async () => {
 			const originalFetch = global.fetch;
 			const fetchMock = vi.fn().mockResolvedValue(new Response(
