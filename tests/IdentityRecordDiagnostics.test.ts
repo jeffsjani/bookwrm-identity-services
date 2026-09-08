@@ -1,11 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { randomUUID } from "crypto";
 import type { FastifyInstance } from "fastify";
 import Fastify from "fastify";
 
 import { configuration } from "../src/config/ConfigurationService.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { UserAuthenticatorRepository } from "../src/identity/UserAuthenticatorRepository.js";
 import type { IdentitySubject } from "../src/models/IdentitySubject.js";
+import type { UserAuthenticator } from "../src/models/UserAuthenticator.js";
 import { registerDiagnosticsRoutes } from "../src/routes/diagnostics.js";
 import {
 	storePrivateIDSession,
@@ -387,5 +389,103 @@ describe("POST /diagnostics/identity-record (Release Patch 6.4.2)", () => {
 			expect(JSON.stringify(body)).not.toContain("secret");
 			expect(JSON.stringify(body)).not.toContain("Bearer");
 		});
+	});
+});
+
+describe("POST /diagnostics/user-authenticator (Release P3.1)", () => {
+	let app: FastifyInstance;
+	const apiKey = "test-api-key";
+	const authenticator: UserAuthenticator = {
+		id: randomUUID(),
+		userId: randomUUID(),
+		provider: "privateid",
+		providerSubject: "puid-123",
+		authenticatorType: "face",
+		status: "active",
+		linkedAt: "2026-09-07T00:00:00.000Z",
+		verifiedAt: "2026-09-07T00:01:00.000Z",
+		createdAt: "2026-09-07T00:00:00.000Z",
+		updatedAt: "2026-09-07T00:01:00.000Z"
+	};
+
+	beforeEach(async () => {
+		process.env.BOOKWRM_IDENTITY_API_KEY = apiKey;
+		app = Fastify();
+		await registerDiagnosticsRoutes(app);
+	});
+
+	afterEach(async () => {
+		await app.close();
+	});
+
+	it("returns the exact authenticator response by privateid provider subject", async () => {
+		const lookup = vi.spyOn(UserAuthenticatorRepository.prototype, "findByProviderSubject").mockResolvedValue(authenticator);
+		try {
+			const response = await app.inject({
+				method: "POST",
+				url: "/diagnostics/user-authenticator",
+				headers: { authorization: `Bearer ${apiKey}` },
+				payload: { provider: "privateid", providerSubject: authenticator.providerSubject }
+			});
+
+			expect(response.statusCode).toBe(200);
+			expect(response.json()).toEqual({
+				userAuthenticator: {
+					userId: authenticator.userId,
+					provider: "privateid",
+					providerSubject: authenticator.providerSubject,
+					status: "active",
+					linkedAt: authenticator.linkedAt,
+					verifiedAt: authenticator.verifiedAt
+				}
+			});
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
+	it("looks up an active authenticator by user ID", async () => {
+		const lookup = vi.spyOn(UserAuthenticatorRepository.prototype, "findByUser").mockResolvedValue([authenticator]);
+		try {
+			const response = await app.inject({
+				method: "POST",
+				url: "/diagnostics/user-authenticator",
+				headers: { authorization: `Bearer ${apiKey}` },
+				payload: { userId: authenticator.userId }
+			});
+
+			expect(response.statusCode).toBe(200);
+			expect(lookup).toHaveBeenCalledWith(authenticator.userId);
+			expect(response.json().userAuthenticator.userId).toBe(authenticator.userId);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
+	it("returns null when no authenticator exists", async () => {
+		const lookup = vi.spyOn(UserAuthenticatorRepository.prototype, "findByProviderSubject").mockResolvedValue(undefined);
+		try {
+			const response = await app.inject({
+				method: "POST",
+				url: "/diagnostics/user-authenticator",
+				headers: { authorization: `Bearer ${apiKey}` },
+				payload: { provider: "privateid", providerSubject: "missing-puid" }
+			});
+
+			expect(response.statusCode).toBe(200);
+			expect(response.json()).toEqual({ userAuthenticator: null });
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
+	it("requires the configured API key", async () => {
+		const response = await app.inject({
+			method: "POST",
+			url: "/diagnostics/user-authenticator",
+			payload: { userId: authenticator.userId }
+		});
+
+		expect(response.statusCode).toBe(401);
 	});
 });

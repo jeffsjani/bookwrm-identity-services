@@ -5,6 +5,7 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
+import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
@@ -48,6 +49,23 @@ type IdentityRecordErrorResponse = {
 		error: string;
 		error_description?: string;
 		message?: string;
+};
+
+type UserAuthenticatorDiagnosticsBody = {
+	provider?: string;
+	providerSubject?: string;
+	userId?: string;
+};
+
+type UserAuthenticatorDiagnosticsResponse = {
+	userAuthenticator: {
+		userId: string;
+		provider: "privateid";
+		providerSubject: string;
+		status: "active" | "revoked";
+		linkedAt: string;
+		verifiedAt?: string;
+	} | null;
 };
 
 type PrivateIdDiagnosticsResponse = {
@@ -430,6 +448,43 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
+        // TEMPORARY RELEASE P3.1 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.post(
+			"/diagnostics/user-authenticator",
+			async (request, reply): Promise<UserAuthenticatorDiagnosticsResponse | IdentityRecordErrorResponse> => {
+				const authorization = request.headers.authorization;
+				const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+				if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+					reply.code(401);
+					return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+				}
+
+				const body = request.body as UserAuthenticatorDiagnosticsBody;
+				const repository = new UserAuthenticatorRepository();
+				let authenticator;
+				if (body?.provider === "privateid" && body.providerSubject?.trim()) {
+					authenticator = await repository.findByProviderSubject("privateid", body.providerSubject.trim());
+				} else if (body?.userId?.trim()) {
+					const authenticators = await repository.findByUser(body.userId.trim());
+					authenticator = authenticators.find((value) => value.status === "active") ?? authenticators[0];
+				} else {
+					reply.code(400);
+					return { error: "invalid_request", error_description: "provider and providerSubject, or userId is required" };
+				}
+
+				return {
+					userAuthenticator: authenticator ? {
+						userId: authenticator.userId,
+						provider: authenticator.provider,
+						providerSubject: authenticator.providerSubject,
+						status: authenticator.status,
+						linkedAt: authenticator.linkedAt,
+						verifiedAt: authenticator.verifiedAt
+					} : null
+				};
+			}
+		);
+
 // Release Patch 6.4.2: temporary endpoint to retrieve the actual IdentitySubject row stored
 		// in the Identity Registry for production verification. Supports three lookup methods:
 		// 1. By oidcSubject
@@ -532,6 +587,7 @@ export async function registerDiagnosticsRoutes(
 										"/privateid/callback",
 										"/diagnostics/oidc/dashboard",
 										"/diagnostics/claims",
+										"/diagnostics/user-authenticator",
 										"/diagnostics/identity-record",
 										"/diagnostics/privateid-webhook/{sessionId}",
 										"/diagnostics/privateid-webhook-recent",
