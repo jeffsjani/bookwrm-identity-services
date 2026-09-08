@@ -4,11 +4,11 @@ import { configuration } from "../config/ConfigurationService.js";
 import { privateIDEnrollmentService } from "../identity/PrivateIDEnrollmentService.js";
 
 function isAuthorized(authorization: string | undefined): boolean {
-	const expectedKey = configuration.getHapiPlatformServiceKey();
+	const expectedKey = configuration.getHapiPlatformServiceKey()?.trim();
 	if (!expectedKey || !authorization) {
 		return false;
 	}
-	return authorization === `Bearer ${expectedKey}`;
+	return authorization.trim() === `Bearer ${expectedKey}`;
 }
 
 function authenticatedUserId(userId: string | string[] | undefined): string | undefined {
