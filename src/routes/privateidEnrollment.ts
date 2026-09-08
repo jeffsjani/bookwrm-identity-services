@@ -19,18 +19,31 @@ function authenticatedUserId(userId: string | string[] | undefined): string | un
 // Internal-only: the service-authenticated Bookwrm caller attests the authenticated user in this header.
 export async function registerPrivateIDEnrollmentRoutes(app: FastifyInstance): Promise<void> {
 	app.post<{ Body: { provider?: string } }>("/internal/authenticators/enroll", async (request, reply) => {
-		if (!isAuthorized(request.headers.authorization)) {
+		// TEMPORARY (Release Verification P4.9): remove after certification. Booleans only, no sensitive values.
+		const platformKeyMatches = isAuthorized(request.headers.authorization);
+		const userId = authenticatedUserId(request.headers["x-bookwrm-user-id"]);
+		request.log.info({
+			event: "ENROLL_REQUEST",
+			authorizationHeaderPresent: Boolean(request.headers.authorization),
+			platformKeyMatches,
+			bookwrmUserHeaderPresent: Boolean(request.headers["x-bookwrm-user-id"]),
+			authenticatedPrincipalResolved: Boolean(userId)
+		});
+
+		if (!platformKeyMatches) {
+			request.log.info({ event: "ENROLL_REJECTED", reason: "INVALID_PLATFORM_KEY" });
 			reply.code(401);
 			return { error: "unauthorized" };
 		}
 
 		if (request.body?.provider !== "privateid") {
+			request.log.info({ event: "ENROLL_REJECTED", reason: "INVALID_PROVIDER" });
 			reply.code(400);
 			return { error: "invalid_request", error_description: "provider must be privateid" };
 		}
 
-		const userId = authenticatedUserId(request.headers["x-bookwrm-user-id"]);
 		if (!userId) {
+			request.log.info({ event: "ENROLL_REJECTED", reason: "MISSING_USER_HEADER" });
 			reply.code(400);
 			return { error: "invalid_request", error_description: "authenticated user context is required" };
 		}
