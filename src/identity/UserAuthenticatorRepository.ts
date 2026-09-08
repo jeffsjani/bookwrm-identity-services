@@ -91,7 +91,7 @@ export class UserAuthenticatorRepository {
 
 	async findByUser(userId: string): Promise<UserAuthenticator[]> {
 		const result = await this.client.query<UserAuthenticatorRow>(
-			`SELECT * FROM user_authenticators WHERE user_id = $1 ORDER BY created_at ASC`,
+			`SELECT * FROM user_authenticators WHERE user_id::text = $1 ORDER BY created_at ASC`,
 			[userId]
 		);
 		return result.rows.map(toUserAuthenticator);

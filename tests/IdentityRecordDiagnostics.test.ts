@@ -462,6 +462,25 @@ describe("POST /diagnostics/user-authenticator (Release P3.1)", () => {
 		}
 	});
 
+	it("looks up an active authenticator by canonical Bookwrm ObjectId", async () => {
+		const userId = "6a1f25b6f6771ce75374f8ad";
+		const lookup = vi.spyOn(UserAuthenticatorRepository.prototype, "findByUser").mockResolvedValue([{ ...authenticator, userId }]);
+		try {
+			const response = await app.inject({
+				method: "POST",
+				url: "/diagnostics/user-authenticator",
+				headers: { authorization: `Bearer ${apiKey}` },
+				payload: { userId }
+			});
+
+			expect(response.statusCode).toBe(200);
+			expect(lookup).toHaveBeenCalledWith(userId);
+			expect(response.json().userAuthenticator.userId).toBe(userId);
+		} finally {
+			lookup.mockRestore();
+		}
+	});
+
 	it("returns null when no authenticator exists", async () => {
 		const lookup = vi.spyOn(UserAuthenticatorRepository.prototype, "findByProviderSubject").mockResolvedValue(undefined);
 		try {
