@@ -140,10 +140,18 @@ export class PrivateIDClient {
 						throw new Error(`PrivateID session API request failed (${response.status}): ${rawBody || response.statusText}`);
 				}
 
-			const session = {
-				...responsePayload,
-				transactionId
-			} as PrivateIDSession;
+				const session: PrivateIDSession = {
+					sessionId: this.pickString(responsePayload, ["sessionId", "session_id", "id"]) ?? randomUUID(),
+					transactionId,
+					status: this.normalizeStatus(this.pickString(responsePayload, ["status", "state"]) ?? "created"),
+					launchUrl: this.pickString(responsePayload, ["launchUrl", "launchURL", "launch_url", "url"]) ?? "",
+					expires: this.pickTimestamp(
+						responsePayload,
+						["expiresAt", "expires", "expiration", "expiresIn"],
+						now + configuration.getNumber("PRIVATEID_SESSION_TTL_MS", 300_000)
+					),
+					created: this.pickTimestamp(responsePayload, ["createdAt", "created", "created_at"], now)
+				};
 				if (!session.launchUrl) {
 						throw new Error("PrivateID session API response missing launchUrl");
 				}
