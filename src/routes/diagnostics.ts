@@ -10,6 +10,7 @@ import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
+import { PrivateIDEnrollmentTransactionRepository } from "../identity/PrivateIDEnrollmentTransactionRepository.js";
 import {
 		privateIdWebhookDiagnosticsRepository,
 		PrivateIdWebhookDiagnosticsConnectionError
@@ -239,6 +240,134 @@ export async function registerDiagnosticsRoutes(
 						}
 
 						return { rawWebhook: diagnostic.raw_webhook_json };
+				}
+		);
+
+		// TEMPORARY RELEASE C4 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		// Self-diagnostics: reconstructs a booleans-only trace of a face enrollment attempt from
+		// the signals this service already keeps (in-memory PrivateID session store, the Postgres
+		// enrollment transactions table, and the Postgres webhook diagnostics table). No secrets or PII.
+		app.get(
+				"/diagnostics/enrollment-trace/:sessionId",
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const { sessionId: rawSessionId } = request.params as { sessionId?: string };
+						const sessionId = rawSessionId?.trim();
+						if (!sessionId) {
+								reply.code(400);
+								return { error: "invalid_request", error_description: "sessionId is required" };
+						}
+
+						const record = findPrivateIDSession(sessionId);
+						const privateIdSessionCreated = Boolean(record);
+						const enrollmentTransactionId = record?.enrollmentTransactionId;
+
+						let enrollmentTransactionStatus: string | undefined;
+						if (enrollmentTransactionId) {
+								const transaction = await new PrivateIDEnrollmentTransactionRepository().findById(enrollmentTransactionId);
+								enrollmentTransactionStatus = transaction?.status;
+						}
+
+						const webhookDiagnostic = await privateIdWebhookDiagnosticsRepository.findActiveBySessionId(sessionId);
+						const webhookMatchedSession = Boolean(webhookDiagnostic);
+						// A transaction that moved off "pending" can only have happened via a matched webhook,
+						// so it still counts as "received" even if the diagnostics row itself has since expired.
+						const webhookReceived = webhookMatchedSession || Boolean(enrollmentTransactionStatus && enrollmentTransactionStatus !== "pending");
+						const userAuthenticatorCreated = enrollmentTransactionStatus === "completed";
+
+						// Session creation only happens after the enroll request has already passed authorization.
+						const requestReachedService = privateIdSessionCreated;
+						const authorizationPassed = privateIdSessionCreated;
+						const enrollmentTransactionCreated = Boolean(enrollmentTransactionId);
+
+						let failureStage: string | null = null;
+						if (!requestReachedService) {
+								failureStage = "REQUEST_NOT_RECEIVED";
+						} else if (!enrollmentTransactionCreated) {
+								failureStage = "ENROLLMENT_TRANSACTION_CREATION";
+						} else if (!webhookReceived) {
+								failureStage = "WEBHOOK_NOT_RECEIVED";
+						} else if (!webhookMatchedSession) {
+								failureStage = "WEBHOOK_SESSION_LOOKUP";
+						} else if (!userAuthenticatorCreated) {
+								failureStage = "USER_AUTHENTICATOR_CREATION";
+						}
+
+						return {
+								sessionId,
+								requestReachedService,
+								authorizationPassed,
+								privateIdSessionCreated,
+								privateIdSessionId: record?.session.sessionId,
+								transactionId: record?.session.transactionId,
+								enrollmentTransactionCreated,
+								enrollmentTransactionId,
+								enrollmentTransactionStatus,
+								webhookReceived,
+								webhookMatchedSession,
+								userAuthenticatorCreated,
+								failureStage
+						};
+				}
+		);
+
+		// TEMPORARY RELEASE C4 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.get(
+				"/diagnostics/session/:sessionId",
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const { sessionId: rawSessionId } = request.params as { sessionId?: string };
+						const sessionId = rawSessionId?.trim();
+						const record = sessionId ? findPrivateIDSession(sessionId) : undefined;
+						if (!record) {
+								return { exists: false };
+						}
+
+						return {
+								exists: true,
+								store: "memory",
+								status: record.session.status,
+								transactionId: record.session.transactionId
+						};
+				}
+		);
+
+		// TEMPORARY RELEASE C4 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.get(
+				"/diagnostics/enrollment-transaction/:transactionId",
+				async (request, reply) => {
+						const authorization = request.headers.authorization;
+						const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+						if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+								reply.code(401);
+								return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+						}
+
+						const { transactionId: rawTransactionId } = request.params as { transactionId?: string };
+						const transactionId = rawTransactionId?.trim();
+						const transaction = transactionId ? await new PrivateIDEnrollmentTransactionRepository().findById(transactionId) : undefined;
+						if (!transaction) {
+								return { exists: false };
+						}
+
+						return {
+								exists: true,
+								status: transaction.status,
+								expires: transaction.expiresAt,
+								completed: transaction.status === "completed"
+						};
 				}
 		);
 
@@ -591,6 +720,9 @@ export async function registerDiagnosticsRoutes(
 										"/diagnostics/identity-record",
 										"/diagnostics/privateid-webhook/{sessionId}",
 										"/diagnostics/privateid-webhook-recent",
+										"/diagnostics/enrollment-trace/{sessionId}",
+										"/diagnostics/session/{sessionId}",
+										"/diagnostics/enrollment-transaction/{transactionId}",
 										"/diagnostics/routes"
 								],
 								oidc: [

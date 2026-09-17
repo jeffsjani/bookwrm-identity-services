@@ -68,6 +68,14 @@ export class PrivateIDEnrollmentTransactionRepository {
 		return result.rows[0] ? toEnrollmentTransaction(result.rows[0]) : undefined;
 	}
 
+	async findById(id: string): Promise<PrivateIDEnrollmentTransaction | undefined> {
+		const result = await this.client.query<PrivateIDEnrollmentTransactionRow>(
+			`SELECT * FROM privateid_enrollment_transactions WHERE id = $1`,
+			[id]
+		);
+		return result.rows[0] ? toEnrollmentTransaction(result.rows[0]) : undefined;
+	}
+
 	async updateStatus(
 		id: string,
 		status: PrivateIDEnrollmentTransactionStatus,
