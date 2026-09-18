@@ -22,7 +22,8 @@ ALTER TABLE identity_subjects ALTER COLUMN display_name DROP NOT NULL;
 -- Provider authenticator storage. It is intentionally not used by runtime authentication yet.
 CREATE TABLE IF NOT EXISTS user_authenticators (
 		id UUID PRIMARY KEY,
-		user_id UUID NOT NULL REFERENCES identity_subjects(id),
+		-- user_id is the canonical Bookwrm user identifier (ObjectId string), not the OIDC subject / identity_subjects UUID.
+		user_id TEXT NOT NULL,
 		provider TEXT NOT NULL CHECK (provider = 'privateid'),
 		provider_subject TEXT NOT NULL,
 		authenticator_type TEXT NOT NULL CHECK (authenticator_type = 'face'),
@@ -36,13 +37,18 @@ CREATE TABLE IF NOT EXISTS user_authenticators (
 		CONSTRAINT user_authenticators_provider_subject_key UNIQUE (provider, provider_subject)
 );
 
+-- Release C3.7: existing deployments created the column as UUID with an identity_subjects FK; migrate in place.
+ALTER TABLE user_authenticators DROP CONSTRAINT IF EXISTS user_authenticators_user_id_fkey;
+ALTER TABLE user_authenticators ALTER COLUMN user_id TYPE TEXT USING user_id::text;
+
 CREATE UNIQUE INDEX IF NOT EXISTS user_authenticators_one_active_face_per_user_key
 		ON user_authenticators (user_id)
 		WHERE status = 'active' AND authenticator_type = 'face';
 
 CREATE TABLE IF NOT EXISTS privateid_enrollment_transactions (
 		id UUID PRIMARY KEY,
-		user_id UUID NOT NULL REFERENCES identity_subjects(id),
+		-- user_id is the canonical Bookwrm user identifier (ObjectId string), not an identity_subjects UUID.
+		user_id TEXT NOT NULL,
 		purpose TEXT NOT NULL CHECK (purpose = 'face_enrollment'),
 		provider_transaction_id UUID NOT NULL UNIQUE,
 		status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed', 'expired')),
@@ -50,6 +56,10 @@ CREATE TABLE IF NOT EXISTS privateid_enrollment_transactions (
 		expires_at TIMESTAMPTZ NOT NULL,
 		completed_at TIMESTAMPTZ
 );
+
+-- Release C3.7: existing deployments created the column as UUID with an identity_subjects FK; migrate in place.
+ALTER TABLE privateid_enrollment_transactions DROP CONSTRAINT IF EXISTS privateid_enrollment_transactions_user_id_fkey;
+ALTER TABLE privateid_enrollment_transactions ALTER COLUMN user_id TYPE TEXT USING user_id::text;
 
 CREATE TABLE IF NOT EXISTS authenticator_login_transactions (
 		id UUID PRIMARY KEY,
