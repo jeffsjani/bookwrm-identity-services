@@ -6,9 +6,7 @@ import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
-import { inMemoryUserAuthenticatorRepository } from "../identity/InMemoryUserAuthenticatorRepository.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
-import type { AuthenticatorProvider } from "../models/UserAuthenticator.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
@@ -713,11 +711,12 @@ export async function registerDiagnosticsRoutes(
 
 		);
 
-		// Release C4.3: read-only trace of the exact IdentitySubject AuthenticatorLoginResolver.resolveLogin()
-		// loads during Face Login -- UserAuthenticator lookup by (provider, providerSubject), then IdentitySubject
-		// lookup by authenticator.userId. No writes; unlike resolveLogin() itself, never throws on revoked/inactive
-		// so the true stored status is always visible for diagnosis.
-		// TEMPORARY RELEASE C4.3 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		// Release C4.3/C4.4: read-only trace of the exact IdentitySubject resolveOrCreate()/the runtime locate
+		// by -- queries identity_subjects directly by (provider, providerSubject), the same key
+		// resolveOrCreate()'s INSERT ... ON CONFLICT (primary_provider, primary_provider_subject) upserts
+		// against. No writes, no UserAuthenticator/id indirection, never throws on inactive/disabled so the
+		// true stored status is always visible for diagnosis.
+		// TEMPORARY RELEASE C4.3/C4.4 - REMOVE AFTER PRODUCTION CERTIFICATION.
 		app.post(
 			"/diagnostics/identity-subject",
 			async (request, reply): Promise<IdentitySubjectDiagnosticsResponse | IdentityRecordErrorResponse> => {
@@ -736,11 +735,7 @@ export async function registerDiagnosticsRoutes(
 					return { error: "invalid_request", error_description: "provider and providerSubject are required" };
 				}
 
-				const authenticators = configuration.getIdentityRegistryDriver() === "memory"
-					? inMemoryUserAuthenticatorRepository
-					: new UserAuthenticatorRepository();
-				const authenticator = await authenticators.findByProviderSubject(provider.toLowerCase() as AuthenticatorProvider, providerSubject);
-				const identitySubject = authenticator ? await identityRegistry.findById(authenticator.userId) : undefined;
+				const identitySubject = await identityRegistry.findByProvider(provider as IdentityProvider, providerSubject);
 
 				return {
 					identitySubject: identitySubject ? {
