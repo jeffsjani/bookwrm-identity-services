@@ -3,6 +3,13 @@ import type { AuthenticatorLoginTransaction, AuthenticatorLoginTransactionStatus
 export class InMemoryAuthenticatorLoginTransactionRepository {
 	private readonly transactions = new Map<string, AuthenticatorLoginTransaction>();
 	async create(input: Omit<AuthenticatorLoginTransaction, "createdAt" | "completedAt">): Promise<AuthenticatorLoginTransaction> {
+		// Release C4.6: mirrors the Postgres repository's ON CONFLICT (provider_transaction_id) reuse --
+		// a webhook/callback retry for the same providerTransactionId must reuse the existing row, never
+		// create a duplicate.
+		const existing = [...this.transactions.values()].find((transaction) => transaction.providerTransactionId === input.providerTransactionId);
+		if (existing) {
+			return { ...existing };
+		}
 		const transaction = { ...input, createdAt: new Date().toISOString() };
 		this.transactions.set(transaction.id, transaction);
 		return { ...transaction };

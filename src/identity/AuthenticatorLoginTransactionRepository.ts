@@ -20,9 +20,14 @@ export class AuthenticatorLoginTransactionRepository {
 	private get client(): PostgresClient { return this.explicitClient ?? (this.explicitClient = getPostgresPool()); }
 
 	async create(transaction: Omit<AuthenticatorLoginTransaction, "createdAt" | "completedAt">): Promise<AuthenticatorLoginTransaction> {
+		// Release C4.6: idempotent under webhook/callback retries -- provider_transaction_id is UNIQUE, so a
+		// retry that races/repeats the same login attempt must reuse the existing row (returned as-is via the
+		// no-op DO UPDATE) instead of throwing a unique-constraint violation.
 		const result = await this.client.query<Row>(
 			`INSERT INTO authenticator_login_transactions (id, provider, provider_transaction_id, provider_subject, resolved_user_id, status, created_at, completed_at)
-			 VALUES ($1, $2, $3, NULL, NULL, $4, $5, NULL) RETURNING *`,
+			 VALUES ($1, $2, $3, NULL, NULL, $4, $5, NULL)
+			 ON CONFLICT (provider_transaction_id) DO UPDATE SET provider_transaction_id = EXCLUDED.provider_transaction_id
+			 RETURNING *`,
 			[transaction.id, transaction.provider, transaction.providerTransactionId, transaction.status, new Date()]
 		);
 		return mapRow(result.rows[0]);

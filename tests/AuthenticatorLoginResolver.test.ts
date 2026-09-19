@@ -45,4 +45,19 @@ describe("AuthenticatorLoginResolver", () => {
 		await authenticators.create({ id: randomUUID(), userId: randomUUID(), provider: "privateid", providerSubject: "duplicate-puid", authenticatorType: "face", status: "active" });
 		await expect(authenticators.create({ id: randomUUID(), userId: randomUUID(), provider: "privateid", providerSubject: "duplicate-puid", authenticatorType: "face", status: "active" })).rejects.toThrow("provider subject already linked");
 	});
+
+	it("Release C4.6: a retried resolveLogin() for the same providerTransactionId reuses the transaction instead of throwing", async () => {
+		const authenticators = new InMemoryUserAuthenticatorRepository();
+		const canonicalUser = user();
+		await authenticators.create({ id: randomUUID(), userId: canonicalUser.id, provider: "privateid", providerSubject: "puid-retry", authenticatorType: "face", status: "active" });
+		const resolver = new AuthenticatorLoginResolver(authenticators, { async findById(id) { return id === canonicalUser.id ? canonicalUser : undefined; } }, new InMemoryAuthenticatorLoginTransactionRepository());
+		const providerTransactionId = randomUUID();
+
+		// Simulates a webhook + callback (or callback retry) both resolving login for the same PrivateID session.
+		const first = await resolver.resolveLogin("privateid", providerTransactionId, "puid-retry");
+		const second = await resolver.resolveLogin("privateid", providerTransactionId, "puid-retry");
+
+		expect(first.id).toBe(canonicalUser.id);
+		expect(second.id).toBe(canonicalUser.id);
+	});
 });
