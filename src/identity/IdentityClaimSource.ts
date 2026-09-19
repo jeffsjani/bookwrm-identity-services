@@ -5,5 +5,6 @@ export type IdentityClaimSource =
 		| "APPLE"
 		| "PASSKEY"
 		| "ENTERPRISE"
+		| "BOOKWRM"
 		| "MANUAL"
 		| "SYSTEM";

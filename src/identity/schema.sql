@@ -87,3 +87,16 @@ CREATE TABLE IF NOT EXISTS privateid_webhook_diagnostics (
 		status TEXT NOT NULL,
 		raw_webhook_json JSONB NOT NULL
 );
+
+-- Release C5.1: provider-neutral mapping from an external Bookwrm account to an IdentitySubject.
+-- Deliberately separate from providerSubject/user_authenticators.user_id/oidc_subject.
+CREATE TABLE IF NOT EXISTS identity_account_links (
+		id UUID PRIMARY KEY,
+		source TEXT NOT NULL CHECK (source = 'bookwrm'),
+		external_user_id TEXT NOT NULL,
+		identity_subject_id UUID NOT NULL REFERENCES identity_subjects(id),
+		status TEXT NOT NULL CHECK (status = 'active'),
+		linked_at TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL,
+		CONSTRAINT identity_account_links_source_external_user_id_key UNIQUE (source, external_user_id)
+);

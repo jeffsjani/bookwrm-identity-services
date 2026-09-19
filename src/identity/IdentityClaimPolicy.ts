@@ -16,7 +16,8 @@ export type ClaimEvaluationInput = {
 		proposedSource: IdentityClaimSource;
 };
 
-const ADMINISTRATIVE_SOURCES: readonly IdentityClaimSource[] = ["MANUAL", "SYSTEM"];
+// BOOKWRM is the first-party authoritative account source (Release C5.1), not merely an authenticator.
+const ADMINISTRATIVE_SOURCES: readonly IdentityClaimSource[] = ["MANUAL", "SYSTEM", "BOOKWRM"];
 
 function isAdministrative(source: IdentityClaimSource): boolean {
 		return ADMINISTRATIVE_SOURCES.includes(source);

@@ -54,6 +54,8 @@ export function ensureOidcTestEnvironment(): void {
 		process.env.PRIVATEID_FALLBACK_EMAIL = "dev.user@bookwrm.local";
 		process.env.PRIVATEID_FALLBACK_NAME = "Dev User";
 
+		process.env.HAPI_PLATFORM_SERVICE_KEY = "hapi-platform-service-key";
+
 		configuration.reload();
 }
 
@@ -62,11 +64,13 @@ export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {
 		const { oidcService } = await import("../src/oidc/OIDCService.js");
 		const { registerDiagnosticsRoutes } = await import("../src/routes/diagnostics.js");
 		const { registerPrivateIdRoutes } = await import("../src/routes/privateid.js");
+		const { registerIdentityAccountLinkRoutes } = await import("../src/routes/identityAccountLink.js");
 
 		const app = Fastify();
 		await app.register(formbody);
 		await registerDiagnosticsRoutes(app);
 		await registerPrivateIdRoutes(app);
+		await registerIdentityAccountLinkRoutes(app);
 		await oidcService.registerEndpoints(app);
 		await app.ready();
 
