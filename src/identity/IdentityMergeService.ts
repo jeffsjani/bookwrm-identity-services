@@ -1,6 +1,9 @@
 import { identityRegistry } from "./IdentityRegistry.js";
 import { identityClaimResolver } from "./IdentityClaimResolver.js";
 import { recordIdentityAudit } from "./IdentityAudit.js";
+import { configuration } from "../config/ConfigurationService.js";
+import { inMemoryUserAuthenticatorRepository } from "./InMemoryUserAuthenticatorRepository.js";
+import { UserAuthenticatorRepository } from "./UserAuthenticatorRepository.js";
 import type { IdentityClaimSource } from "./IdentityClaimSource.js";
 import type { IdentitySubject } from "../models/IdentitySubject.js";
 
@@ -15,11 +18,20 @@ export type MergeResult = {
 		loserOidcSubject: string;
 };
 
+function defaultAuthenticators(): Pick<UserAuthenticatorRepository, "reassignUser"> {
+		return configuration.getIdentityRegistryDriver() === "memory"
+				? inMemoryUserAuthenticatorRepository
+				: new UserAuthenticatorRepository();
+}
+
 // Implements the Phase 4 Identity Merge design (claim reconciliation + loser retirement).
-// LIMITATION: current schema models exactly one primaryProvider/primaryProviderSubject per
-// IdentitySubject, so the loser's authenticator link is NOT re-attached to the survivor here --
-// that requires a multi-authenticator table, tracked as future work (see Phase 4 design notes).
-export async function mergeIdentities(request: MergeRequest): Promise<MergeResult> {
+// Release C4.1: a retired loser's UserAuthenticator rows are re-pointed to the survivor's id so
+// AuthenticatorLoginResolver.resolveUserFromAuthenticator() keeps resolving the still-ACTIVE canonical
+// IdentitySubject -- previously they stayed linked to the disabled loser and could never be found "ACTIVE" again.
+export async function mergeIdentities(
+		request: MergeRequest,
+		authenticators: Pick<UserAuthenticatorRepository, "reassignUser"> = defaultAuthenticators()
+): Promise<MergeResult> {
 		if (request.survivorOidcSubject === request.loserOidcSubject) {
 				throw new Error("Cannot merge an IdentitySubject into itself");
 		}
@@ -49,6 +61,11 @@ export async function mergeIdentities(request: MergeRequest): Promise<MergeResul
 		if (!disabledLoser) {
 				throw new Error(`Failed to retire loser IdentitySubject: ${loser.oidcSubject}`);
 		}
+
+		// Without this, any UserAuthenticator still linked to loser.id would forever resolve to a
+		// DISABLED IdentitySubject and fail login with "User Inactive", even though the account is
+		// active under the survivor.
+		await authenticators.reassignUser(loser.id, survivor.id);
 
 		recordIdentityAudit(survivor.oidcSubject, "MERGE", {
 				role: "survivor",

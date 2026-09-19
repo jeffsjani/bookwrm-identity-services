@@ -23,7 +23,7 @@ describe("face enrollment login continuity", () => {
 		};
 		const enrollment = new PrivateIDEnrollmentService(transactions, authenticators, async (providerTransactionId) => ({
 			sessionId: randomUUID(), transactionId: providerTransactionId, status: "created", launchUrl: "https://privateid.example.test/enroll", expires: Date.now() + 60_000, created: Date.now()
-		}));
+		}), { async resolveOrCreate() { return user; } } as never);
 
 		const started = await enrollment.startEnrollment({ userId: user.id });
 		await enrollment.completeEnrollment(started.transaction.providerTransactionId, "puid-continuity");

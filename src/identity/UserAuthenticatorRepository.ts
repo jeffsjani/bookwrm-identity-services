@@ -167,4 +167,14 @@ export class UserAuthenticatorRepository {
 		);
 		return result.rows[0] ? toUserAuthenticator(result.rows[0]) : undefined;
 	}
+
+	// Re-points authenticators from a retired (merged/loser) userId onto the surviving canonical userId,
+	// so future logins resolve the still-ACTIVE IdentitySubject instead of the disabled one.
+	async reassignUser(fromUserId: string, toUserId: string): Promise<number> {
+		const result = await this.client.query<UserAuthenticatorRow>(
+			`UPDATE user_authenticators SET user_id = $2, updated_at = $3 WHERE user_id = $1 RETURNING *`,
+			[fromUserId, toUserId, new Date()]
+		);
+		return result.rows.length;
+	}
 }

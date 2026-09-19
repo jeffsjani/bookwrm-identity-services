@@ -9,6 +9,7 @@ import { PrivateIDEnrollmentTransactionRepository } from "./PrivateIDEnrollmentT
 import { UserAuthenticatorRepository } from "./UserAuthenticatorRepository.js";
 import { configuration } from "../config/ConfigurationService.js";
 import { inMemoryUserAuthenticatorRepository } from "./InMemoryUserAuthenticatorRepository.js";
+import { identityRegistry, type IdentityRegistry } from "./IdentityRegistry.js";
 
 type EnrollmentTransactionStore = Pick<
 	PrivateIDEnrollmentTransactionRepository,
@@ -16,6 +17,7 @@ type EnrollmentTransactionStore = Pick<
 >;
 type AuthenticatorStore = Pick<UserAuthenticatorRepository, "create">;
 type EnrollmentSessionCreator = (providerTransactionId: string) => Promise<PrivateIDSession>;
+type IdentityRegistryStore = Pick<IdentityRegistry, "resolveOrCreate">;
 
 function defaultAuthenticatorStore(): AuthenticatorStore {
 	return configuration.getIdentityRegistryDriver() === "memory"
@@ -27,7 +29,8 @@ export class PrivateIDEnrollmentService {
 	constructor(
 		private readonly transactions: EnrollmentTransactionStore = new PrivateIDEnrollmentTransactionRepository(),
 		private readonly authenticators: AuthenticatorStore = defaultAuthenticatorStore(),
-		private readonly createSession: EnrollmentSessionCreator = (transactionId) => new PrivateIDClient().createEnrollmentSession(transactionId)
+		private readonly createSession: EnrollmentSessionCreator = (transactionId) => new PrivateIDClient().createEnrollmentSession(transactionId),
+		private readonly identities: IdentityRegistryStore = identityRegistry
 	) {}
 
 	async startEnrollment(principal: AuthenticatedPrincipal): Promise<{ transaction: PrivateIDEnrollmentTransaction; session: PrivateIDSession }> {
@@ -55,9 +58,19 @@ export class PrivateIDEnrollmentService {
 		}
 
 		const now = new Date().toISOString();
+
+		// Bookwrm User -> IdentitySubject -> UserAuthenticator: reuse an existing IdentitySubject for this
+		// PUID (exactly one provider identifier, matching UserAuthenticator.providerSubject below) or mint
+		// one via the existing creation service -- never duplicate that logic here. status defaults to
+		// ACTIVE inside resolveOrCreate.
+		const identitySubject = await this.identities.resolveOrCreate({
+			provider: "PrivateID",
+			providerSubject: providerSubject
+		});
+
 		await this.authenticators.create({
 			id: randomUUID(),
-			userId: transaction.userId,
+			userId: identitySubject.id,
 			provider: "privateid",
 			providerSubject,
 			authenticatorType: "face",

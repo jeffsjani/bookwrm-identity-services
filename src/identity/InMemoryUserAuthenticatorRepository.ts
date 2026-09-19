@@ -47,6 +47,16 @@ export class InMemoryUserAuthenticatorRepository {
 	async revoke(id: string): Promise<UserAuthenticator | undefined> {
 		return this.update(id, { status: "revoked", revokedAt: new Date().toISOString() });
 	}
+
+	// Re-points authenticators from a retired (merged/loser) userId onto the surviving canonical userId,
+	// so future logins resolve the still-ACTIVE IdentitySubject instead of the disabled one.
+	async reassignUser(fromUserId: string, toUserId: string): Promise<number> {
+		const matches = [...this.authenticatorsById.values()].filter((authenticator) => authenticator.userId === fromUserId);
+		for (const authenticator of matches) {
+			Object.assign(authenticator, { userId: toUserId, updatedAt: new Date().toISOString() });
+		}
+		return matches.length;
+	}
 }
 
 export const inMemoryUserAuthenticatorRepository = new InMemoryUserAuthenticatorRepository();

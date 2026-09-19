@@ -43,17 +43,24 @@ describe("PrivateIDEnrollmentService", () => {
 				return input;
 			}
 		};
+		const identitySubjectId = randomUUID();
+		const identities = {
+			async resolveOrCreate(request: { provider: string; providerSubject: string }) {
+				expect(request).toEqual({ provider: "PrivateID", providerSubject: "puid-enrolled-user" });
+				return { id: identitySubjectId, oidcSubject: randomUUID(), primaryProvider: "PrivateID", primaryProviderSubject: request.providerSubject, status: "ACTIVE", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+			}
+		};
 		const service = new PrivateIDEnrollmentService(transactions, authenticators, async (transactionId) => ({
 			...session,
 			transactionId
-		}));
+		}), identities as never);
 
 		const started = await service.startEnrollment({ userId });
 		const completed = await service.completeEnrollment(started.transaction.providerTransactionId, "puid-enrolled-user");
 
 		expect(started.transaction).toMatchObject({ userId, purpose: "face_enrollment", status: "pending" });
 		expect(createdAuthenticators).toEqual([expect.objectContaining({
-			userId,
+			userId: identitySubjectId,
 			provider: "privateid",
 			providerSubject: "puid-enrolled-user",
 			authenticatorType: "face",

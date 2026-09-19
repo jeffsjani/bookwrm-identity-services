@@ -7,6 +7,9 @@ import { identityMetrics } from "../src/identity/infrastructure/IdentityMetrics.
 import { getSharedMetricsRegistry } from "../src/oidc/infrastructure/OIDCMetrics.js";
 import { recoverIdentity } from "../src/identity/IdentityRecoveryService.js";
 import { mergeIdentities } from "../src/identity/IdentityMergeService.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
+import { AuthenticatorLoginResolver } from "../src/identity/AuthenticatorLoginResolver.js";
+import { InMemoryAuthenticatorLoginTransactionRepository } from "../src/identity/InMemoryAuthenticatorLoginTransactionRepository.js";
 
 async function createTestSubject(email: string) {
 		return identityRegistry.resolveOrCreate({
@@ -283,5 +286,39 @@ describe("Task 9: Identity Merge (implemented)", () => {
 								reason: "invalid"
 						})
 				).rejects.toThrow("itself");
+		});
+
+		it("Release C4.1: re-points the loser's UserAuthenticator to the survivor so login keeps resolving an ACTIVE canonical user", async () => {
+				const survivor = await createTestSubject(`merge-c41-survivor-${randomUUID()}@example.com`);
+				const loser = await createTestSubject(`merge-c41-loser-${randomUUID()}@example.com`);
+
+				await inMemoryUserAuthenticatorRepository.create({
+						id: randomUUID(),
+						userId: loser.id,
+						provider: "privateid",
+						providerSubject: `merge-c41-puid-${randomUUID()}`,
+						authenticatorType: "face",
+						status: "active"
+				});
+
+				await mergeIdentities(
+						{
+								survivorOidcSubject: survivor.oidcSubject,
+								loserOidcSubject: loser.oidcSubject,
+								reason: "Confirmed same person via support ticket"
+						},
+						inMemoryUserAuthenticatorRepository
+				);
+
+				const authenticator = await inMemoryUserAuthenticatorRepository.findByProviderSubject(
+						"privateid",
+						(await inMemoryUserAuthenticatorRepository.findByUser(survivor.id))[0].providerSubject
+				);
+				expect(authenticator?.userId).toBe(survivor.id);
+
+				const resolver = new AuthenticatorLoginResolver(inMemoryUserAuthenticatorRepository, { async findById(id) { return identityRegistry.findById(id); } }, new InMemoryAuthenticatorLoginTransactionRepository());
+				const resolved = await resolver.resolveLogin("privateid", randomUUID(), authenticator!.providerSubject);
+				expect(resolved.id).toBe(survivor.id);
+				expect(resolved.status).toBe("ACTIVE");
 		});
 });
