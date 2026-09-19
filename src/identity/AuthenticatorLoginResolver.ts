@@ -58,7 +58,12 @@ export class AuthenticatorLoginResolver {
 
 	async resolveUserFromAuthenticator(authenticator: UserAuthenticator): Promise<IdentitySubject> {
 		const user = await this.users.findById(authenticator.userId);
-		if (!user || user.status !== "ACTIVE") throw new AuthenticatorLoginError("USER_INACTIVE");
+		// TEMPORARY RELEASE C4.7 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no UUIDs/PII.
+		console.info("STATUS_CHECK", { status: user?.status ?? null });
+		if (!user || user.status !== "ACTIVE") {
+			console.info("STATUS_ABORT", { reason: "USER_INACTIVE" });
+			throw new AuthenticatorLoginError("USER_INACTIVE");
+		}
 		return user;
 	}
 

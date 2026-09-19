@@ -597,6 +597,16 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						pendingAuthorizationPresent
 				}, "CALLBACK_RESOLUTION");
 
+				// TEMPORARY RELEASE C4.7 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no UUIDs/PUIDs/user IDs/tokens/PII.
+				app.log.info({
+						event: "RESOLVED_IDENTITY",
+						identitySubjectIdPresent: Boolean(canonicalUser.id),
+						identitySubjectStatus: canonicalUser.status,
+						oidcSubjectPresent: Boolean(canonicalUser.oidcSubject),
+						resolvedByProvider: "PrivateID",
+						resolvedByProviderSubjectPresent: Boolean(providerSubject)
+				}, "RESOLVED_IDENTITY");
+
 				const oidcSubject = canonicalUser.oidcSubject;
 				if (!oidcSubject) {
 						app.log.info({ event: "CALLBACK_ABORT", reason: "OIDC_SUBJECT_MISSING" }, "CALLBACK_ABORT");
