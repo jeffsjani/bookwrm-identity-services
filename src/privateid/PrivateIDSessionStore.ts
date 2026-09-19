@@ -96,6 +96,11 @@ export function consumePendingAuthorizationRequest(sessionId: string): PendingAu
 		return context;
 }
 
+// Non-mutating peek for diagnostics (Release C4.5) -- never consumes the pending context.
+export function hasPendingAuthorizationRequest(sessionId: string): boolean {
+		return pendingAuthorizationRequests.has(sessionId);
+}
+
 export function getCurrentPrivateIDSessionRecord(): PrivateIDSessionRecord | undefined {
 		if (!currentSessionId) {
 				return undefined;

@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
+import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
@@ -13,7 +14,8 @@ import {
 		storePrivateIDAuthenticatedUser,
 		storePrivateIDIdentityContext,
 		storePrivateIDResult,
-		updatePrivateIDSessionStatus
+		updatePrivateIDSessionStatus,
+		hasPendingAuthorizationRequest
 } from "../privateid/PrivateIDSessionStore.js";
 import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/CorrelationStore.js";
 import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
@@ -541,6 +543,8 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				if (!resolvedRecord || !providerSubject) {
 						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
+						// TEMPORARY RELEASE C4.5 - REMOVE AFTER PRODUCTION CERTIFICATION.
+						app.log.info({ event: "CALLBACK_ABORT", reason: "USER_AUTHENTICATOR_NOT_FOUND" }, "CALLBACK_ABORT");
 						reply.code(200);
 						return {
 								status: "failed",
@@ -552,6 +556,28 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				try {
 						canonicalUser = await authenticatorLoginResolver.resolveLogin("privateid", resolvedRecord.session.transactionId, providerSubject);
 				} catch (error) {
+						// TEMPORARY RELEASE C4.5 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no PII/UUIDs/PUIDs/tokens.
+						const code = error instanceof AuthenticatorLoginError ? error.code : undefined;
+						const userAuthenticatorFound = code === "AUTHENTICATOR_REVOKED" || code === "USER_INACTIVE";
+						let identitySubjectFound = false;
+						let identitySubjectStatus: string | null = null;
+						let abortReason = "USER_AUTHENTICATOR_NOT_FOUND";
+						if (code === "USER_INACTIVE") {
+								const subject = await identityRegistry.findByProvider("PrivateID", providerSubject);
+								identitySubjectFound = Boolean(subject);
+								identitySubjectStatus = subject?.status ?? null;
+								abortReason = subject ? "USER_INACTIVE" : "IDENTITY_SUBJECT_NOT_FOUND";
+						}
+						app.log.info({
+								event: "CALLBACK_RESOLUTION",
+								userAuthenticatorFound,
+								identitySubjectFound,
+								identitySubjectStatus,
+								oidcSubjectPresent: false,
+								pendingAuthorizationPresent: hasPendingAuthorizationRequest(resolvedRecord.session.sessionId)
+						}, "CALLBACK_RESOLUTION");
+						app.log.info({ event: "CALLBACK_ABORT", reason: abortReason }, "CALLBACK_ABORT");
+
 						app.log.warn({ requestId, correlationId, sessionId: callbackSessionId, error }, "AuthenticatorLoginResolver failed during PrivateID callback");
 						reply.code(200);
 						const message = error instanceof AuthenticatorLoginError
@@ -560,8 +586,20 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						return { status: "failed", message };
 				}
 
+				// TEMPORARY RELEASE C4.5 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no PII/UUIDs/PUIDs/tokens.
+				const pendingAuthorizationPresent = hasPendingAuthorizationRequest(resolvedRecord.session.sessionId);
+				app.log.info({
+						event: "CALLBACK_RESOLUTION",
+						userAuthenticatorFound: true,
+						identitySubjectFound: true,
+						identitySubjectStatus: canonicalUser.status,
+						oidcSubjectPresent: Boolean(canonicalUser.oidcSubject),
+						pendingAuthorizationPresent
+				}, "CALLBACK_RESOLUTION");
+
 				const oidcSubject = canonicalUser.oidcSubject;
 				if (!oidcSubject) {
+						app.log.info({ event: "CALLBACK_ABORT", reason: "OIDC_SUBJECT_MISSING" }, "CALLBACK_ABORT");
 						app.log.warn({ requestId, correlationId, sessionId: callbackSessionId }, "Canonical user missing oidcSubject during PrivateID callback");
 						reply.code(200);
 						return { status: "failed", message: "OIDC Subject not resolved" };
@@ -578,6 +616,13 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				reply.code(200);
 				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
+
+				// TEMPORARY RELEASE C4.5 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no PII/UUIDs/PUIDs/tokens.
+				if (pendingAuthorizationPresent) {
+						app.log.info({ event: "CALLBACK_RESUME" }, "CALLBACK_RESUME true");
+				} else {
+						app.log.info({ event: "CALLBACK_ABORT", reason: "PENDING_AUTHORIZATION_MISSING" }, "CALLBACK_ABORT");
+				}
 
 				const redirectUrl = await oidcService.resumePendingAuthorization(resolvedRecord.session.sessionId);
 				if (redirectUrl) {
