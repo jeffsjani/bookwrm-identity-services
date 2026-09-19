@@ -516,10 +516,9 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				const sessionId = pickQueryValue(query, ["sessionId", "session_id", "sid"]);
 				const transactionId = pickQueryValue(query, ["transactionId", "transaction_id", "txId", "txnId"]);
 				let callbackSessionId = sessionId;
-				let retry = false;
 
 				if (!reason) {
-						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 						reply.code(400);
 						return {
 							error: "invalid_request",
@@ -528,46 +527,57 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				if (reason.trim().toLowerCase() !== "success") {
-						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 					reply.code(200);
 					reply.type("text/plain");
 					return "authentication failed";
 				}
 
+				// Release C3.8: Authenticator Resolution architecture. Session status/completed/result are no
+				// longer used to gate the decision -- the PUID is looked up purely to feed AuthenticatorLoginResolver.
 				const resolvedRecord = resolvePrivateIDSessionRecord(sessionId, transactionId);
+				callbackSessionId = resolvedRecord?.session.sessionId ?? callbackSessionId;
+				const providerSubject = resolvedRecord?.result?.privateIdUserId;
 
-				if (!resolvedRecord) {
-					retry = true;
-						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
-					reply.code(202);
-					return {
-							status: "pending",
-							reason,
-							message: "Authentication Incomplete",
-							retry: true
-					};
+				if (!resolvedRecord || !providerSubject) {
+						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
+						reply.code(200);
+						return {
+								status: "failed",
+								message: "UserAuthenticator not found"
+						};
 				}
 
-				const isComplete = resolvedRecord.session.status === "ready"
-						&& Boolean(resolvedRecord.session.completed)
-						&& Boolean(resolvedRecord.result);
-				callbackSessionId = resolvedRecord.session.sessionId;
-				if (!isComplete) {
-					retry = true;
-						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
-					reply.code(202);
-					return {
-							status: resolvedRecord.session.status,
-							reason,
-							sessionId: resolvedRecord.session.sessionId,
-							transactionId: resolvedRecord.session.transactionId,
-							message: "Authentication Incomplete",
-							retry: true
-					};
+				let canonicalUser;
+				try {
+						canonicalUser = await authenticatorLoginResolver.resolveLogin("privateid", resolvedRecord.session.transactionId, providerSubject);
+				} catch (error) {
+						app.log.warn({ requestId, correlationId, sessionId: callbackSessionId, error }, "AuthenticatorLoginResolver failed during PrivateID callback");
+						reply.code(200);
+						const message = error instanceof AuthenticatorLoginError
+								? (error.code === "AUTHENTICATION_FAILED" ? "UserAuthenticator not found" : error.message)
+								: "UserAuthenticator not found";
+						return { status: "failed", message };
 				}
+
+				const oidcSubject = canonicalUser.oidcSubject;
+				if (!oidcSubject) {
+						app.log.warn({ requestId, correlationId, sessionId: callbackSessionId }, "Canonical user missing oidcSubject during PrivateID callback");
+						reply.code(200);
+						return { status: "failed", message: "OIDC Subject not resolved" };
+				}
+
+				const authenticatedUser: AuthenticatedUser = {
+						id: canonicalUser.id,
+						sub: oidcSubject,
+						email: canonicalUser.email,
+						emailVerified: canonicalUser.emailVerified,
+						name: canonicalUser.displayName
+				};
+				storePrivateIDAuthenticatedUser(resolvedRecord.session.sessionId, authenticatedUser);
 
 				reply.code(200);
-				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason, retry }, "PrivateID callback processed");
+				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 
 				const redirectUrl = await oidcService.resumePendingAuthorization(resolvedRecord.session.sessionId);
 				if (redirectUrl) {
@@ -576,7 +586,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 
 				return {
-						status: resolvedRecord.session.status,
+						status: "ok",
 						reason,
 						sessionId: resolvedRecord.session.sessionId,
 						transactionId: resolvedRecord.session.transactionId,

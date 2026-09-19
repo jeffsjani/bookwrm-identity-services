@@ -1,10 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("PrivateID callback", () => {
-		it("returns processing when callback has no matching session", async () => {
+		it("returns UserAuthenticator not found when callback has no matching session", async () => {
 				const { app } = await buildOidcTestApp();
 
 				const response = await app.inject({
@@ -12,18 +15,17 @@ describe("PrivateID callback", () => {
 						url: "/privateid/callback?reason=success"
 				});
 
-				expect(response.statusCode).toBe(202);
+				expect(response.statusCode).toBe(200);
 				const payload = response.json() as Record<string, unknown>;
 				expect(payload).toMatchObject({
-						status: "pending",
-						message: "Authentication Incomplete",
-						retry: true
+						status: "failed",
+						message: "UserAuthenticator not found"
 				});
 
 				await app.close();
 		});
 
-		it("returns processing when callback arrives before webhook completion", async () => {
+		it("returns UserAuthenticator not found when callback arrives before webhook completion", async () => {
 				const { app } = await buildOidcTestApp();
 				const client = new PrivateIDClient();
 				const session = await client.createAuthenticationSession();
@@ -33,14 +35,11 @@ describe("PrivateID callback", () => {
 						url: `/privateid/callback?result=success&session_id=${encodeURIComponent(session.sessionId)}&txn_id=${encodeURIComponent(session.transactionId)}`
 				});
 
-				expect(response.statusCode).toBe(202);
+				expect(response.statusCode).toBe(200);
 				const payload = response.json() as Record<string, unknown>;
 				expect(payload).toMatchObject({
-						status: "created",
-						sessionId: session.sessionId,
-						transactionId: session.transactionId,
-						message: "Authentication Incomplete",
-						retry: true
+						status: "failed",
+						message: "UserAuthenticator not found"
 				});
 
 				expect((await client.getSession()).status).toBe("created");
@@ -67,10 +66,26 @@ describe("PrivateID callback", () => {
 				await app.close();
 		});
 
-		it("accepts SUCCESS webhook and then allows callback continuation", async () => {
+		it("accepts SUCCESS webhook and then resolves the callback via AuthenticatorLoginResolver", async () => {
 				const { app } = await buildOidcTestApp();
 				const client = new PrivateIDClient();
 				const session = await client.createAuthenticationSession();
+				const providerSubject = "dev-user-1";
+
+				const canonicalUser = await identityRegistry.resolveOrCreate({
+						provider: "PrivateID",
+						providerSubject: `seed-${randomUUID()}`,
+						email: "dev.user@bookwrm.local",
+						emailVerified: true
+				});
+				await inMemoryUserAuthenticatorRepository.create({
+						id: randomUUID(),
+						userId: canonicalUser.id,
+						provider: "privateid",
+						providerSubject,
+						authenticatorType: "face",
+						status: "active"
+				});
 
 				const webhookResponse = await app.inject({
 						method: "POST",
@@ -82,12 +97,11 @@ describe("PrivateID callback", () => {
 								status: "SUCCESS",
 								sessionId: session.sessionId,
 								transactionId: session.transactionId,
-								privateIdUserId: "dev-user-1"
+								puid: providerSubject
 						}
 				});
 
 				expect(webhookResponse.statusCode).toBe(200);
-				expect((await client.getSession()).status).toBe("ready");
 
 				const response = await app.inject({
 						method: "GET",
@@ -97,7 +111,7 @@ describe("PrivateID callback", () => {
 				expect(response.statusCode).toBe(200);
 				const payload = response.json() as Record<string, unknown>;
 				expect(payload).toMatchObject({
-						status: "ready",
+						status: "ok",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
 						message: "Continue OIDC authorization"
@@ -261,7 +275,6 @@ describe("PrivateID callback", () => {
 				status: "SUCCESS",
 				sessionId: session.sessionId,
 				transactionId: session.transactionId,
-				privateIdUserId: "dev-user-1",
 				puid: "stable-user-id",
 				guid: "session-unique-id"
 			}
@@ -300,7 +313,6 @@ describe("PrivateID callback", () => {
 				metadata: {
 					correlationId: session.transactionId
 				},
-				privateIdUserId: "dev-user-1",
 				puid: "stable-user-id",
 				guid: "session-unique-id"
 			}
@@ -338,7 +350,6 @@ describe("PrivateID callback", () => {
 				metadata: {
 					correlationId: "different-id" // Should be ignored
 				},
-				privateIdUserId: "dev-user-1",
 				puid: "stable-user-id",
 				guid: "session-unique-id"
 			}
