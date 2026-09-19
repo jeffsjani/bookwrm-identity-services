@@ -5,6 +5,8 @@
 **Scope:** No implementation changes. Verification only.  
 **Trace Methodology:** Code-level inspection across authentication, OIDC, and identity registry layers.
 
+> Deprecated compatibility report: its PrivateID-derived claim and account-creation steps describe retained legacy behavior, not the target ownership model. PrivateID is an authentication provider. Bookwrm Identity owns `userId`, `oidcSubject`, `email`, `emailVerified`, and `displayName`; PrivateID supplies only `provider = privateid` and `providerSubject = PUID`.
+
 ---
 
 ## Task 1: Complete Flow Trace

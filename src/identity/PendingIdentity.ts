@@ -2,8 +2,10 @@ import type { IdentitySubject } from "../models/IdentitySubject.js";
 
 export type PendingIdentityStage = "pending" | "persisted" | "blocked";
 
-// Tracks a PrivateID identity between "we know who claims to be authenticating"
-// and "IdentityRegistry has durably persisted an IdentitySubject for them" (RC1 Task 6).
+/**
+ * @deprecated PrivateID is an authentication provider. This claim-bearing compatibility state
+ * remains until Bookwrm Identity exclusively owns account creation and user claims.
+ */
 export type PendingIdentityRecord = {
 		privateIdUserId: string;
 		email?: string;
@@ -16,6 +18,7 @@ export type PendingIdentityRecord = {
 
 const pendingByPrivateIdUserId = new Map<string, PendingIdentityRecord>();
 
+/** @deprecated Compatibility state for the legacy PrivateID claim path. */
 export function beginPendingIdentity(
 		privateIdUserId: string,
 		email: string | undefined,
@@ -27,6 +30,7 @@ export function beginPendingIdentity(
 		return record;
 }
 
+/** @deprecated Compatibility state for the legacy PrivateID claim path. */
 export function markPersisted(privateIdUserId: string, identitySubject: IdentitySubject): PendingIdentityRecord | undefined {
 		const record = pendingByPrivateIdUserId.get(privateIdUserId);
 		if (!record) {

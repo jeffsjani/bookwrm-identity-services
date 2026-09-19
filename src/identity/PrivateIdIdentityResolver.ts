@@ -6,6 +6,10 @@ import { identityRegistry } from "./IdentityRegistry.js";
 import { identityMetrics } from "./infrastructure/IdentityMetrics.js";
 import { beginPendingIdentity, markPersisted } from "./PendingIdentity.js";
 
+/**
+ * @deprecated PrivateID is an authentication provider. Bookwrm Identity owns user claims.
+ * This compatibility payload remains until claim ownership is migrated.
+ */
 export type PrivateIdIdentityCandidate = {
 		email?: string;
 		emailVerified?: boolean;
@@ -34,7 +38,10 @@ function pickBoolean(source: Record<string, unknown>, keys: string[]): boolean |
 		return undefined;
 }
 
-// PrivateID is the only source of identity fields here -- never Bookwrm/Base44 IdentityContext.
+/**
+ * @deprecated PrivateID is an authentication provider, not the source of Bookwrm identity claims.
+ * This compatibility extraction remains until claim ownership is migrated; it must not expand PrivateID's role.
+ */
 export function extractIdentityCandidateFromRawResponse(rawResponse: unknown): PrivateIdIdentityCandidate {
 		if (!rawResponse || typeof rawResponse !== "object") {
 				return {};
@@ -86,7 +93,10 @@ function hashProviderSubject(providerSubject: string): string {
 		return createHash("sha256").update(providerSubject).digest("hex");
 }
 
-// PrivateID -> privateIdUserId -> IdentityRegistry.resolveOrCreate() -> PendingIdentity -> persisted IdentitySubject.
+/**
+ * @deprecated Compatibility path only. PrivateID identifies an authenticator by PUID;
+ * Bookwrm Identity owns account creation and all user claims.
+ */
 export async function resolveAuthenticatedUserFromPrivateId(
 		privateIdUserId: string,
 		candidate: PrivateIdIdentityCandidate

@@ -624,6 +624,15 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				};
 				storePrivateIDAuthenticatedUser(resolvedRecord.session.sessionId, authenticatedUser);
 
+				// Release C5.0: OIDC interoperability claims (sub/email/email_verified) are validated here for
+				// observability only -- email is never used for identity resolution, sub remains authoritative.
+				app.log.info({
+						event: "OIDC_CLAIMS_VALIDATION",
+						subPresent: typeof authenticatedUser.sub === "string" && authenticatedUser.sub.length > 0,
+						emailPresent: typeof authenticatedUser.email === "string" && authenticatedUser.email.length > 0,
+						emailVerifiedPresent: typeof authenticatedUser.emailVerified === "boolean"
+				}, "OIDC_CLAIMS_VALIDATION");
+
 				reply.code(200);
 				app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 

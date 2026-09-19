@@ -5,6 +5,8 @@ import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { PrivateIDAuthenticationProvider } from "../src/privateid/PrivateIDAuthenticationProvider.js";
 import { storeCorrelation } from "../src/oidc/CorrelationStore.js";
 import { identityService } from "../src/identity/IdentityService.js";
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 import { getPrivateIDAuthenticatedUser, resolvePrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import type { PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
@@ -43,19 +45,38 @@ function postSuccessWebhook(
 		});
 }
 
+async function seedFaceLoginUser(providerSubject: string) {
+	const user = await identityRegistry.resolveOrCreate({
+		provider: "PrivateID",
+		providerSubject: `seed-${randomUUID()}`,
+		email: "user@example.com",
+		emailVerified: true
+	});
+	await inMemoryUserAuthenticatorRepository.create({
+		id: randomUUID(),
+		userId: user.id,
+		provider: "privateid",
+		providerSubject,
+		authenticatorType: "face",
+		status: "active"
+	});
+	return user;
+}
+
 describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 		it("Case 1: SUCCESS webhook with a correlationId resolves via IdentityRegistry and authorization continues", async () => {
 				const { app } = await buildOidcTestApp();
 				const correlationId = randomUUID();
 				const session = await createOidcSession(correlationId);
-				const privateIdUserId = `case1-user-${randomUUID()}`;
+				const providerSubject = `case1-user-${randomUUID()}`;
+				await seedFaceLoginUser(providerSubject);
 				const resolveIdentitySpy = vi.spyOn(identityService, "resolveIdentity");
 
 				const response = await postSuccessWebhook(app, {
 						status: "SUCCESS",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						privateIdUserId
+						puid: providerSubject
 				});
 
 				expect(response.statusCode).toBe(200);
@@ -63,7 +84,7 @@ describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 
 				const authenticatedUser = getPrivateIDAuthenticatedUser(session.sessionId);
 				expect(authenticatedUser).toBeDefined();
-				expect(authenticatedUser?.sub).not.toBe(privateIdUserId);
+				expect(authenticatedUser?.sub).not.toBe(providerSubject);
 
 				resolveIdentitySpy.mockRestore();
 				await app.close();
@@ -73,7 +94,8 @@ describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 				const { app } = await buildOidcTestApp();
 				const correlationId = randomUUID();
 				const session = await createOidcSession(correlationId);
-				const privateIdUserId = `case2-user-${randomUUID()}`;
+				const providerSubject = `case2-user-${randomUUID()}`;
+				await seedFaceLoginUser(providerSubject);
 				const resolveIdentitySpy = vi.spyOn(identityService, "resolveIdentity");
 
 				// Simulate the correlation already being consumed/lost (e.g. a duplicate webhook delivery) before this SUCCESS arrives.
@@ -81,7 +103,7 @@ describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 						status: "SUCCESS",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						privateIdUserId
+						puid: providerSubject
 				});
 				resolveIdentitySpy.mockClear();
 
@@ -89,7 +111,7 @@ describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 						status: "SUCCESS",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						privateIdUserId
+						puid: providerSubject
 				});
 
 				expect(response.statusCode).toBe(200);
@@ -105,21 +127,21 @@ describe("Release Patch 5A - remove legacy OIDC fallback", () => {
 				const { app } = await buildOidcTestApp();
 				const client = new PrivateIDClient();
 				const session = await client.createAuthenticationSession();
-				const privateIdUserId = `case3-legacy-user-${randomUUID()}`;
+				const providerSubject = `case3-legacy-user-${randomUUID()}`;
 				const resolveIdentitySpy = vi.spyOn(identityService, "resolveIdentity");
 
 				const response = await postSuccessWebhook(app, {
 						status: "SUCCESS",
 						sessionId: session.sessionId,
 						transactionId: session.transactionId,
-						privateIdUserId
+						puid: providerSubject
 				});
 
 				expect(response.statusCode).toBe(200);
-				expect(resolveIdentitySpy).toHaveBeenCalledWith(privateIdUserId);
+				expect(resolveIdentitySpy).toHaveBeenCalledWith(providerSubject);
 
 				const authenticatedUser = getPrivateIDAuthenticatedUser(session.sessionId);
-				expect(authenticatedUser?.sub).toBe(privateIdUserId);
+				expect(authenticatedUser?.sub).toBe(providerSubject);
 
 				resolveIdentitySpy.mockRestore();
 				await app.close();

@@ -6,6 +6,7 @@ import { storeCorrelation } from "../src/oidc/CorrelationStore.js";
 import { buildOidcTestApp, exchangeAuthorizationCode, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { getPrivateIDAuthenticatedUser, resolvePrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import type { PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
 
 const WEBHOOK_SECRET = "privateid-webhook-secret";
@@ -20,7 +21,23 @@ const STUB_PENDING_CONTEXT: PendingAuthorizationContext = {
 		codeChallenge: CODE_CHALLENGE
 };
 
-async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp>>["app"], privateIdUserId: string) {
+async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp>>["app"], providerSubject: string) {
+	if (!await inMemoryUserAuthenticatorRepository.findByProviderSubject("privateid", providerSubject)) {
+		const user = await identityRegistry.resolveOrCreate({
+			provider: "PrivateID",
+			providerSubject: `seed-${randomUUID()}`,
+			email: "user@example.com",
+			emailVerified: true
+		});
+		await inMemoryUserAuthenticatorRepository.create({
+			id: randomUUID(),
+			userId: user.id,
+			provider: "privateid",
+			providerSubject,
+			authenticatorType: "face",
+			status: "active"
+		});
+	}
 		const correlationId = randomUUID();
 		storeCorrelation(correlationId, STUB_PENDING_CONTEXT);
 		const provider = new PrivateIDAuthenticationProvider();
@@ -38,7 +55,7 @@ async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp
 						status: "SUCCESS",
 						sessionId,
 						transactionId: record.session.transactionId,
-						privateIdUserId,
+						puid: providerSubject,
 						contactInformation: {
 								email: "user@example.com",
 								phone: "[TEST-ONLY]"

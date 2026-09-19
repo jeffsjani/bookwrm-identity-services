@@ -15,29 +15,24 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
 - On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` and `GET /identity/admin/health` gate readiness.
 - The `identity_subjects` and `schema_migrations` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` at process startup in `server.ts` — no separate migration step is required for this table today.
 
-## 1.1 Identity First, Account Second
+## 1.1 PrivateID Authentication Provider
 
-Successful biometric authentication creates an `IdentitySubject` immediately, even when PrivateID has not supplied an email or has supplied `emailVerified: false`. Email, email verification, and display name are optional claims and may be linked or updated later through the claim policy. Pending account activation state must never prevent the stable OIDC `sub` from being issued.
+Deprecated: the legacy compatibility flow below may still derive claims or create an identity from a PrivateID webhook. It must not be used as the ownership model for new work.
 
-```mermaid
-sequenceDiagram
-  participant P as PrivateID
-  participant W as Webhook
-  participant R as IdentityRegistry
-  participant I as IdentitySubject
-  participant C as Claims
-  participant T as OIDC Token Endpoint
+PrivateID is an authentication provider.
 
-  P->>W: Successful biometric authentication
-  W->>R: resolveOrCreate(privateIdUserId, optional claims)
-  R->>I: Create or reuse stable IdentitySubject
-  I-->>R: Stable oidcSubject (sub)
-  R-->>W: AuthenticatedUser with sub
-  W->>T: Authorization code flow
-  T->>C: Build sub and available claims
-  C-->>T: sub plus optional email, email_verified, name
-  T-->>P: ID Token
-```
+Bookwrm Identity owns:
+
+- `userId`
+- `oidcSubject`
+- `email`
+- `emailVerified`
+- `displayName`
+
+PrivateID supplies only:
+
+- `provider = privateid`
+- `providerSubject = PUID`
 
 ## 2. Backup
 

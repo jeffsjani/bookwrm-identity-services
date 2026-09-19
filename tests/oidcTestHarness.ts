@@ -1,7 +1,9 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import formbody from "@fastify/formbody";
-import { createHash, generateKeyPairSync } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { configuration } from "../src/config/ConfigurationService.js";
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 
 type AuthorizeOptions = {
@@ -75,6 +77,25 @@ export function pkceChallengeFromVerifier(verifier: string): string {
 		return createHash("sha256").update(verifier).digest("base64url");
 }
 
+async function seedFaceLoginUser(): Promise<string> {
+		const providerSubject = `puid-${randomUUID()}`;
+		const user = await identityRegistry.resolveOrCreate({
+			provider: "PrivateID",
+			providerSubject: `seed-${randomUUID()}`,
+			email: "dev.user@bookwrm.local",
+			emailVerified: true
+		});
+		await inMemoryUserAuthenticatorRepository.create({
+			id: randomUUID(),
+			userId: user.id,
+			provider: "privateid",
+			providerSubject,
+			authenticatorType: "face",
+			status: "active"
+		});
+		return providerSubject;
+}
+
 export async function authorizeAndGetCode(
 		app: FastifyInstance,
 		verifier: string,
@@ -110,6 +131,7 @@ export async function authorizeAndGetCode(
 		if (!sessionRecord) {
 				throw new Error("No PrivateID session was created by /authorize");
 		}
+		const providerSubject = await seedFaceLoginUser();
 
 		const webhookResponse = await app.inject({
 				method: "POST",
@@ -121,7 +143,7 @@ export async function authorizeAndGetCode(
 						status: "SUCCESS",
 						sessionId: sessionRecord.session.sessionId,
 						transactionId: sessionRecord.session.transactionId,
-						privateIdUserId: "dev-user-1",
+						puid: providerSubject,
 						contactInformation: {
 								email: "dev.user@bookwrm.local",
 								phone: "[TEST-ONLY]"
