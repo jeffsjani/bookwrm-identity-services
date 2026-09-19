@@ -6,6 +6,7 @@ import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
+import { repairUserAuthenticatorLink } from "../identity/AuthenticatorLinkRepairService.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
@@ -748,6 +749,37 @@ export async function registerDiagnosticsRoutes(
 						updatedAt: identitySubject.updatedAt
 					} : null
 				};
+			}
+		);
+
+		// Release C4.9: repairs a UserAuthenticator.userId still pointing at a legacy Bookwrm ObjectId
+		// (pre-C4.2/C4.2B) to the correct identity_subjects.id, via AuthenticatorLinkRepairService. Idempotent.
+		// TEMPORARY RELEASE C4.9 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.post(
+			"/diagnostics/repair-user-authenticator-link",
+			async (request, reply): Promise<{ repaired: boolean; authenticatorFound: boolean; changed: boolean } | IdentityRecordErrorResponse> => {
+				const authorization = request.headers.authorization;
+				const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+				if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+					reply.code(401);
+					return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+				}
+
+				const body = request.body as IdentitySubjectDiagnosticsBody;
+				const provider = body?.provider?.trim();
+				const providerSubject = body?.providerSubject?.trim();
+				if (!provider || !providerSubject) {
+					reply.code(400);
+					return { error: "invalid_request", error_description: "provider and providerSubject are required" };
+				}
+
+				const result = await repairUserAuthenticatorLink("privateid", provider as IdentityProvider, providerSubject);
+				if (!result.authenticatorFound) {
+					reply.code(404);
+					return { error: "not_found", error_description: "No UserAuthenticator exists for this provider/providerSubject" };
+				}
+
+				return { repaired: result.repaired, authenticatorFound: true, changed: result.repaired };
 			}
 		);
 

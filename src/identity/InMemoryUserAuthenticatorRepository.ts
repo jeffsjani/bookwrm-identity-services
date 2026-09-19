@@ -48,6 +48,15 @@ export class InMemoryUserAuthenticatorRepository {
 		return this.update(id, { status: "revoked", revokedAt: new Date().toISOString() });
 	}
 
+	// Release C4.9: repairs a pre-existing authenticator's userId (e.g. a legacy Bookwrm ObjectId) to the
+	// correct identity_subjects.id. Idempotent -- a no-op if userId already matches.
+	async updateUserId(id: string, userId: string): Promise<UserAuthenticator | undefined> {
+		const authenticator = this.authenticatorsById.get(id);
+		if (!authenticator) return undefined;
+		Object.assign(authenticator, { userId, updatedAt: new Date().toISOString() });
+		return { ...authenticator };
+	}
+
 	// Re-points authenticators from a retired (merged/loser) userId onto the surviving canonical userId,
 	// so future logins resolve the still-ACTIVE IdentitySubject instead of the disabled one.
 	async reassignUser(fromUserId: string, toUserId: string): Promise<number> {

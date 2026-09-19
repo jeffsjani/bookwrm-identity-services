@@ -168,6 +168,16 @@ export class UserAuthenticatorRepository {
 		return result.rows[0] ? toUserAuthenticator(result.rows[0]) : undefined;
 	}
 
+	// Release C4.9: repairs a pre-existing authenticator's userId (e.g. a legacy Bookwrm ObjectId) to the
+	// correct identity_subjects.id. Idempotent -- a no-op UPDATE if userId already matches.
+	async updateUserId(id: string, userId: string): Promise<UserAuthenticator | undefined> {
+		const result = await this.client.query<UserAuthenticatorRow>(
+			`UPDATE user_authenticators SET user_id = $2, updated_at = $3 WHERE id = $1 RETURNING *`,
+			[id, userId, new Date()]
+		);
+		return result.rows[0] ? toUserAuthenticator(result.rows[0]) : undefined;
+	}
+
 	// Re-points authenticators from a retired (merged/loser) userId onto the surviving canonical userId,
 	// so future logins resolve the still-ACTIVE IdentitySubject instead of the disabled one.
 	async reassignUser(fromUserId: string, toUserId: string): Promise<number> {
