@@ -6,7 +6,9 @@ import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
+import { inMemoryUserAuthenticatorRepository } from "../identity/InMemoryUserAuthenticatorRepository.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
+import type { AuthenticatorProvider } from "../models/UserAuthenticator.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
 import { oidcService } from "../oidc/OIDCService.js";
 import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
@@ -56,6 +58,23 @@ type UserAuthenticatorDiagnosticsBody = {
 	provider?: string;
 	providerSubject?: string;
 	userId?: string;
+};
+
+type IdentitySubjectDiagnosticsBody = {
+	provider?: string;
+	providerSubject?: string;
+};
+
+type IdentitySubjectDiagnosticsResponse = {
+	identitySubject: {
+		id: string;
+		provider: IdentityProvider;
+		providerSubject: string;
+		status: string;
+		oidcSubject: string;
+		createdAt: string;
+		updatedAt: string;
+	} | null;
 };
 
 type UserAuthenticatorDiagnosticsResponse = {
@@ -692,6 +711,49 @@ export async function registerDiagnosticsRoutes(
 						};
 				}
 
+		);
+
+		// Release C4.3: read-only trace of the exact IdentitySubject AuthenticatorLoginResolver.resolveLogin()
+		// loads during Face Login -- UserAuthenticator lookup by (provider, providerSubject), then IdentitySubject
+		// lookup by authenticator.userId. No writes; unlike resolveLogin() itself, never throws on revoked/inactive
+		// so the true stored status is always visible for diagnosis.
+		// TEMPORARY RELEASE C4.3 - REMOVE AFTER PRODUCTION CERTIFICATION.
+		app.post(
+			"/diagnostics/identity-subject",
+			async (request, reply): Promise<IdentitySubjectDiagnosticsResponse | IdentityRecordErrorResponse> => {
+				const authorization = request.headers.authorization;
+				const providedKey = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length).trim() : "";
+				if (!providedKey || providedKey !== configuration.getIdentityApiKey()) {
+					reply.code(401);
+					return { error: "unauthorized", error_description: "Valid admin/service API key required" };
+				}
+
+				const body = request.body as IdentitySubjectDiagnosticsBody;
+				const provider = body?.provider?.trim();
+				const providerSubject = body?.providerSubject?.trim();
+				if (!provider || !providerSubject) {
+					reply.code(400);
+					return { error: "invalid_request", error_description: "provider and providerSubject are required" };
+				}
+
+				const authenticators = configuration.getIdentityRegistryDriver() === "memory"
+					? inMemoryUserAuthenticatorRepository
+					: new UserAuthenticatorRepository();
+				const authenticator = await authenticators.findByProviderSubject(provider.toLowerCase() as AuthenticatorProvider, providerSubject);
+				const identitySubject = authenticator ? await identityRegistry.findById(authenticator.userId) : undefined;
+
+				return {
+					identitySubject: identitySubject ? {
+						id: identitySubject.id,
+						provider: identitySubject.primaryProvider,
+						providerSubject: identitySubject.primaryProviderSubject,
+						status: identitySubject.status,
+						oidcSubject: identitySubject.oidcSubject,
+						createdAt: identitySubject.createdAt,
+						updatedAt: identitySubject.updatedAt
+					} : null
+				};
+			}
 		);
 
 		app.get(
