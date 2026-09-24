@@ -9,7 +9,7 @@ import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorReposi
 import { repairUserAuthenticatorLink } from "../identity/AuthenticatorLinkRepairService.js";
 import type { IdentityProvider } from "../models/IdentitySubject.js";
 import { PrivateIDClient } from "../privateid/PrivateIDClient.js";
-import { oidcService } from "../oidc/OIDCService.js";
+import { oidcService } from "../oidc/oidcServiceInstance.js";
 import { findPrivateIDSession } from "../privateid/PrivateIDSessionStore.js";
 import { PrivateIDEnrollmentTransactionRepository } from "../identity/PrivateIDEnrollmentTransactionRepository.js";
 import {

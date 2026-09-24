@@ -5,6 +5,7 @@ import { configuration } from "../src/config/ConfigurationService.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
+import { ensureBookwrmApplicationSeed } from "../src/adapters/base44/Base44ApplicationSeed.js";
 
 type AuthorizeOptions = {
 		clientId?: string;
@@ -61,7 +62,8 @@ export function ensureOidcTestEnvironment(): void {
 
 export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {
 		ensureOidcTestEnvironment();
-		const { oidcService } = await import("../src/oidc/OIDCService.js");
+		await ensureBookwrmApplicationSeed();
+		const { oidcService } = await import("../src/oidc/oidcServiceInstance.js");
 		const { registerDiagnosticsRoutes } = await import("../src/routes/diagnostics.js");
 		const { registerPrivateIdRoutes } = await import("../src/routes/privateid.js");
 		const { registerIdentityAccountLinkRoutes } = await import("../src/routes/identityAccountLink.js");

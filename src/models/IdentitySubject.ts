@@ -11,6 +11,8 @@ export type IdentityClaimName = "email" | "emailVerified" | "displayName" | "pre
 export type IdentitySubject = {
 		id: string;
 		oidcSubject: string;
+		// HAPI ID H1: scopes this subject to an Application (undefined only for pre-H1 rows pending backfill).
+		applicationId?: string;
 		primaryProvider: IdentityProvider;
 		primaryProviderSubject: string;
 		email?: string;

@@ -19,6 +19,48 @@ ALTER TABLE identity_subjects ALTER COLUMN email DROP NOT NULL;
 ALTER TABLE identity_subjects ALTER COLUMN email_verified DROP NOT NULL;
 ALTER TABLE identity_subjects ALTER COLUMN display_name DROP NOT NULL;
 
+-- HAPI ID H1 (Multi-Tenant/Application Foundation): top-level IDaaS customer boundary.
+CREATE TABLE IF NOT EXISTS tenants (
+		id UUID PRIMARY KEY,
+		name TEXT NOT NULL,
+		slug TEXT NOT NULL UNIQUE,
+		status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+		created_at TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL
+);
+
+-- A registered relying-party product within a Tenant (e.g. Bookwrm's Base44 app). Owns one or more oidc_clients rows.
+CREATE TABLE IF NOT EXISTS applications (
+		id UUID PRIMARY KEY,
+		tenant_id UUID NOT NULL REFERENCES tenants(id),
+		name TEXT NOT NULL,
+		slug TEXT NOT NULL,
+		status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+		created_at TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL,
+		CONSTRAINT applications_tenant_slug_key UNIQUE (tenant_id, slug)
+);
+
+-- Persisted replacement for the hardcoded Base44 OIDC client configuration previously in src/oidc/clients.ts.
+CREATE TABLE IF NOT EXISTS oidc_clients (
+		id UUID PRIMARY KEY,
+		application_id UUID NOT NULL REFERENCES applications(id),
+		client_id TEXT NOT NULL UNIQUE,
+		client_secret TEXT NOT NULL,
+		redirect_uris TEXT[] NOT NULL,
+		scopes TEXT[] NOT NULL,
+		grant_types TEXT[] NOT NULL,
+		response_types TEXT[] NOT NULL,
+		token_endpoint_auth_method TEXT NOT NULL CHECK (token_endpoint_auth_method IN ('client_secret_post', 'client_secret_basic', 'none')),
+		require_pkce BOOLEAN NOT NULL DEFAULT true,
+		created_at TIMESTAMPTZ NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL
+);
+
+-- Scopes an IdentitySubject to the Application it was minted under; nullable so pre-H1 rows remain valid
+-- until PlatformSeed.ts backfills them to the Bookwrm application (see ensureBookwrmApplicationSeed()).
+ALTER TABLE identity_subjects ADD COLUMN IF NOT EXISTS application_id UUID REFERENCES applications(id);
+
 -- Provider authenticator storage. It is intentionally not used by runtime authentication yet.
 CREATE TABLE IF NOT EXISTS user_authenticators (
 		id UUID PRIMARY KEY,

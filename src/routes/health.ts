@@ -3,7 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { configuration } from "../config/ConfigurationService.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
 import { identityService } from "../identity/IdentityService.js";
-import { oidcService } from "../oidc/OIDCService.js";
+import { oidcService } from "../oidc/oidcServiceInstance.js";
 import { getRedisClient } from "../oidc/infrastructure/RedisInfrastructure.js";
 
 export async function registerHealthRoutes(app: FastifyInstance): Promise<void> {

@@ -9,6 +9,7 @@ import { getPostgresPool, type PostgresClient } from "./infrastructure/PostgresI
 type IdentitySubjectRow = {
 		id: string;
 		oidc_subject: string;
+		application_id: string | null;
 		primary_provider: string;
 		primary_provider_subject: string;
 		email: string | null;
@@ -32,6 +33,7 @@ function toIdentitySubject(row: IdentitySubjectRow): IdentitySubject {
 		return {
 				id: row.id,
 				oidcSubject: row.oidc_subject,
+				applicationId: row.application_id ?? undefined,
 				primaryProvider: row.primary_provider as IdentityProvider,
 				primaryProviderSubject: row.primary_provider_subject,
 				email: row.email ?? undefined,
@@ -68,12 +70,13 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 				const now = new Date();
 				const result = await this.client.query<IdentitySubjectRow>(
 						`INSERT INTO identity_subjects
-							(id, oidc_subject, primary_provider, primary_provider_subject, email, email_verified, display_name, status, created_at, updated_at, last_authenticated_at)
-						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9)
+							(id, oidc_subject, application_id, primary_provider, primary_provider_subject, email, email_verified, display_name, status, created_at, updated_at, last_authenticated_at)
+						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10)
 						 RETURNING *`,
 						[
 								input.id,
 								input.oidcSubject,
+								input.applicationId ?? null,
 								input.primaryProvider,
 								input.primaryProviderSubject,
 								input.email ?? null,
@@ -219,14 +222,15 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 				const now = new Date();
 				const result = await this.client.query<IdentitySubjectRow>(
 						`INSERT INTO identity_subjects
-							(id, oidc_subject, primary_provider, primary_provider_subject, email, email_verified, display_name, status, created_at, updated_at, last_authenticated_at)
-						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9)
+							(id, oidc_subject, application_id, primary_provider, primary_provider_subject, email, email_verified, display_name, status, created_at, updated_at, last_authenticated_at)
+						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10)
 						 ON CONFLICT (primary_provider, primary_provider_subject)
-						 DO UPDATE SET updated_at = $9, last_authenticated_at = $9
+						 DO UPDATE SET updated_at = $10, last_authenticated_at = $10
 						 RETURNING *`,
 						[
 								input.id,
 								input.oidcSubject,
+								input.applicationId ?? null,
 								input.primaryProvider,
 								input.primaryProviderSubject,
 								input.email ?? null,

@@ -4,7 +4,7 @@ import { configuration } from "../config/ConfigurationService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityService } from "../identity/IdentityService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
-import { oidcService } from "../oidc/OIDCService.js";
+import { oidcService } from "../oidc/oidcServiceInstance.js";
 import type { AuthenticatedUser } from "../authentication/AuthenticationProvider.js";
 import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
 import type { IdentityContext } from "../models/IdentityContext.js";

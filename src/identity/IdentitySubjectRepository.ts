@@ -3,6 +3,7 @@ import type { IdentityProvider, IdentitySubject, IdentitySubjectStatus } from ".
 export type CreateIdentitySubjectInput = {
 		id: string;
 		oidcSubject: string;
+		applicationId?: string;
 		primaryProvider: IdentityProvider;
 		primaryProviderSubject: string;
 		email?: string;

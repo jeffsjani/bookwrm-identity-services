@@ -7,6 +7,7 @@ import type { IdentityProvider, IdentitySubject } from "../models/IdentitySubjec
 import { inMemoryIdentitySubjectRepository } from "./InMemoryIdentitySubjectRepository.js";
 import { PostgresIdentitySubjectRepository } from "./PostgresIdentitySubjectRepository.js";
 import type { IdentitySubjectRepository, UpdateIdentitySubjectInput } from "./IdentitySubjectRepository.js";
+import { BOOKWRM_APPLICATION_ID } from "./WellKnownIdentities.js";
 
 export type IdentityLinkRequest = {
 		provider: IdentityProvider;
@@ -14,6 +15,8 @@ export type IdentityLinkRequest = {
 		email?: string;
 		emailVerified?: boolean;
 		displayName?: string;
+		// HAPI ID H1: defaults to Bookwrm's Application so existing callers are unaffected.
+		applicationId?: string;
 };
 
 function defaultRepository(): IdentitySubjectRepository {
@@ -56,6 +59,7 @@ export class IdentityRegistry {
 						const subject = await this.repository.resolveOrCreate({
 								id: randomUUID(),
 								oidcSubject: randomUUID(),
+								applicationId: request.applicationId ?? BOOKWRM_APPLICATION_ID,
 								primaryProvider: request.provider,
 								primaryProviderSubject: request.providerSubject,
 								email: request.email,
@@ -67,14 +71,16 @@ export class IdentityRegistry {
 						if (existing) {
 								identityMetrics.recordReturningLogin();
 						} else {
-								identityMetrics.recordNewIdentity();							recordIdentityAudit(subject.oidcSubject, "IDENTITY_CREATED", {
-									provider: request.provider,
-									providerSubject: request.providerSubject
-							});
-							recordIdentityAudit(subject.oidcSubject, "AUTHENTICATOR_LINKED", {
-									provider: request.provider,
-									providerSubject: request.providerSubject
-							});						}
+								identityMetrics.recordNewIdentity();
+								recordIdentityAudit(subject.oidcSubject, "IDENTITY_CREATED", {
+										provider: request.provider,
+										providerSubject: request.providerSubject
+								});
+								recordIdentityAudit(subject.oidcSubject, "AUTHENTICATOR_LINKED", {
+										provider: request.provider,
+										providerSubject: request.providerSubject
+								});
+						}
 
 						return subject;
 				} catch (error) {

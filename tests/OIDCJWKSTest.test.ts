@@ -37,7 +37,7 @@ describe("OIDCJWKSTest", () => {
 				process.env.NODE_ENV = "development";
 
 				try {
-					const { oidcService } = await import("../src/oidc/OIDCService.js");
+					const { oidcService } = await import("../src/oidc/oidcServiceInstance.js");
 					const app = (await import("fastify")).default();
 					await oidcService.registerEndpoints(app);
 

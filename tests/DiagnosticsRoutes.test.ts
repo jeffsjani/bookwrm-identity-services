@@ -4,7 +4,7 @@ import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityService } from "../src/identity/IdentityService.js";
 import { privateIdWebhookDiagnosticsRepository } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 import { PrivateIdWebhookDiagnosticsConnectionError } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
-import { oidcService } from "../src/oidc/OIDCService.js";
+import { oidcService } from "../src/oidc/oidcServiceInstance.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
 
 describe("Diagnostics routes", () => {

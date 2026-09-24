@@ -8,7 +8,7 @@ import { identityRegistry } from "./IdentityRegistry.js";
 import { getPostgresPool, getSchemaVersionInfo, type SchemaVersionInfo } from "./infrastructure/PostgresInfrastructure.js";
 import type { IdentityProvider, IdentitySubject } from "../models/IdentitySubject.js";
 import { getRedisClient } from "../oidc/infrastructure/RedisInfrastructure.js";
-import { oidcService } from "../oidc/OIDCService.js";
+import { oidcService } from "../oidc/oidcServiceInstance.js";
 
 export type IdentityHistory = {
 		created: string;

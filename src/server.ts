@@ -14,7 +14,8 @@ import { registerPrivateIDEnrollmentRoutes } from "./routes/privateidEnrollment.
 import { registerIdentityAccountLinkRoutes } from "./routes/identityAccountLink.js";
 import { registerAuthenticatorStatusRoutes } from "./routes/authenticatorStatus.js";
 import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
-import { oidcService } from "./oidc/OIDCService.js";
+import { ensureBookwrmApplicationSeed } from "./adapters/base44/Base44ApplicationSeed.js";
+import { oidcService } from "./oidc/oidcServiceInstance.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
 
@@ -33,6 +34,14 @@ if (configuration.getIdentityRegistryDriver() === "postgres") {
 				await ensureIdentitySchema();
 		} catch (error) {
 				app.log.error({ error }, "Failed to bootstrap Identity Registry schema at startup");
+		}
+
+		// HAPI ID H1: idempotently seeds Tenant #1 (Bookwrm) + Application #1 + its OIDCClient row,
+		// and backfills any pre-H1 IdentitySubjects onto that Application.
+		try {
+				await ensureBookwrmApplicationSeed();
+		} catch (error) {
+				app.log.error({ error }, "Failed to seed Bookwrm Tenant/Application at startup");
 		}
 }
 

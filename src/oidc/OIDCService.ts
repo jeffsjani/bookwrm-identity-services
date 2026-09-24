@@ -16,10 +16,14 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
+import { BOOKWRM_APPLICATION_ID } from "../identity/WellKnownIdentities.js";
+import type { OIDCClientRepository } from "../identity/OIDCClientRepository.js";
+import { inMemoryOIDCClientRepository } from "../identity/InMemoryOIDCClientRepository.js";
+import { PostgresOIDCClientRepository } from "../identity/PostgresOIDCClientRepository.js";
+import type { OIDCClientRecord } from "../models/OIDCClientRecord.js";
 import type { OIDCAuthorizationCode } from "../models/OIDCAuthorizationCode.js";
 import { ClaimsService } from "./ClaimsService.js";
 import { oidcClaims } from "./claims.js";
-import { registerOIDCClients } from "./clients.js";
 import { oidcConfiguration } from "./configuration.js";
 import { recordOIDCRequest } from "./infrastructure/OIDCMetrics.js";
 import { OIDCKeyRotationService } from "./infrastructure/OIDCKeyRotationService.js";
@@ -35,7 +39,6 @@ import { OIDCRateLimiter } from "./infrastructure/OIDCRateLimiter.js";
 import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
-import { PrivateIDAuthenticationProvider } from "../privateid/PrivateIDAuthenticationProvider.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
 
@@ -48,6 +51,8 @@ export type OIDCServiceOptions = {
 		mountPath?: string;
 		clients?: OIDCClient[];
 		signingKeys?: OIDCSigningKey[];
+		authenticationProvider: AuthenticationProvider;
+		oidcClients?: OIDCClientRepository;
 };
 
 type AuthorizationQuery = {
@@ -136,6 +141,7 @@ export class OIDCService {
 		private provider?: Provider;
 		private readonly options: OIDCServiceOptions;
 		private readonly authenticationProvider: AuthenticationProvider;
+		private readonly oidcClients: OIDCClientRepository;
 		private readonly claimsService: ClaimsService;
 		private readonly redisStore: RedisOIDCStore;
 		private readonly lockService: RedisLockService;
@@ -148,9 +154,14 @@ export class OIDCService {
 				errors: 0
 		};
 
-		constructor(options: OIDCServiceOptions = {}) {
+		constructor(options: OIDCServiceOptions) {
 				this.options = options;
-				this.authenticationProvider = new PrivateIDAuthenticationProvider();
+				this.authenticationProvider = options.authenticationProvider;
+				this.oidcClients = options.oidcClients ?? (
+						configuration.getIdentityRegistryDriver() === "memory"
+								? inMemoryOIDCClientRepository
+								: new PostgresOIDCClientRepository()
+				);
 				this.claimsService = new ClaimsService();
 				this.redisStore = new RedisOIDCStore();
 				this.lockService = new RedisLockService();
@@ -162,7 +173,7 @@ export class OIDCService {
 				this.assertSigningKeyConfiguration();
 
 				const issuer = this.resolveIssuer();
-				const clients = this.configureClients();
+				const clients = await this.configureClients();
 				const signingKeys = await this.keyRotationService.getSigningKeys();
 				const pkce = this.configurePKCE();
 				const claims = this.configureClaims();
@@ -273,7 +284,7 @@ export class OIDCService {
 										return { error: "invalid_request", error_description: "redirect_uri is required" };
 								}
 
-								const client = this.resolveClient(clientId);
+								const client = await this.resolveClient(clientId);
 								if (!client) {
 										reply.code(400);
 										error = "Unknown client";
@@ -533,7 +544,7 @@ export class OIDCService {
 										return { error: "invalid_grant", error_description: "redirect_uri does not match code" };
 								}
 
-								const client = this.resolveClient(clientId);
+								const client = await this.resolveClient(clientId);
 								if (!client) {
 										reply.code(400);
 										error = "Unknown client";
@@ -850,14 +861,28 @@ export class OIDCService {
 				return `rsa-${index + 1}-${fingerprint}`;
 		}
 
-		private configureClients(): OIDCClient[] {
+		private toOIDCClient(record: OIDCClientRecord): OIDCClient {
+				return {
+						client_id: record.clientId,
+						client_secret: record.clientSecret,
+						redirect_uris: record.redirectUris,
+						scope: record.scopes.join(" "),
+						grant_types: record.grantTypes,
+						response_types: record.responseTypes,
+						token_endpoint_auth_method: record.tokenEndpointAuthMethod,
+						require_pkce: record.requirePkce
+				};
+		}
+
+		// HAPI ID Core resolves clients only from the persisted application/client registry.
+		private async configureClients(): Promise<OIDCClient[]> {
 				if (this.options.clients && this.options.clients.length > 0) {
 						return this.options.clients;
 				}
 
-				const configuredClients = registerOIDCClients();
-				if (configuredClients.length > 0) {
-						return configuredClients;
+				const persistedClients = await this.oidcClients.listByApplication(BOOKWRM_APPLICATION_ID);
+				if (persistedClients.length > 0) {
+						return persistedClients.map((record) => this.toOIDCClient(record));
 				}
 
 				const rawClients = configuration.get("OIDC_CLIENTS_JSON");
@@ -980,8 +1005,8 @@ export class OIDCService {
 				return createHash("sha256").update(verifier).digest("base64url");
 		}
 
-		private resolveClient(clientId: string): OIDCClient | null {
-				const clients = this.configureClients();
+		private async resolveClient(clientId: string): Promise<OIDCClient | null> {
+				const clients = await this.configureClients();
 				const client = clients.find((candidate) => {
 						return typeof candidate.client_id === "string" && candidate.client_id === clientId;
 				});
@@ -1199,7 +1224,8 @@ export class OIDCService {
 
 		async getDashboardSnapshot(): Promise<OIDCDashboardSnapshot> {
 				const issuer = this.resolveIssuer();
-				const clients = this.configureClients().map((client) => {
+				const configuredClients = await this.configureClients();
+				const clients = configuredClients.map((client) => {
 						const clientId = typeof client.client_id === "string" ? client.client_id : "";
 						const redirectUris = this.extractRedirectUris(client);
 						const scopes = this.extractScopes(client);
@@ -1298,5 +1324,3 @@ export class OIDCService {
 				return Boolean(this.provider);
 		}
 }
-
-export const oidcService = new OIDCService();
