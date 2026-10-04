@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql",
+    "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql && cp src/email/schema.sql dist/email/schema.sql",
     "start": "node dist/server.js"
   },
   "dependencies": {
@@ -23,10 +23,12 @@
     "pino": "^10.3.1",
     "prom-client": "^15.1.3",
     "redlock": "^5.0.0-beta.2",
+    "svix": "^2.6.1",
     "uuid": "^14.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@babel/parser": "^7.29.9",
     "@types/node": "^26.2.0",
     "@types/pg": "^8.23.1",
     "eslint": "^10.8.1",

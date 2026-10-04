@@ -18,6 +18,7 @@ import { ensureBookwrmApplicationSeed } from "./adapters/base44/Base44Applicatio
 import { oidcService } from "./oidc/oidcServiceInstance.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
+import { configureEmailVerification } from "./adapters/email/EmailVerificationComposition.js";
 
 const app = Fastify({
 		logger: {
@@ -67,6 +68,7 @@ await registerHapiIdentityBridgeRoutes(app);
 await registerPrivateIDEnrollmentRoutes(app);
 await registerIdentityAccountLinkRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
+await configureEmailVerification(app);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {
