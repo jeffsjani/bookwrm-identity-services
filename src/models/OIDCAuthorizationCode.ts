@@ -11,4 +11,6 @@ export type OIDCAuthorizationCode = {
 		userSub: string;
 		expiresAt: number;
 		consumed: boolean;
+		authenticationMethod?: "HAPI_EMAIL";
+		authenticatedAt?: string;
 };

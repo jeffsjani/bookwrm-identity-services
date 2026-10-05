@@ -9,6 +9,10 @@ import {
 		type KeyObject
 } from "node:crypto";
 import Provider from "oidc-provider";
+import { z } from "zod";
+import type { EmailOIDCHandoff } from "../authentication/EmailOIDCHandoff.js";
+import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
+import { VerificationError } from "../email/VerificationChallenge.js";
 
 import type { AuthenticationProvider, AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import { configuration } from "../config/ConfigurationService.js";
@@ -65,6 +69,18 @@ type AuthorizationQuery = {
 		code_challenge?: string;
 		code_challenge_method?: string;
 };
+
+const emailAuthorizationSchema = z.object({
+	client_id: z.string().min(1),
+	redirect_uri: z.string().url(),
+	response_type: z.literal("code"),
+	scope: z.string().refine(value => value.split(" ").includes("openid")),
+	state: z.string().optional(),
+	nonce: z.string().min(1),
+	code_challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+	code_challenge_method: z.literal("S256"),
+	authentication_result: z.string().regex(/^[A-Za-z0-9_-]{43}$/)
+}).strict();
 
 type TokenRequestBody = {
 		grant_type?: string;
@@ -141,6 +157,7 @@ export class OIDCService {
 		private provider?: Provider;
 		private readonly options: OIDCServiceOptions;
 		private readonly authenticationProvider: AuthenticationProvider;
+		private emailAuthentication?: EmailOIDCHandoff;
 		private readonly oidcClients: OIDCClientRepository;
 		private readonly claimsService: ClaimsService;
 		private readonly redisStore: RedisOIDCStore;
@@ -167,6 +184,10 @@ export class OIDCService {
 				this.lockService = new RedisLockService();
 				this.rateLimiter = new OIDCRateLimiter();
 				this.keyRotationService = new OIDCKeyRotationService();
+		}
+
+		configureEmailAuthentication(handoff: EmailOIDCHandoff): void {
+				this.emailAuthentication = handoff;
 		}
 
 		async configureProvider(): Promise<Provider> {
@@ -249,12 +270,32 @@ export class OIDCService {
 								});
 						}
 				});
-				app.get("/authorize", async (request, reply) => {
+				app.route({ method: ["GET", "POST"], url: "/authorize", bodyLimit: 4096,
+					errorHandler: (error, request, reply) => {
+						if (request.method !== "POST") throw error;
+						reply.header("Cache-Control", "no-store");
+						const status = typeof error.statusCode === "number" && error.statusCode >= 400 && error.statusCode < 500
+							? error.statusCode : 503;
+						if (status === 503) request.log.error({ event: "EMAIL_OIDC_HANDOFF_UNAVAILABLE" }, "Email OIDC handoff failed");
+						return reply.code(status).send({ error: status === 503 ? "authentication_unavailable" : "invalid_request" });
+					},
+					handler: async (request, reply) => {
+						let emailResult: string | undefined;
+						let query: AuthorizationQuery;
+						if (request.method === "POST") {
+								reply.header("Cache-Control", "no-store");
+								if (!this.emailAuthentication) return reply.code(404).send({ error: "not_found" });
+								const parsed = emailAuthorizationSchema.safeParse(request.body);
+								if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
+								emailResult = parsed.data.authentication_result;
+								query = parsed.data;
+						} else {
+								query = request.query as AuthorizationQuery;
+						}
 						const startedAt = Date.now();
 						let error = "";
 						let userId = "";
 						this.metrics.authorizationRequests += 1;
-						const query = request.query as AuthorizationQuery;
 						const clientId = query.client_id?.trim();
 						const redirectUri = query.redirect_uri;
 						const responseType = query.response_type;
@@ -284,7 +325,7 @@ export class OIDCService {
 										return { error: "invalid_request", error_description: "redirect_uri is required" };
 								}
 
-								const client = await this.resolveClient(clientId);
+								const client = await this.resolveClient(clientId, request.method === "POST");
 								if (!client) {
 										reply.code(400);
 										error = "Unknown client";
@@ -359,6 +400,12 @@ export class OIDCService {
 										codeChallenge: codeChallenge ?? "",
 										state: query.state
 								};
+								if (emailResult && this.emailAuthentication) {
+										const principal = await this.emailAuthentication.consume(request, emailResult, clientId);
+										userId = principal.id;
+										const redirect = await this.issueAuthorizationRedirect(principal, pendingContext);
+										return { redirectUri: redirect };
+								}
 								this.authenticationProvider.setPendingAuthorizationContext?.(pendingContext);
 
 								// correlationId ties this authorization request to its PrivateID session without depending on Bookwrm.
@@ -374,6 +421,15 @@ export class OIDCService {
 
 								reply.redirect(asyncSession.launchUrl, 302);
 						} catch (err) {
+								if (request.method === "POST") {
+										if (err instanceof EmailAuthenticationError || err instanceof VerificationError) {
+												error = "email_authentication_failed";
+												return reply.code(err.statusCode).send({ error: "authentication_failed" });
+										}
+										app.log.error({ event: "EMAIL_OIDC_HANDOFF_UNAVAILABLE" }, "Email OIDC handoff failed");
+										error = "email_authentication_unavailable";
+										return reply.code(503).send({ error: "authentication_unavailable" });
+								}
 								error = err instanceof Error ? err.message : "unknown_error";
 								throw err;
 						} finally {
@@ -389,7 +445,7 @@ export class OIDCService {
 										correlationId: this.correlationIdFor(request)
 								});
 						}
-				});
+				}});
 				app.get("/jwks", async (request, reply) => {
 						const startedAt = Date.now();
 						let error = "";
@@ -544,7 +600,7 @@ export class OIDCService {
 										return { error: "invalid_grant", error_description: "redirect_uri does not match code" };
 								}
 
-								const client = await this.resolveClient(clientId);
+								const client = await this.resolveClient(clientId, codeRecord.authenticationMethod === "HAPI_EMAIL");
 								if (!client) {
 										reply.code(400);
 										error = "Unknown client";
@@ -611,6 +667,15 @@ export class OIDCService {
 
 								const now = Math.floor(Date.now() / 1000);
 								const issuer = this.resolveIssuer();
+								if (codeRecord.authenticationMethod === "HAPI_EMAIL") {
+										const subject = await identityRegistry.findByOidcSubject(codeRecord.userSub);
+										if (!subject || subject.primaryProvider !== "HAPI_EMAIL" ||
+											subject.status !== "ACTIVE" || subject.emailVerified !== true ||
+											subject.email !== subject.primaryProviderSubject) {
+												error = "email_identity_not_eligible";
+												return reply.code(400).send({ error: "invalid_grant" });
+										}
+								}
 								// Release Patch 6.1: the code only carries userId/userSub -- mutable claims are re-resolved live from the
 								// Identity Registry here, so an Identity Registry update after code issuance is never missed.
 							const currentClaims = await this.resolveCurrentClaims(codeRecord.userSub);
@@ -649,6 +714,10 @@ export class OIDCService {
 							audience: clientId,
 							nonce: codeRecord.nonce,
 							scope: codeRecord.scope,
+							...(codeRecord.authenticationMethod ? {
+								authenticationMethod: codeRecord.authenticationMethod,
+								authenticatedAt: codeRecord.authenticatedAt
+							} : {}),
 							...(claims.email !== undefined ? { email: claims.email } : {}),
 							...(claims.emailVerified !== undefined ? { emailVerified: claims.emailVerified } : {}),
 								...(claims.name !== undefined ? { name: claims.name } : {}),
@@ -921,7 +990,11 @@ export class OIDCService {
 						nonce: context.nonce,
 						codeChallenge: context.codeChallenge,
 						userId: user.id,
-						userSub: user.sub
+						userSub: user.sub,
+						...(user.authenticationMethod ? {
+							authenticationMethod: user.authenticationMethod,
+							authenticatedAt: user.authenticatedAt
+						} : {})
 				});
 
 				const redirectTarget = new URL(context.redirectUri);
@@ -1005,7 +1078,11 @@ export class OIDCService {
 				return createHash("sha256").update(verifier).digest("base64url");
 		}
 
-		private async resolveClient(clientId: string): Promise<OIDCClient | null> {
+		private async resolveClient(clientId: string, emailAuthentication = false): Promise<OIDCClient | null> {
+				if (emailAuthentication && !this.options.clients) {
+						const persisted = await this.oidcClients.findByClientId(clientId);
+						if (persisted) return this.toOIDCClient(persisted);
+				}
 				const clients = await this.configureClients();
 				const client = clients.find((candidate) => {
 						return typeof candidate.client_id === "string" && candidate.client_id === clientId;
@@ -1064,6 +1141,8 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
+			authenticationMethod?: "HAPI_EMAIL";
+			authenticatedAt?: string;
 		}): Record<string, unknown> {
 			return {
 				iss: input.issuer,
@@ -1075,7 +1154,11 @@ export class OIDCService {
 				...(input.emailVerified !== undefined ? { email_verified: input.emailVerified } : {}),
 				...(input.name !== undefined ? { name: input.name } : {}),
 				iat: input.iat,
-				exp: input.exp
+				exp: input.exp,
+				...(input.authenticationMethod && input.authenticatedAt ? {
+					amr: ["email"],
+					auth_time: Math.floor(Date.parse(input.authenticatedAt) / 1000)
+				} : {})
 			};
 		}
 
@@ -1090,6 +1173,8 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
+			authenticationMethod?: "HAPI_EMAIL";
+			authenticatedAt?: string;
 		}): Promise<string> {
 			const signing = await this.getSigningMaterial();
 			const payload = this.buildIdTokenPayload(input);

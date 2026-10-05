@@ -42,9 +42,8 @@ No changes to `identity_subjects`, `verification_challenges`, `tenants`, `applic
 
 `POST /v1/registration/complete`
 
-- Auth: same trusted H1 client Basic-auth context as H2 (`authorize()` is **duplicated verbatim**
-  from `routes/emailVerification.ts`, not shared/refactored, to avoid touching H2's route module at
-  all).
+- Auth: same trusted H1 client Basic-auth context as H2. H3 retains its certified local
+  authorization function; H2/H4 now reuse the equivalent shared H1 helper.
 - Request body: `z.object({ verificationId: z.string().uuid() }).strict()`. The `.strict()` flag
   rejects any extra field — this is the mechanism that structurally prevents the `email`, `tenantId`,
   `emailVerified`, `claimSource`, `oidcSubject` injection vectors named in spec item 19: they are

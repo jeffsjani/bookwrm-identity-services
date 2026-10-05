@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS verification_challenges (
 	tenant_id UUID NOT NULL REFERENCES tenants(id),
 	application_id UUID REFERENCES applications(id),
 	channel TEXT NOT NULL CHECK (channel = 'EMAIL'),
-	purpose TEXT NOT NULL CHECK (purpose IN ('REGISTRATION', 'INVITATION', 'RECOVERY', 'EMAIL_CHANGE')),
+	purpose TEXT NOT NULL CHECK (purpose IN ('REGISTRATION', 'INVITATION', 'RECOVERY', 'EMAIL_CHANGE', 'AUTHENTICATION')),
 	destination_normalized TEXT NOT NULL,
 	destination_hash TEXT NOT NULL,
 	code_hash TEXT NOT NULL,
@@ -46,3 +46,17 @@ CREATE TABLE IF NOT EXISTS email_verification_audit (
 	occurred_at TIMESTAMPTZ NOT NULL
 );
 CREATE INDEX IF NOT EXISTS email_verification_audit_challenge_idx ON email_verification_audit (tenant_id, challenge_id, occurred_at);
+
+-- Expand only the purpose constraint; existing H2 challenges and lifecycle remain unchanged.
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1 FROM pg_constraint WHERE conrelid='verification_challenges'::regclass
+		AND conname='verification_challenges_purpose_check'
+		AND pg_get_constraintdef(oid) LIKE '%AUTHENTICATION%'
+	) THEN
+		ALTER TABLE verification_challenges DROP CONSTRAINT IF EXISTS verification_challenges_purpose_check;
+		ALTER TABLE verification_challenges ADD CONSTRAINT verification_challenges_purpose_check
+			CHECK (purpose IN ('REGISTRATION', 'INVITATION', 'RECOVERY', 'EMAIL_CHANGE', 'AUTHENTICATION'));
+	END IF;
+END $$;

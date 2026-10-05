@@ -1,4 +1,4 @@
-export const verificationPurposes = ["REGISTRATION", "INVITATION", "RECOVERY", "EMAIL_CHANGE"] as const;
+export const verificationPurposes = ["REGISTRATION", "INVITATION", "RECOVERY", "EMAIL_CHANGE", "AUTHENTICATION"] as const;
 export type VerificationPurpose = typeof verificationPurposes[number];
 export type VerificationStatus = "PENDING" | "VERIFIED" | "EXPIRED" | "LOCKED" | "CONSUMED";
 

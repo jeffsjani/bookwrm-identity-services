@@ -8,10 +8,7 @@ import type { RegistrationContext } from "../registration/RegistrationTypes.js";
 import { RegistrationError } from "../registration/RegistrationTypes.js";
 import type { RegistrationService } from "../registration/RegistrationService.js";
 
-// Duplicated verbatim from routes/emailVerification.ts's `authorize()` (Task 3/15: H3 depends only on
-// the trusted H1 client context, never on any downstream application's own headers) -- H2's route
-// module is intentionally left unmodified, so this is a deliberate, self-contained copy rather than
-// a shared refactor that would touch H2 code.
+// Keeps H3's certified authorization policy unchanged; H2/H4 use the equivalent shared H1 helper.
 export interface H1ClientAuthority {
 	clients: Pick<OIDCClientRepository, "findByClientId">;
 	applications: Pick<ApplicationRepository, "findById">;

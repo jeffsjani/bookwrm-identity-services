@@ -69,7 +69,8 @@ await registerHapiIdentityBridgeRoutes(app);
 await registerPrivateIDEnrollmentRoutes(app);
 await registerIdentityAccountLinkRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
-await configureEmailVerification(app);
+const emailAuthentication = await configureEmailVerification(app);
+if (emailAuthentication) oidcService.configureEmailAuthentication(emailAuthentication);
 await configureRegistration(app);
 await oidcService.registerEndpoints(app);
 

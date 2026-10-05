@@ -2,6 +2,14 @@
 
 Enterprise Identity Platform for Bookwrm.
 
+## HAPI passwordless email authentication
+
+H4 adds application-neutral authentication for existing, ACTIVE, verified `HAPI_EMAIL`
+IdentitySubjects, reusing H2 email verification and the existing OIDC token flow.
+It is disabled by default via `HAPI_EMAIL_AUTHENTICATION_ENABLED=false`.
+See [H4 API, policy, migration, and validation guide](docs/H4-Email-Authentication.md).
+No Bookwrm UI, Base44 integration, cross-provider linking, or deployment is included.
+
 ## Overview
 
 This service provides identity-facing API routes backed by an internal client and service layer:

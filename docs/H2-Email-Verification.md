@@ -43,7 +43,14 @@ These are server-to-server endpoints. Do not place client secrets in browsers. A
 * `POST /v1/identity/email/resend`: `{ "challengeId": "UUID" }` returns the same shape. Cooldown and limits return 429. Concurrent eligible resends have one winner.
 * `POST /v1/identity/email/verify`: `{ "challengeId": "UUID", "code": "123456" }` returns `{ "verified": true, "verificationId": "UUID" }`. Optional `purpose` asserts the expected purpose. Invalid codes consume attempts; exhausted challenges lock. Concurrent verification has one winner.
 
-Purposes are `REGISTRATION`, `INVITATION`, `RECOVERY`, and `EMAIL_CHANGE`. Responses have `Cache-Control: no-store`. Start never consults the identity registry and has identical response shape/status for registered and unknown emails. Provider failure/timeout returns generic 503. Request parsing errors, provider payloads, OTPs, OTP hashes, and credentials are never logged by H2.
+Purposes are `REGISTRATION`, `INVITATION`, `RECOVERY`, `EMAIL_CHANGE`, and (H4) `AUTHENTICATION`. Responses have `Cache-Control: no-store`. Start never consults the identity registry and has identical response shape/status for registered and unknown emails. Provider failure/timeout returns generic 503. Request parsing errors, provider payloads, OTPs, OTP hashes, and credentials are never logged by H2.
+
+H4 reuses this service through dedicated authentication routes. The generic H2 verify route
+still establishes evidence only, including for `AUTHENTICATION`; it does not issue an authenticated
+principal or authentication result. Use the H4 verify route for that journey.
+H2 and H4 share the trusted H1 Basic-auth helper without changing H2 authorization semantics.
+The idempotent H4 purpose migration expands only `verification_challenges_purpose_check` in one
+transaction; it preserves existing purposes, challenge data, and lifecycle rules.
 
 ## H3 consumption preparation
 
