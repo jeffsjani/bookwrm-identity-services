@@ -7,4 +7,6 @@ export type IdentityClaimSource =
 		| "ENTERPRISE"
 		| "BOOKWRM"
 		| "MANUAL"
-		| "SYSTEM";
+		| "SYSTEM"
+		// HAPI ID H3: canonical identity claims established from verified HAPI email evidence (H2).
+		| "HAPI_EMAIL";

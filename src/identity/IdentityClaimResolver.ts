@@ -2,10 +2,13 @@ import type { IdentityClaimName, IdentitySubject } from "../models/IdentitySubje
 import type { IdentityClaimSource } from "./IdentityClaimSource.js";
 import { evaluateClaim, type ClaimDecision } from "./IdentityClaimPolicy.js";
 import { recordClaimAudit } from "./IdentityClaimAudit.js";
-import { getClaimSources, getClaimUpdatedAt, recordClaimSource } from "./IdentityClaimSourceStore.js";
+import type { IdentityClaimSourceStore } from "./IdentityClaimSourceStore.js";
+import { inMemoryIdentityClaimSourceStore } from "./InMemoryIdentityClaimSourceStore.js";
+import { PostgresIdentityClaimSourceStore } from "./PostgresIdentityClaimSourceStore.js";
 import { identityRegistry } from "./IdentityRegistry.js";
 import { identityMetrics } from "./infrastructure/IdentityMetrics.js";
 import type { UpdateIdentitySubjectInput } from "./IdentitySubjectRepository.js";
+import { configuration } from "../config/ConfigurationService.js";
 
 export type SuggestedClaims = {
 		email?: string;
@@ -26,9 +29,17 @@ export type ClaimResolutionResult = {
 
 const CLAIM_VALUE_FIELDS = ["email", "emailVerified", "displayName"] as const;
 
+function defaultClaimSourceStore(): IdentityClaimSourceStore {
+		return configuration.getIdentityRegistryDriver() === "memory"
+					? inMemoryIdentityClaimSourceStore
+				: new PostgresIdentityClaimSourceStore();
+}
+
 // Only path allowed to turn authenticator-suggested claims into persisted IdentitySubject fields.
 // Authenticators propose; this resolver (via IdentityClaimPolicy) decides; IdentityRegistry persists.
 export class IdentityClaimResolver {
+		constructor(private readonly claimSources: IdentityClaimSourceStore = defaultClaimSourceStore()) {}
+
 		async resolve(oidcSubject: string, source: IdentityClaimSource, suggested: SuggestedClaims): Promise<ClaimResolutionResult> {
 				// Rule 1: the OIDC Subject never changes -- reject any attempt to smuggle it in as a "claim".
 				const suggestedAsRecord = suggested as Record<string, unknown>;
@@ -43,8 +54,9 @@ export class IdentityClaimResolver {
 
 				const outcomes: ClaimResolutionOutcome[] = [];
 				const changes: UpdateIdentitySubjectInput = {};
-				const claimSources = getClaimSources(oidcSubject);
-				const claimUpdatedAt = getClaimUpdatedAt(oidcSubject);
+				// Task 2: durable provenance is keyed by the immutable identity_subjects.id, not oidcSubject.
+				const claimSources = await this.claimSources.getClaimSources(subject.id);
+				const claimUpdatedAt = await this.claimSources.getClaimUpdatedAt(subject.id);
 
 				for (const claim of CLAIM_VALUE_FIELDS) {
 						if (suggested[claim] === undefined) {
@@ -74,7 +86,7 @@ export class IdentityClaimResolver {
 										changes.displayName = suggested.displayName;
 								}
 								const timestamp = new Date().toISOString();
-								recordClaimSource(oidcSubject, claim, source, timestamp);
+								await this.claimSources.recordClaimSource(subject.id, claim, source, timestamp);
 								claimSources[claim] = source;
 								claimUpdatedAt[claim] = timestamp;
 						}
@@ -96,3 +108,4 @@ export class IdentityClaimResolver {
 }
 
 export const identityClaimResolver = new IdentityClaimResolver();
+

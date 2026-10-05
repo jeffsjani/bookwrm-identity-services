@@ -1,6 +1,9 @@
 import type { IdentityClaimSource } from "../identity/IdentityClaimSource.js";
 
-export type IdentityProvider = "PrivateID" | "Google" | "Apple" | "Passkey" | "Enterprise";
+// HAPI ID H3: "HAPI_EMAIL" is the canonical-registration provider identity, keyed by normalized verified
+// email (see RegistrationService). It reuses the existing (primaryProvider, primaryProviderSubject)
+// uniqueness constraint for atomic duplicate-registration protection; it never changes existing rows.
+export type IdentityProvider = "PrivateID" | "Google" | "Apple" | "Passkey" | "Enterprise" | "HAPI_EMAIL";
 
 export type IdentitySubjectStatus = "ACTIVE" | "LOCKED" | "DISABLED";
 

@@ -19,6 +19,7 @@ import { oidcService } from "./oidc/oidcServiceInstance.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
 import { configureEmailVerification } from "./adapters/email/EmailVerificationComposition.js";
+import { configureRegistration } from "./registration/RegistrationComposition.js";
 
 const app = Fastify({
 		logger: {
@@ -69,6 +70,7 @@ await registerPrivateIDEnrollmentRoutes(app);
 await registerIdentityAccountLinkRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
 await configureEmailVerification(app);
+await configureRegistration(app);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {

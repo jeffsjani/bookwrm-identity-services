@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS authenticator_login_transactions (
 		completed_at TIMESTAMPTZ
 );
 
+-- HAPI ID H3P: durable governance metadata for which source currently owns each IdentitySubject
+-- claim (Release C5.1/H3). Additive only; keyed by the immutable identity_subjects.id, never by
+-- email/oidcSubject/providerSubject. Deliberately minimal -- not a generalized evidence system.
+CREATE TABLE IF NOT EXISTS identity_claim_provenance (
+		identity_subject_id UUID NOT NULL REFERENCES identity_subjects(id),
+		claim_name TEXT NOT NULL,
+		source TEXT NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL,
+		PRIMARY KEY (identity_subject_id, claim_name)
+);
+
 -- Formal schema version tracking (Sprint 5.1).
 CREATE TABLE IF NOT EXISTS schema_migrations (
 		version TEXT PRIMARY KEY,
