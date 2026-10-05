@@ -4,7 +4,7 @@ export type AuthenticatorType = "face";
 
 export type UserAuthenticatorStatus = "active" | "revoked";
 
-// Provider-backed credential metadata. It is intentionally not wired into authentication yet.
+// Provider-backed credential metadata; HAPI links userId to the existing IdentitySubject.id.
 export type UserAuthenticator = {
 	id: string;
 	userId: string;

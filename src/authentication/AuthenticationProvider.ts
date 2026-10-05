@@ -4,9 +4,9 @@ export type AuthenticatedUser = {
 		email?: string;
 		emailVerified?: boolean;
 		name?: string;
-		authenticationMethod?: "HAPI_EMAIL";
+		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
 		authenticatedAt?: string;
-		assurance?: "email_otp";
+		assurance?: "email_otp" | "face";
 };
 
 export type AuthenticationStatus = {

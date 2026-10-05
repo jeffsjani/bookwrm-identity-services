@@ -10,6 +10,8 @@ type AccessTokenRecord = {
 		nonce: string;
 		scope: string;
 		expiresAt: number;
+		authenticationMethod?: OIDCAuthorizationCode["authenticationMethod"];
+		authenticatedAt?: string;
 };
 
 type RefreshTokenRecord = {

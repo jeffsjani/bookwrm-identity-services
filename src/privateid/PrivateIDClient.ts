@@ -22,11 +22,11 @@ export class PrivateIDClient {
 			return this.createSession(correlationId);
 		}
 
-		async createEnrollmentSession(providerTransactionId: string): Promise<PrivateIDSession> {
-			return this.createSession(undefined, providerTransactionId);
+		async createEnrollmentSession(providerTransactionId: string, signal?: AbortSignal): Promise<PrivateIDSession> {
+			return this.createSession(undefined, providerTransactionId, signal);
 		}
 
-		private async createSession(correlationId?: string, providedTransactionId?: string): Promise<PrivateIDSession> {
+		private async createSession(correlationId?: string, providedTransactionId?: string, signal?: AbortSignal): Promise<PrivateIDSession> {
 				const now = Date.now();
 				const transactionId = providedTransactionId ?? randomUUID();
 				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
@@ -119,6 +119,7 @@ export class PrivateIDClient {
 
 				const response = await fetch(endpoint, {
 						method: "POST",
+						signal,
 						headers: {
 								"content-type": "application/json",
 								"x-api-key": authConfiguration.authApiKey as string

@@ -10,6 +10,15 @@ It is disabled by default via `HAPI_EMAIL_AUTHENTICATION_ENABLED=false`.
 See [H4 API, policy, migration, and validation guide](docs/H4-Email-Authentication.md).
 No Bookwrm UI, Base44 integration, cross-provider linking, or deployment is included.
 
+## HAPI Face authenticator attachment
+
+H5 lets an existing HAPI_EMAIL identity attach PrivateID Face to its existing canonical
+subject using a recent H4 access token. It reuses the provider ceremony and Face login
+resolver, without creating an IdentitySubject or requiring a product account link.
+It is disabled by default via `HAPI_FACE_ENROLLMENT_ENABLED=false`.
+See [H5 authority, API, migration, and validation guide](docs/H5-Face-Authenticator-Attachment.md).
+No production activation, deployment, or Base44 UI is included.
+
 ## Overview
 
 This service provides identity-facing API routes backed by an internal client and service layer:

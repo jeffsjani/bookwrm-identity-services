@@ -58,7 +58,7 @@ function toUserAuthenticator(row: UserAuthenticatorRow): UserAuthenticator {
 	};
 }
 
-// Dormant persistence boundary for provider authenticators. No runtime flows use it yet.
+// Shared provider-authenticator persistence for Face login and enrollment.
 export class UserAuthenticatorRepository {
 	private explicitClient?: PostgresClient;
 

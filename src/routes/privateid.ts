@@ -10,6 +10,7 @@ import type { PrivateIDResult } from "../privateid/PrivateIDResult.js";
 import type { IdentityContext } from "../models/IdentityContext.js";
 import {
 		resolvePrivateIDSessionRecord,
+		findPrivateIDSession,
 		storePendingAuthorizationRequest,
 		storePrivateIDAuthenticatedUser,
 		storePrivateIDIdentityContext,
@@ -21,6 +22,7 @@ import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/Cor
 import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 import { privateIDEnrollmentService } from "../identity/PrivateIDEnrollmentService.js";
 import { AuthenticatorLoginError, authenticatorLoginResolver } from "../identity/AuthenticatorLoginResolver.js";
+import { FaceEnrollmentError, type FaceEnrollmentCallbacks, type FaceEnrollmentReply } from "../authenticators/FaceEnrollmentTypes.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -130,8 +132,20 @@ function resolveEmailFromIdentityContext(identityContext?: IdentityContext): { e
 		return { email: "", emailVerified: false };
 }
 
-export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<void> {
+export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollment?: FaceEnrollmentCallbacks): Promise<void> {
 		app.log.info({ method: "POST", path: "/privateid/webhook" }, "PrivateID webhook endpoint registered at POST /privateid/webhook");
+
+		const dispatchFaceEnrollment = async (operation: () => Promise<FaceEnrollmentReply | undefined>): Promise<FaceEnrollmentReply | undefined> => {
+				try {
+						const result = await operation();
+						if (result) app.log.info({ event: "hapi_face_enrollment_callback", responseCode: result.statusCode }, "HAPI Face enrollment callback processed");
+						return result;
+				} catch (error) {
+						if (!(error instanceof FaceEnrollmentError)) throw error;
+						app.log.warn({ event: "hapi_face_enrollment_callback_rejected", code: error.code }, "HAPI Face enrollment callback rejected");
+						return { statusCode: error.statusCode, body: { error: error.code } };
+				}
+		};
 
 		app.post("/privateid/webhook", async (request, reply) => {
 				const timestamp = new Date().toISOString();
@@ -254,8 +268,24 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 				}
 				responseContext.sessionId = sessionId;
 				responseContext.transactionId = transactionId;
+				if (faceEnrollment) {
+						const result = await dispatchFaceEnrollment(() => faceEnrollment.webhook(transactionId, sessionId, status,
+								typeof body.puid === "string" ? body.puid.trim() : undefined));
+						if (result) return reply.code(result.statusCode).send(result.body);
+				}
 				app.log.info({ event: "WEBHOOK_ENTER", sessionId, transactionID: transactionId, status }, "WEBHOOK_ENTER");
-				const record = resolvePrivateIDSessionRecord(sessionId, transactionId);
+				const record = faceEnrollment && (sessionId || transactionId)
+						? findPrivateIDSession(sessionId, transactionId)
+						: resolvePrivateIDSessionRecord(sessionId, transactionId);
+				if (faceEnrollment && record && ((sessionId && record.session.sessionId !== sessionId) ||
+						(transactionId && record.session.transactionId !== transactionId))) {
+						app.log.warn({ event: "privateid_webhook_binding_mismatch" }, "PrivateID webhook correlation mismatch");
+						return reply.code(400).send({ error: "ENROLLMENT_BINDING_MISMATCH" });
+				}
+				if (record?.hapiEnrollment) {
+						app.log.warn({ event: "hapi_face_enrollment_unbound_webhook" }, "HAPI enrollment webhook requires exact durable binding");
+						return reply.code(400).send({ error: "ENROLLMENT_BINDING_MISMATCH" });
+				}
 				app.log.info(
 						{
 							event: record ? "WEBHOOK_SESSION_FOUND" : "WEBHOOK_SESSION_NOT_FOUND",
@@ -451,7 +481,10 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 									sub: user.oidcSubject,
 									email: user.email,
 									emailVerified: user.emailVerified,
-									name: user.displayName
+									name: user.displayName,
+									authenticationMethod: "PRIVATEID_FACE",
+									authenticatedAt: new Date().toISOString(),
+									assurance: "face"
 								};
 							} catch (error) {
 									updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
@@ -528,6 +561,11 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						};
 				}
 
+				if (faceEnrollment) {
+						const result = await dispatchFaceEnrollment(() => faceEnrollment.callback(transactionId, sessionId));
+						if (result) return reply.code(result.statusCode).send(result.body);
+				}
+
 				if (reason.trim().toLowerCase() !== "success") {
 						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 					reply.code(200);
@@ -537,7 +575,18 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 
 				// Release C3.8: Authenticator Resolution architecture. Session status/completed/result are no
 				// longer used to gate the decision -- the PUID is looked up purely to feed AuthenticatorLoginResolver.
-				const resolvedRecord = resolvePrivateIDSessionRecord(sessionId, transactionId);
+				const resolvedRecord = faceEnrollment && (sessionId || transactionId)
+						? findPrivateIDSession(sessionId, transactionId)
+						: resolvePrivateIDSessionRecord(sessionId, transactionId);
+				if (faceEnrollment && resolvedRecord && ((sessionId && resolvedRecord.session.sessionId !== sessionId) ||
+						(transactionId && resolvedRecord.session.transactionId !== transactionId))) {
+						app.log.warn({ event: "privateid_callback_binding_mismatch" }, "PrivateID callback correlation mismatch");
+						return reply.code(400).send({ error: "ENROLLMENT_BINDING_MISMATCH" });
+				}
+				if (resolvedRecord?.hapiEnrollment) {
+						app.log.warn({ event: "hapi_face_enrollment_unbound_callback" }, "HAPI enrollment callback requires exact durable binding");
+						return reply.code(400).send({ error: "ENROLLMENT_BINDING_MISMATCH" });
+				}
 				callbackSessionId = resolvedRecord?.session.sessionId ?? callbackSessionId;
 				const providerSubject = resolvedRecord?.result?.privateIdUserId;
 
@@ -620,7 +669,12 @@ export async function registerPrivateIdRoutes(app: FastifyInstance): Promise<voi
 						sub: oidcSubject,
 						email: canonicalUser.email,
 						emailVerified: canonicalUser.emailVerified,
-						name: canonicalUser.displayName
+						name: canonicalUser.displayName,
+						...(resolvedRecord.authenticatedUser?.authenticationMethod === "PRIVATEID_FACE" ? {
+								authenticationMethod: "PRIVATEID_FACE" as const,
+								authenticatedAt: resolvedRecord.authenticatedUser.authenticatedAt,
+								assurance: "face" as const
+						} : {})
 				};
 				storePrivateIDAuthenticatedUser(resolvedRecord.session.sessionId, authenticatedUser);
 

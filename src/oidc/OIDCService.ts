@@ -701,7 +701,11 @@ export class OIDCService {
 									sub: claims.sub,
 									clientId,
 									nonce: codeRecord.nonce,
-									scope: codeRecord.scope
+									scope: codeRecord.scope,
+									...(codeRecord.authenticationMethod ? {
+										authenticationMethod: codeRecord.authenticationMethod,
+										authenticatedAt: codeRecord.authenticatedAt
+									} : {})
 							});
 							await this.storeRefreshToken(refreshToken, {
 									userId: codeRecord.userId,
@@ -1141,7 +1145,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL";
+			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
 			authenticatedAt?: string;
 		}): Record<string, unknown> {
 			return {
@@ -1156,7 +1160,7 @@ export class OIDCService {
 				iat: input.iat,
 				exp: input.exp,
 				...(input.authenticationMethod && input.authenticatedAt ? {
-					amr: ["email"],
+					amr: input.authenticationMethod === "HAPI_EMAIL" ? ["email"] : ["face", "privateid"],
 					auth_time: Math.floor(Date.parse(input.authenticatedAt) / 1000)
 				} : {})
 			};
@@ -1173,7 +1177,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL";
+			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
 			authenticatedAt?: string;
 		}): Promise<string> {
 			const signing = await this.getSigningMaterial();

@@ -61,10 +61,10 @@ CREATE TABLE IF NOT EXISTS oidc_clients (
 -- until PlatformSeed.ts backfills them to the Bookwrm application (see ensureBookwrmApplicationSeed()).
 ALTER TABLE identity_subjects ADD COLUMN IF NOT EXISTS application_id UUID REFERENCES applications(id);
 
--- Provider authenticator storage. It is intentionally not used by runtime authentication yet.
+-- Provider authenticator storage used by Face login and HAPI authenticator attachment.
 CREATE TABLE IF NOT EXISTS user_authenticators (
 		id UUID PRIMARY KEY,
-		-- user_id is the canonical Bookwrm user identifier (ObjectId string), not the OIDC subject / identity_subjects UUID.
+		-- HAPI uses identity_subjects.id::text; legacy product identifiers remain compatible.
 		user_id TEXT NOT NULL,
 		provider TEXT NOT NULL CHECK (provider = 'privateid'),
 		provider_subject TEXT NOT NULL,
@@ -89,7 +89,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS user_authenticators_one_active_face_per_user_k
 
 CREATE TABLE IF NOT EXISTS privateid_enrollment_transactions (
 		id UUID PRIMARY KEY,
-		-- user_id is the canonical Bookwrm user identifier (ObjectId string), not an identity_subjects UUID.
+		-- HAPI uses identity_subjects.id::text; legacy product identifiers remain compatible.
 		user_id TEXT NOT NULL,
 		purpose TEXT NOT NULL CHECK (purpose = 'face_enrollment'),
 		provider_transaction_id UUID NOT NULL UNIQUE,

@@ -20,6 +20,7 @@ import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMet
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
 import { configureEmailVerification } from "./adapters/email/EmailVerificationComposition.js";
 import { configureRegistration } from "./registration/RegistrationComposition.js";
+import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposition.js";
 
 const app = Fastify({
 		logger: {
@@ -62,7 +63,8 @@ await app.register(formbody);
 // Routes
 registerHealthRoutes(app);
 await registerDiagnosticsRoutes(app);
-await registerPrivateIdRoutes(app);
+const faceEnrollment = await configureFaceEnrollment(app);
+await registerPrivateIdRoutes(app, faceEnrollment);
 await registerIdentityRoutes(app);
 await registerIdentityAdminRoutes(app);
 await registerHapiIdentityBridgeRoutes(app);
