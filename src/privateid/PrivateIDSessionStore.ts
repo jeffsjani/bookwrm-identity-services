@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession } from "./PrivateIDSession.js";
 import type { AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
@@ -18,7 +19,39 @@ export type PrivateIDSessionRecord = {
 const sessionRecords = new Map<string, PrivateIDSessionRecord>();
 const transactionIndex = new Map<string, string>();
 const pendingAuthorizationRequests = new Map<string, PendingAuthorizationContext>();
+const browserReturns = new Map<string, { sessionId: string; expiresAt: number }>();
+export const PRIVATEID_BROWSER_RETURN_COOKIE = "hapi_privateid_oidc_return";
 let currentSessionId: string | undefined;
+
+function browserReturnHandle(cookie: string | undefined): string | undefined {
+	return cookie?.split(";").map(value => value.trim())
+		.find(value => value.startsWith(`${PRIVATEID_BROWSER_RETURN_COOKIE}=`))?.slice(PRIVATEID_BROWSER_RETURN_COOKIE.length + 1);
+}
+
+export function storePrivateIDBrowserReturn(sessionId: string): string | undefined {
+	const record = sessionRecords.get(sessionId);
+	if (!record?.oidcOrigin || record.hapiEnrollment || record.session.expires <= Date.now()) return undefined;
+	for (const [handle, context] of browserReturns) if (context.expiresAt <= Date.now()) browserReturns.delete(handle);
+	const handle = randomBytes(32).toString("base64url");
+	browserReturns.set(handle, { sessionId, expiresAt: Math.min(record.session.expires, Date.now() + 300_000) });
+	return handle;
+}
+
+export function findPrivateIDBrowserReturn(cookie: string | undefined): PrivateIDSessionRecord | undefined {
+	const handle = browserReturnHandle(cookie);
+	const context = handle ? browserReturns.get(handle) : undefined;
+	if (!context || context.expiresAt <= Date.now()) {
+		if (handle) browserReturns.delete(handle);
+		return undefined;
+	}
+	const record = sessionRecords.get(context.sessionId);
+	return record?.oidcOrigin && !record.hapiEnrollment ? record : undefined;
+}
+
+export function clearPrivateIDBrowserReturn(cookie: string | undefined): void {
+	const handle = browserReturnHandle(cookie);
+	if (handle) browserReturns.delete(handle);
+}
 
 export function storePrivateIDSession(session: PrivateIDSession, options: { oidcOrigin?: boolean } = {}): void {
 		sessionRecords.set(session.sessionId, {

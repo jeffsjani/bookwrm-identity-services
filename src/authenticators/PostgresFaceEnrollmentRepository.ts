@@ -5,8 +5,8 @@ import { PrivateIDEnrollmentTransactionRepository } from "../identity/PrivateIDE
 import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
 import type { PrivateIDSession } from "../privateid/PrivateIDSession.js";
 import {
-	FaceEnrollmentError, FACE_ENROLLMENT_TTL_MS, requireRecentEmailAuthority,
-	type FaceEnrollmentAuthority, type FaceEnrollmentReply, type FaceEnrollmentReservation
+	FaceEnrollmentError, FACE_ENROLLMENT_TTL_MS, requireRecentEmailAuthority, requireStatusAuthority,
+	type FaceEnrollmentAuthority, type FaceEnrollmentReply, type FaceEnrollmentReservation, type FaceEnrollmentStatus
 } from "./FaceEnrollmentTypes.js";
 
 type Binding = {
@@ -210,10 +210,14 @@ export class PostgresFaceEnrollmentRepository {
 			const existing = await authenticators.findByProviderSubject("privateid", puid);
 			const active = (await authenticators.findByUser(current.identity_subject_id))
 				.find(authenticator => authenticator.status === "active" && authenticator.authenticatorType === "face");
-			if (providerIdentity || (existing && (existing.userId !== current.identity_subject_id || existing.status !== "active")) ||
-				(active && active.providerSubject !== puid)) {
+			const conflict = providerIdentity ? "LEGACY_PROVIDER_SUBJECT_EXISTS"
+				: existing && existing.userId !== current.identity_subject_id ? "AUTHENTICATOR_OWNED_BY_OTHER_SUBJECT"
+				: existing && existing.status !== "active" ? "AUTHENTICATOR_NOT_ACTIVE"
+				: active && active.providerSubject !== puid ? "TARGET_HAS_DIFFERENT_ACTIVE_AUTHENTICATOR"
+				: undefined;
+			if (conflict) {
 				await new PrivateIDEnrollmentTransactionRepository(client).updateStatus(current.enrollment_id, "failed", now);
-				await this.audit(client, current, current.enrollment_id, "AUTHENTICATOR_ENROLLMENT_CONFLICT", "AUTHENTICATOR_OWNERSHIP_CONFLICT");
+				await this.audit(client, current, current.enrollment_id, "AUTHENTICATOR_ENROLLMENT_CONFLICT", conflict);
 				return { statusCode: 409, body: { error: "ENROLLMENT_CONFLICT" } };
 			}
 			const afterLock = await this.now(client);
@@ -250,6 +254,38 @@ export class PostgresFaceEnrollmentRepository {
 			await this.audit(client, current, current.enrollment_id, alreadyEnrolled ? "AUTHENTICATOR_ALREADY_ACTIVE" : "AUTHENTICATOR_ENROLLED",
 				alreadyEnrolled ? "EXISTING_AUTHENTICATOR" : "ATTACHED");
 			return { statusCode: 200, body: { enrolled: true, alreadyEnrolled } };
+		});
+	}
+
+	async status(enrollmentId: string, authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReply> {
+		return this.transaction(async client => {
+			const subject = (await client.query<{ id: string }>(
+				"SELECT id FROM identity_subjects WHERE oidc_subject::text=$1 FOR SHARE", [authority.sub])).rows[0];
+			const binding = await this.find(client, enrollmentId);
+			if (!subject || !binding || binding.identity_subject_id !== subject.id) {
+				throw new FaceEnrollmentError("ENROLLMENT_NOT_FOUND", 404);
+			}
+			const context = await this.activeContext(client, subject.id, authority.clientId);
+			if (!context || authority.clientId !== binding.client_id || context.tenant_id !== binding.tenant_id ||
+				context.application_id !== binding.application_id) throw new FaceEnrollmentError("ENROLLMENT_NOT_AUTHORIZED", 403);
+			const now = await this.now(client);
+			requireStatusAuthority(authority, now.getTime());
+			if (binding.expires_at <= now || binding.status === "expired") {
+				return { statusCode: 410, body: { status: "EXPIRED", guidance: "Start a new enrollment after signing in." } };
+			}
+			let status: FaceEnrollmentStatus = binding.status === "completed" ? "COMPLETED"
+				: binding.status === "failed" ? "FAILED" : "PENDING";
+			if (status === "FAILED") {
+				const audit = (await client.query<{ type: string }>(
+					"SELECT type FROM authenticator_enrollment_audit WHERE enrollment_id=$1 AND type='AUTHENTICATOR_ENROLLMENT_CONFLICT' AND outcome=ANY($2::text[]) LIMIT 1",
+					[binding.enrollment_id, ["LEGACY_PROVIDER_SUBJECT_EXISTS", "AUTHENTICATOR_OWNED_BY_OTHER_SUBJECT",
+						"AUTHENTICATOR_NOT_ACTIVE", "TARGET_HAS_DIFFERENT_ACTIVE_AUTHENTICATOR",
+						"AUTHENTICATOR_OWNERSHIP_CONFLICT", "CONCURRENT_AUTHENTICATOR_CONFLICT"]])).rows[0];
+				if (audit?.type === "AUTHENTICATOR_ENROLLMENT_CONFLICT") status = "CONFLICT";
+			}
+			return { statusCode: 200, body: { status, guidance: status === "PENDING"
+				? "Waiting for the identity provider." : status === "COMPLETED" ? "Face enrollment completed."
+				: "Enrollment could not be completed. Contact your HAPI administrator." } };
 		});
 	}
 

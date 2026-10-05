@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { Writable } from "node:stream";
 import Fastify from "fastify";
 import formbody from "@fastify/formbody";
 import pg from "pg";
@@ -34,7 +35,7 @@ import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityService } from "../src/identity/IdentityService.js";
 import { privateIdWebhookDiagnosticsRepository } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 import * as infrastructure from "../src/identity/infrastructure/PostgresInfrastructure.js";
-import { getCurrentPrivateIDSessionRecord, markHapiFaceEnrollmentSession, storePrivateIDSession } from "../src/privateid/PrivateIDSessionStore.js";
+import { getCurrentPrivateIDSessionRecord, findPrivateIDSession, markHapiFaceEnrollmentSession, storePrivateIDSession } from "../src/privateid/PrivateIDSessionStore.js";
 import { ensureOidcTestEnvironment } from "./oidcTestHarness.js";
 
 const databaseUrl = process.env.HAPI_FACE_ENROLLMENT_TEST_DATABASE_URL;
@@ -87,6 +88,18 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 	}
 	async function complete(flow: { transactionId: string; sessionId: string }, puid = randomUUID()) {
 		return service.webhook(flow.transactionId, flow.sessionId, "SUCCESS", puid);
+	}
+	async function statusApp(sub: string, captureLogs = false, overrides: Partial<FaceEnrollmentAuthority> = {}) {
+		const logs: string[] = [];
+		const stream = new Writable({ write(chunk, _encoding, next) { logs.push(chunk.toString()); next(); } });
+		const app = Fastify(captureLogs ? { logger: { stream } } : {});
+		const tokens = new RedisOIDCStore();
+		const token = randomUUID();
+		const { expiresAt, ...record } = authority(sub, overrides);
+		await tokens.storeAccessToken(token, { ...record, nonce: randomUUID() }, expiresAt - Date.now());
+		await registerHapiFaceEnrollmentRoutes(app, service, tokens);
+		await registerPrivateIdRoutes(app, service);
+		return { app, logs, tokens, token, headers: { authorization: `Bearer ${token}` } };
 	}
 	async function snapshot(subjectId: string) {
 		return {
@@ -160,6 +173,8 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		expect(await snapshot(second.id)).toEqual(secondSnapshot);
 		expect((await pool.query("SELECT type FROM authenticator_enrollment_audit WHERE identity_subject_id=$1 ORDER BY occurred_at DESC LIMIT 1",
 			[second.id])).rows[0].type).toBe("AUTHENTICATOR_ENROLLMENT_CONFLICT");
+		expect((await pool.query("SELECT outcome FROM authenticator_enrollment_audit WHERE identity_subject_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+			[second.id])).rows[0].outcome).toBe("AUTHENTICATOR_OWNED_BY_OTHER_SUBJECT");
 	});
 	it("serializes concurrent completion of the same ceremony to exactly one authenticator", async () => {
 		const subject = await seed(), flow = await pending(subject.oidcSubject), puid = randomUUID();
@@ -177,6 +192,8 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		expect(await complete(flow, puid)).toMatchObject({ statusCode: 409 });
 		expect(await authenticators.findByUser(subject.id)).toHaveLength(0);
 		expect(await subjects.findById(legacy.id)).toEqual(legacy);
+		expect((await pool.query("SELECT outcome FROM authenticator_enrollment_audit WHERE identity_subject_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+			[subject.id])).rows[0].outcome).toBe("LEGACY_PROVIDER_SUBJECT_EXISTS");
 	});
 	it("rejects another active Face attached during a pending ceremony", async () => {
 		const subject = await seed(), flow = await pending(subject.oidcSubject);
@@ -184,6 +201,8 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			providerSubject: randomUUID(), authenticatorType: "face", status: "active" });
 		expect(await complete(flow)).toMatchObject({ statusCode: 409 });
 		expect(await authenticators.findByUser(subject.id)).toEqual([existing]);
+		expect((await pool.query("SELECT outcome FROM authenticator_enrollment_audit WHERE identity_subject_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+			[subject.id])).rows[0].outcome).toBe("TARGET_HAS_DIFFERENT_ACTIVE_AUTHENTICATOR");
 	});
 	it("reuses the same active PUID attached to the same subject during a pending ceremony", async () => {
 		const subject = await seed(), flow = await pending(subject.oidcSubject), puid = randomUUID();
@@ -221,6 +240,8 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		await authenticators.revoke(authenticator.id);
 		expect(await complete(await pending(subject.oidcSubject), puid)).toMatchObject({ statusCode: 409 });
 		expect((await authenticators.findByProviderSubject("privateid", puid))?.status).toBe("revoked");
+		expect((await pool.query("SELECT outcome FROM authenticator_enrollment_audit WHERE identity_subject_id=$1 ORDER BY occurred_at DESC LIMIT 1",
+			[subject.id])).rows[0].outcome).toBe("AUTHENTICATOR_NOT_ACTIVE");
 	});
 	it("rejects unknown, non-HAPI, unverified and inactive subjects before provider invocation", async () => {
 		const subject = await seed();
@@ -421,13 +442,153 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			const payload = { status: "SUCCESS", transactionID: flow.transactionId, sessionId: flow.sessionId, puid: randomUUID() };
 			expect((await app.inject({ method: "POST", url: "/privateid/webhook", payload })).statusCode).toBe(401);
 			const callback = await app.inject({ method: "GET", url: `/privateid/callback?reason=success&transactionID=${flow.transactionId}&puid=untrusted` });
-			expect(callback.json()).toMatchObject({ enrolled: false, status: "pending" });
+			expect(callback.headers["content-type"]).toContain("text/html");
+			expect(callback.body).not.toContain("untrusted");
 			expect((await app.inject({ method: "POST", url: "/privateid/webhook",
 				headers: { "x-storythink-webhook-secret": "privateid-webhook-secret" }, payload })).json()).toMatchObject({ enrolled: true });
 			expect(base44).not.toHaveBeenCalled();
 			expect(legacyRegistration).not.toHaveBeenCalled();
 			expect(diagnostics).not.toHaveBeenCalled();
 		} finally { await app.close(); base44.mockRestore(); legacyRegistration.mockRestore(); diagnostics.mockRestore(); }
+	});
+	it.each([false, true])("H5.1 status observes completion when webhook-before-redirect=%s without callback attachment", async webhookFirst => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject), before = await snapshot(subject.id);
+		const decoy = { sessionId: randomUUID(), transactionId: randomUUID(), launchUrl: "https://privateid.example.test/other",
+			status: "created" as const, created: Date.now(), expires: Date.now() + 300_000 };
+		storePrivateIDSession(decoy);
+		const fixture = await statusApp(subject.oidcSubject, true);
+		const puid = randomUUID();
+		try {
+			const url = `/v1/authenticators/privateid/enroll/${flow.transactionId}/status`;
+			const providerEvent = () => fixture.app.inject({ method: "POST", url: "/privateid/webhook",
+				headers: { "x-storythink-webhook-secret": "privateid-webhook-secret" },
+				payload: { status: "SUCCESS", transactionID: flow.transactionId, sessionId: flow.sessionId, puid } });
+			if (webhookFirst) expect((await providerEvent()).statusCode).toBe(200);
+			const redirect = await fixture.app.inject({ url: "/privateid/callback?reason=success" });
+			expect(redirect.statusCode).toBe(200);
+			expect(redirect.headers["content-type"]).toContain("text/html");
+			expect(redirect.headers["cache-control"]).toBe("no-store");
+			expect(redirect.body).toContain('sessionStorage.getItem("hapi.faceEnrollment")');
+			expect(redirect.body).toContain("Unable to resume enrollment");
+			expect(getCurrentPrivateIDSessionRecord()!.session).toEqual(decoy);
+			const status = await fixture.app.inject({ url, headers: fixture.headers });
+			expect(status.json().status).toBe(webhookFirst ? "COMPLETED" : "PENDING");
+			expect(Object.keys(status.json()).sort()).toEqual(["guidance", "status"]);
+			expect(await authenticators.findByUser(subject.id)).toHaveLength(webhookFirst ? 1 : 0);
+			if (!webhookFirst) expect((await providerEvent()).statusCode).toBe(200);
+			for (let poll = 0; poll < 3; poll += 1) {
+				const response = await fixture.app.inject({ url, headers: fixture.headers });
+				expect(response.json()).toMatchObject({ status: "COMPLETED" });
+				expect(response.body).not.toContain(puid);
+				expect(response.body).not.toContain(subject.id);
+			}
+			expect((await providerEvent()).json()).toMatchObject({ alreadyEnrolled: true });
+			expect(await authenticators.findByUser(subject.id)).toHaveLength(1);
+			expect(await snapshot(subject.id)).toEqual(before);
+			const audit = (await pool.query("SELECT * FROM authenticator_enrollment_audit WHERE identity_subject_id=$1", [subject.id])).rows;
+			expect(JSON.stringify(audit)).not.toContain(puid);
+			expect(fixture.logs.join("")).not.toContain(puid);
+		} finally { await fixture.app.close(); }
+	});
+	it("H5.1 concurrent status reads and authenticated webhook completion commit exactly one attachment", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject), fixture = await statusApp(subject.oidcSubject);
+		const url = `/v1/authenticators/privateid/enroll/${flow.transactionId}/status`;
+		try {
+			const reads = Array.from({ length: 8 }, () => fixture.app.inject({ url, headers: fixture.headers }));
+			const webhook = fixture.app.inject({ method: "POST", url: "/privateid/webhook",
+				headers: { "x-storythink-webhook-secret": "privateid-webhook-secret" },
+				payload: { status: "SUCCESS", transactionID: flow.transactionId, puid: randomUUID() } });
+			const results = await Promise.all([...reads, webhook]);
+			for (const response of results.slice(0, -1)) {
+				expect(response.statusCode).toBe(200);
+				expect(["PENDING", "COMPLETED"]).toContain(response.json().status);
+			}
+			expect(results.at(-1)!.statusCode).toBe(200);
+			expect((await fixture.app.inject({ url, headers: fixture.headers })).json().status).toBe("COMPLETED");
+			expect(await authenticators.findByUser(subject.id)).toHaveLength(1);
+		} finally { await fixture.app.close(); }
+	});
+	it("H5.1 rejects another subject, client, tenant or application reading a binding", async () => {
+		const target = await seed(), other = await seed(), flow = await pending(target.oidcSubject);
+		const otherBrowser = await statusApp(other.oidcSubject);
+		const targetBrowser = await statusApp(target.oidcSubject);
+		const url = `/v1/authenticators/privateid/enroll/${flow.transactionId}/status`;
+		try {
+			expect((await otherBrowser.app.inject({ url, headers: otherBrowser.headers })).statusCode).toBe(404);
+			const wrongClient = await statusApp(target.oidcSubject, false, { clientId: otherClientId });
+			try { expect((await wrongClient.app.inject({ url, headers: wrongClient.headers })).statusCode).toBe(403); }
+			finally { await wrongClient.app.close(); }
+		} finally { await otherBrowser.app.close(); }
+		await expect(service.status(flow.transactionId, authority(other.oidcSubject))).rejects.toMatchObject({ statusCode: 404 });
+		await expect(service.status(flow.transactionId, authority(target.oidcSubject, { clientId: otherClientId }))).rejects.toMatchObject({ statusCode: 403 });
+		const sameApplicationClient = "same-app-" + randomUUID();
+		await h1.clients.upsert({ id: randomUUID(), applicationId, clientId: sameApplicationClient, clientSecret: "fixture-secret",
+			redirectUris: ["https://rp.example/callback"], scopes: ["openid"], grantTypes: ["authorization_code"],
+			responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
+		await expect(service.status(flow.transactionId, authority(target.oidcSubject, { clientId: sameApplicationClient }))).rejects.toMatchObject({ statusCode: 403 });
+		for (const [column, wrong, original] of [["tenant_id", otherTenant, tenantId], ["application_id", otherApplication, applicationId]]) {
+			await pool.query(`UPDATE hapi_face_enrollment_bindings SET ${column}=$2 WHERE session_id=$1`, [flow.sessionId, wrong]);
+			try {
+				await expect(service.status(flow.transactionId, authority(target.oidcSubject))).rejects.toMatchObject({ statusCode: 403 });
+				expect((await targetBrowser.app.inject({ url, headers: targetBrowser.headers })).statusCode).toBe(403);
+			}
+			finally { await pool.query(`UPDATE hapi_face_enrollment_bindings SET ${column}=$2 WHERE session_id=$1`, [flow.sessionId, original]); }
+		}
+		await targetBrowser.app.close();
+		expect(await authenticators.findByUser(target.id)).toHaveLength(0);
+	});
+	it("H5.1 revalidates suspended tenant, application and canonical subject on status reads", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject);
+		for (const [table, id, disabled, active] of [["tenants", tenantId, "suspended", "active"],
+			["applications", applicationId, "suspended", "active"], ["identity_subjects", subject.id, "DISABLED", "ACTIVE"]]) {
+			await pool.query(`UPDATE ${table} SET status=$2 WHERE id=$1`, [id, disabled]);
+			try { await expect(service.status(flow.transactionId, authority(subject.oidcSubject))).rejects.toMatchObject({ statusCode: 403 }); }
+			finally { await pool.query(`UPDATE ${table} SET status=$2 WHERE id=$1`, [id, active]); }
+		}
+	});
+	it("H5.1 expiry and repeated polling are read-only and cannot attach an authenticator", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject), before = await snapshot(subject.id);
+		const beforeAudit = (await pool.query("SELECT * FROM authenticator_enrollment_audit WHERE identity_subject_id=$1", [subject.id])).rows;
+		for (let poll = 0; poll < 3; poll += 1) expect(await service.status(flow.transactionId, authority(subject.oidcSubject))).toMatchObject({ body: { status: "PENDING" } });
+		await pool.query("UPDATE privateid_enrollment_transactions SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE provider_transaction_id=$1", [flow.transactionId]);
+		expect(await service.status(flow.transactionId, authority(subject.oidcSubject))).toMatchObject({ statusCode: 410, body: { status: "EXPIRED" } });
+		expect((await pool.query("SELECT status FROM privateid_enrollment_transactions WHERE provider_transaction_id=$1", [flow.transactionId])).rows[0].status).toBe("pending");
+		expect(await authenticators.findByUser(subject.id)).toHaveLength(0);
+		expect(await snapshot(subject.id)).toEqual(before);
+		expect((await pool.query("SELECT * FROM authenticator_enrollment_audit WHERE identity_subject_id=$1", [subject.id])).rows).toEqual(beforeAudit);
+	});
+	it("H5.1 status rechecks expiry after waiting for a completion lock", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject), blocker = await pool.connect();
+		try {
+			await pool.query("UPDATE privateid_enrollment_transactions SET expires_at=clock_timestamp()+INTERVAL '150 milliseconds' WHERE provider_transaction_id=$1", [flow.transactionId]);
+			await blocker.query("BEGIN");
+			await blocker.query("SELECT id FROM identity_subjects WHERE id=$1 FOR UPDATE", [subject.id]);
+			const waiting = service.status(flow.transactionId, authority(subject.oidcSubject));
+			await new Promise(resolve => setTimeout(resolve, 250));
+			await blocker.query("COMMIT");
+			expect(await waiting).toMatchObject({ statusCode: 410, body: { status: "EXPIRED" } });
+			expect(await authenticators.findByUser(subject.id)).toHaveLength(0);
+		} finally { await blocker.query("ROLLBACK"); blocker.release(); }
+	});
+	it("H5.1 terminal failure, conflict and completion stay immutable under later callbacks or webhooks", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject);
+		await service.webhook(flow.transactionId, flow.sessionId, "FAILURE", undefined);
+		expect(await service.status(flow.transactionId, authority(subject.oidcSubject))).toMatchObject({ body: { status: "FAILED" } });
+		await service.webhook(flow.transactionId, randomUUID(), "SUCCESS", randomUUID());
+		expect(await complete(flow)).toMatchObject({ statusCode: 409 });
+		expect(await service.status(flow.transactionId, authority(subject.oidcSubject))).toMatchObject({ body: { status: "FAILED" } });
+		const owner = await seed(), target = await seed(), puid = randomUUID();
+		await complete(await pending(owner.oidcSubject), puid);
+		const conflict = await pending(target.oidcSubject);
+		await complete(conflict, puid);
+		expect(await service.status(conflict.transactionId, authority(target.oidcSubject))).toMatchObject({ body: { status: "CONFLICT" } });
+		expect(await complete(conflict, randomUUID())).toMatchObject({ statusCode: 409 });
+		expect(await service.status(conflict.transactionId, authority(target.oidcSubject))).toMatchObject({ body: { status: "CONFLICT" } });
+		expect(await authenticators.findByUser(target.id)).toHaveLength(0);
+		const completed = await pending(subject.oidcSubject);
+		await complete(completed);
+		expect(await service.webhook(completed.transactionId, completed.sessionId, "FAILURE", undefined)).toMatchObject({ statusCode: 409 });
+		expect(await service.status(completed.transactionId, authority(subject.oidcSubject))).toMatchObject({ body: { status: "COMPLETED" } });
 	});
 	it("email login, real enrollment, Face login, token and userinfo all resolve the identical canonical subject", async () => {
 		const subject = await seed();
@@ -498,15 +659,24 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 				code_challenge: createHash("sha256").update(verifier).digest("base64url")
 			}) });
 			expect(authorized.statusCode, authorized.body).toBe(302);
+			const browserCookie = String(authorized.headers["set-cookie"]).split(";")[0];
+			expect(authorized.headers["set-cookie"]).toContain("HttpOnly");
+			expect(authorized.headers["set-cookie"]).toContain("Secure");
 			const faceSession = getCurrentPrivateIDSessionRecord()!.session;
 			const faceWebhook = await app.inject({ method: "POST", url: "/privateid/webhook",
 				headers: { "x-storythink-webhook-secret": "privateid-webhook-secret" },
 				payload: { status: "SUCCESS", sessionId: faceSession.sessionId, transactionID: faceSession.transactionId, puid } });
 			expect(faceWebhook.statusCode, faceWebhook.body).toBe(200);
 			const faceAuthenticatedAt = getCurrentPrivateIDSessionRecord()!.authenticatedUser!.authenticatedAt!;
-			const callback = await app.inject({ method: "GET", url: `/privateid/callback?reason=success&sessionId=${faceSession.sessionId}&transactionID=${faceSession.transactionId}` });
+			const unrelated = { sessionId: randomUUID(), transactionId: randomUUID(), launchUrl: "https://privateid.example.test/unrelated",
+				status: "created" as const, created: Date.now(), expires: Date.now() + 300_000 };
+			storePrivateIDSession(unrelated);
+			markHapiFaceEnrollmentSession(unrelated.sessionId);
+			const callback = await app.inject({ method: "GET", url: "/privateid/callback?reason=success", headers: { cookie: browserCookie } });
 			expect(callback.statusCode, callback.body).toBe(302);
-			expect(getCurrentPrivateIDSessionRecord()!.authenticatedUser!.authenticatedAt).toBe(faceAuthenticatedAt);
+			expect(callback.headers["set-cookie"]).toContain("Max-Age=0");
+			expect(findPrivateIDSession(faceSession.sessionId)!.authenticatedUser!.authenticatedAt).toBe(faceAuthenticatedAt);
+			expect(getCurrentPrivateIDSessionRecord()!.session).toEqual(unrelated);
 			const code = new URL(String(callback.headers.location)).searchParams.get("code")!;
 			const tokens = await app.inject({ method: "POST", url: "/token", headers, payload: {
 				grant_type: "authorization_code", code, redirect_uri: "https://rp.example/callback", code_verifier: verifier

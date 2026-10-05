@@ -1,3 +1,4 @@
+import { faceEnrollmentContinuation } from "../authenticators/FaceEnrollmentContinuation.js";
 import type { FastifyInstance } from "fastify";
 
 import { configuration } from "../config/ConfigurationService.js";
@@ -16,7 +17,10 @@ import {
 		storePrivateIDIdentityContext,
 		storePrivateIDResult,
 		updatePrivateIDSessionStatus,
-		hasPendingAuthorizationRequest
+		hasPendingAuthorizationRequest,
+		findPrivateIDBrowserReturn,
+		clearPrivateIDBrowserReturn,
+		PRIVATEID_BROWSER_RETURN_COOKIE
 } from "../privateid/PrivateIDSessionStore.js";
 import { consumeByCorrelationId, findCorrelationIdForSession } from "../oidc/CorrelationStore.js";
 import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
@@ -548,9 +552,21 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 				const correlationId = resolveCorrelationId(requestId, request.headers as unknown as Record<string, unknown>);
 
 				const reason = pickQueryValue(query, ["reason", "status", "result"]);
-				const sessionId = pickQueryValue(query, ["sessionId", "session_id", "sid"]);
-				const transactionId = pickQueryValue(query, ["transactionId", "transaction_id", "txId", "txnId"]);
+				let sessionId = pickQueryValue(query, ["sessionId", "session_id", "sid"]);
+				let transactionId = pickQueryValue(query, ["transactionId", "transaction_id", "txId", "txnId"]);
+				const browserReturn = !sessionId && !transactionId ? findPrivateIDBrowserReturn(request.headers.cookie) : undefined;
+				if (browserReturn) {
+					sessionId = browserReturn.session.sessionId;
+					transactionId = browserReturn.session.transactionId;
+				}
 				let callbackSessionId = sessionId;
+				const sendContinuation = () => {
+					const continuation = faceEnrollmentContinuation();
+					return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer")
+						.header("Content-Security-Policy", continuation.contentSecurityPolicy)
+						.type("text/html; charset=utf-8").send(continuation.html);
+				};
+				if (faceEnrollment && !sessionId && !transactionId) return sendContinuation();
 
 				if (!reason) {
 						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
@@ -563,10 +579,14 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 
 				if (faceEnrollment) {
 						const result = await dispatchFaceEnrollment(() => faceEnrollment.callback(transactionId, sessionId));
-						if (result) return reply.code(result.statusCode).send(result.body);
+						if (result) return result.statusCode === 200 ? sendContinuation() : reply.code(result.statusCode).send(result.body);
 				}
 
 				if (reason.trim().toLowerCase() !== "success") {
+					if (browserReturn) {
+						clearPrivateIDBrowserReturn(request.headers.cookie);
+						reply.header("Set-Cookie", `${PRIVATEID_BROWSER_RETURN_COOKIE}=; Path=/privateid/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+					}
 						app.log.info({ requestId, correlationId, sessionId: callbackSessionId, reason }, "PrivateID callback processed");
 					reply.code(200);
 					reply.type("text/plain");
@@ -698,6 +718,10 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 				}
 
 				const redirectUrl = await oidcService.resumePendingAuthorization(resolvedRecord.session.sessionId);
+				if (browserReturn) {
+					clearPrivateIDBrowserReturn(request.headers.cookie);
+					reply.header("Set-Cookie", `${PRIVATEID_BROWSER_RETURN_COOKIE}=; Path=/privateid/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+				}
 				if (redirectUrl) {
 						reply.redirect(redirectUrl, 302);
 						return;

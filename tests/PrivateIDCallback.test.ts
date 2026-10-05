@@ -5,6 +5,41 @@ import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
+import { clearPrivateIDBrowserReturn, findPrivateIDBrowserReturn, markHapiFaceEnrollmentSession,
+	PRIVATEID_BROWSER_RETURN_COOKIE, storePrivateIDBrowserReturn } from "../src/privateid/PrivateIDSessionStore.js";
+
+describe("H5.1 browser-bound legacy OIDC context", () => {
+	it("selects its own OIDC session, never the latest unrelated session, and clears on consumption", async () => {
+		const { app } = await buildOidcTestApp();
+		try {
+			const client = new PrivateIDClient();
+			const own = await client.createAuthenticationSession(randomUUID());
+			const handle = storePrivateIDBrowserReturn(own.sessionId)!;
+			const cookie = `${PRIVATEID_BROWSER_RETURN_COOKIE}=${handle}`;
+			const unrelated = await client.createAuthenticationSession(randomUUID());
+			expect(findPrivateIDBrowserReturn(cookie)?.session.sessionId).toBe(own.sessionId);
+			expect(findPrivateIDBrowserReturn(cookie)?.session.sessionId).not.toBe(unrelated.sessionId);
+			expect(findPrivateIDBrowserReturn(`${PRIVATEID_BROWSER_RETURN_COOKIE}=unknown`)).toBeUndefined();
+			clearPrivateIDBrowserReturn(cookie);
+			expect(findPrivateIDBrowserReturn(cookie)).toBeUndefined();
+		} finally { await app.close(); }
+	});
+	it("rejects HAPI enrollment context and expires a browser return after its short lifetime", async () => {
+		const { app } = await buildOidcTestApp();
+		try {
+			const client = new PrivateIDClient();
+			const enrollment = await client.createEnrollmentSession(randomUUID());
+			markHapiFaceEnrollmentSession(enrollment.sessionId);
+			expect(storePrivateIDBrowserReturn(enrollment.sessionId)).toBeUndefined();
+			const session = await client.createAuthenticationSession(randomUUID());
+			const cookie = `${PRIVATEID_BROWSER_RETURN_COOKIE}=${storePrivateIDBrowserReturn(session.sessionId)}`;
+			const future = Date.now() + 300_001;
+			const clock = vi.spyOn(Date, "now").mockReturnValue(future);
+			try { expect(findPrivateIDBrowserReturn(cookie)).toBeUndefined(); }
+			finally { clock.mockRestore(); }
+		} finally { await app.close(); }
+	});
+});
 
 describe("PrivateID callback", () => {
 		it("returns UserAuthenticator not found when callback has no matching session", async () => {

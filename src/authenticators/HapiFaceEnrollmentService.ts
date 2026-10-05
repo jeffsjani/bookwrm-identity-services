@@ -1,6 +1,6 @@
 import type { PrivateIDSession } from "../privateid/PrivateIDSession.js";
 import {
-	FaceEnrollmentError, requireRecentEmailAuthority,
+	FaceEnrollmentError, requireRecentEmailAuthority, requireStatusAuthority,
 	type FaceEnrollmentAuthority, type FaceEnrollmentCallbacks, type FaceEnrollmentRepository
 } from "./FaceEnrollmentTypes.js";
 
@@ -42,6 +42,12 @@ export class HapiFaceEnrollmentService implements FaceEnrollmentCallbacks {
 
 	webhook(transactionId: string | undefined, sessionId: string | undefined, status: string, puid: string | undefined) {
 		return this.repository.webhook(transactionId, sessionId, status, puid, this.enabled);
+	}
+
+	status(enrollmentId: string, authority: FaceEnrollmentAuthority) {
+		if (!this.enabled) throw new FaceEnrollmentError("FACE_ENROLLMENT_DISABLED", 404);
+		requireStatusAuthority(authority);
+		return this.repository.status(enrollmentId, authority);
 	}
 
 	callback(transactionId: string | undefined, sessionId: string | undefined) {

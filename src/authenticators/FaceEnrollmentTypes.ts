@@ -29,8 +29,18 @@ export type FaceEnrollmentReservation =
 
 export type FaceEnrollmentReply = { statusCode: number; body: Record<string, unknown> };
 
+export type FaceEnrollmentStatus = "PENDING" | "COMPLETED" | "FAILED" | "CONFLICT" | "EXPIRED";
+
+export function requireStatusAuthority(authority: FaceEnrollmentAuthority, now = Date.now()): void {
+	if (!Number.isFinite(authority.expiresAt) || authority.expiresAt <= now ||
+		!authority.sub || !authority.clientId || !authority.scope.split(" ").includes("openid")) {
+		throw new FaceEnrollmentError("UNAUTHORIZED", 401);
+	}
+}
+
 export interface FaceEnrollmentRepository {
 	reserve(authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReservation>;
+	status(enrollmentId: string, authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReply>;
 	bind(reservation: Extract<FaceEnrollmentReservation, { alreadyEnrolled: false }>,
 		session: PrivateIDSession): Promise<string>;
 	fail(providerTransactionId: string): Promise<void>;

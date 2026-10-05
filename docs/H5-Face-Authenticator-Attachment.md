@@ -98,11 +98,18 @@ When H5 dispatch is installed, explicit unknown/mismatched identifiers no longer
 fall back to the process's current legacy session. Valid legacy/OIDC correlation
 and APIs remain intact.
 
-`GET /privateid/callback` recognizes durable H5 bindings and reports their persisted
-enrollment status; it cannot attach Face or issue a login code. Browser success
-parameters are not provider evidence. The shared provider callback may run before
-the webhook and return `pending`; inspect again after provider completion. No UI
-integration is included.
+`GET /privateid/callback` is a non-authoritative continuation. PrivateID is not
+required to return a transaction ID, session ID, state, or PUID to the browser.
+HAPI enrollment completion is driven only by the authenticated provider webhook.
+The caller retains its own opaque enrollment identifier before launching PrivateID.
+See the H5.1 continuation contract below. Face OIDC `/authorize` independently sets
+a random, short-lived HttpOnly/Secure/SameSite=Lax browser return cookie referring
+only to that OIDC session. Identifier-free legacy Face-login returns use that cookie,
+not the latest global session; success/cancel clears it. This state remains
+process-local like the existing pending OIDC authorization/session state. H5 start
+clears that OIDC cookie and never uses it as enrollment authority. Explicitly
+correlated legacy callbacks retain their existing behavior. Identifier-free returns
+without an OIDC cookie with the H5 dispatcher installed show the safe continuation.
 
 Database completion locks the canonical subject and enrollment transaction in a
 consistent order, then serializes absent-row PUID claims with a transaction-scoped
@@ -124,6 +131,60 @@ An audit failure rolls back the entire attachment.
 - Concurrent cross-subject same-PUID completion: one winner, one conflict.
 
 ## Canonical identity and authentication continuity
+
+### H5.1 authenticated status and browser continuation
+
+`GET /v1/authenticators/privateid/enroll/:enrollmentId/status` requires an unexpired
+HAPI bearer access token with `openid`. The opaque `enrollmentId` is the provider
+transaction UUID returned by the enrollment start response. Caller-supplied tenant,
+application, subject, or client query fields are rejected.
+
+The repository checks the canonical subject, exact client, active application and
+tenant, and the persisted binding under the same subject-first lock order used by
+webhook completion. Status reads neither attach an authenticator nor change the
+binding, enrollment transaction, identity, account links, provenance, or audit.
+Expired read authority returns 401; another subject returns 404; a mismatched or
+inactive client/application/tenant returns 403. Expired ceremonies return HTTP 410
+with `status: "EXPIRED"` without rewriting terminal transaction state.
+
+Successful responses contain only `status` and `guidance`. Status is `PENDING`,
+`COMPLETED`, `FAILED`, or `CONFLICT`. Existing transaction states remain `pending`,
+`completed`, `failed`, and `expired`; terminal ownership audit outcomes distinguish
+public `CONFLICT` from `FAILED`. Later invalid webhook attempts cannot relabel an
+already terminal failure. Historical generic conflicts remain readable as conflicts
+without reconstructing their PUID or owner.
+
+Before launching the provider in a child browser window, the same-origin HAPI caller
+stores only the start response's `{ enrollmentId, expiresAt }` as JSON under the
+`sessionStorage` key `hapi.faceEnrollment`. It must preserve the opener relationship
+for the built-in continuation; do not use `noopener`/`noreferrer` for that launch.
+The continuation requests its existing HAPI principal with a `postMessage` of type
+`hapi.faceEnrollment.authority-request`, including the retained `enrollmentId` and a
+random `requestId`. The caller must validate the source window, same origin, request,
+and its own pending enrollment before replying to that exact window/origin with
+`{ type: "hapi.faceEnrollment.authority", requestId, enrollmentId, accessToken }`.
+The token comes from the caller's current authenticated session, is held only in
+continuation memory, and must never be stored alongside the browser enrollment ID.
+
+The continuation accepts a reply only from its original same-origin opener with
+the matching request and enrollment ID. Missing context or authority produces a
+safe unable-to-resume/return-to-application state; it never guesses a session.
+Callers without an opener can instead resume their own authenticated UI and invoke
+the same status endpoint using their retained enrollment ID.
+
+Polling is every two seconds, capped at 60 requests/two minutes and the retained
+ceremony expiry, with a ten-second per-request timeout. Polling stops on completion,
+failure, conflict, expiry, authentication failure, or network error. A browser return
+before the webhook shows `PENDING`; a committed webhook completion is visible to
+subsequent reads. Browser `reason` does not control any persisted lifecycle state.
+
+Internal ownership-conflict outcomes are, in precedence order:
+`LEGACY_PROVIDER_SUBJECT_EXISTS`, `AUTHENTICATOR_OWNED_BY_OTHER_SUBJECT`,
+`AUTHENTICATOR_NOT_ACTIVE`, and `TARGET_HAS_DIFFERENT_ACTIVE_AUTHENTICATOR`.
+Public responses remain generic `ENROLLMENT_CONFLICT`. No schema migration, new
+secret, raw PUID logging, or persistent PUID diagnostic fingerprint is introduced.
+The earlier failed ceremony and its generic conflict audit are unchanged; its
+historical owner remains `NOT_RESOLVABLE`.
 
 The authenticator's `user_id` is the **existing `IdentitySubject.id` rendered as text**,
 not a product identifier and not `oidcSubject`. H5 never inserts or updates an
@@ -215,3 +276,19 @@ Local validation results:
 - Those 18 gated tests, run separately against fixture databases: **18 PASS**
   (H1 foundation: 3; registry/provenance/schema: 15).
 - Combined distinct regression coverage: **370 PASS**; no unresolved skipped suite.
+
+### Local H5.1 validation
+
+- `npm run build`: PASS in the working tree and isolated release snapshot.
+- H5/H5.1 focused coverage: **70 PASS**, including **37 PostgreSQL** tests.
+- Legacy callback coverage: **17 PASS**, including browser-bound bare-return
+  isolation and expiry; the PostgreSQL continuity test covers H4 -> Face -> H4.
+- Isolated full suite: **372 PASS**, with **18** legacy database-gated tests run
+  separately: **15 PASS** for registry/provenance/schema and **3 PASS** for H1.
+  Combined distinct release regression coverage: **390 PASS**, no unresolved skips.
+- Working-tree full suite: **370 PASS, 2 FAIL, 18 SKIP**. The two failures belong
+  only to the pre-existing modified H1 test. Release validation used its committed
+  `HEAD` version in a temporary snapshot; the user's file and untracked design
+  report were not changed or included in that snapshot.
+- No production deployment, activation, identity modification, or real Face
+  ceremony was performed. Live H5.1 validation remains separately approval-gated.

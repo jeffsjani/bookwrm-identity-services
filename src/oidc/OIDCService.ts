@@ -43,7 +43,8 @@ import { OIDCRateLimiter } from "./infrastructure/OIDCRateLimiter.js";
 import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
-import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser } from "../privateid/PrivateIDSessionStore.js";
+import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
+	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
 
 export type OIDCClient = Record<string, unknown>;
@@ -418,6 +419,9 @@ export class OIDCService {
 								}
 
 								const asyncSession = await beginAsyncAuthentication(correlationId);
+								const browserReturn = storePrivateIDBrowserReturn(asyncSession.sessionId);
+								if (browserReturn) reply.header("Set-Cookie",
+									`${PRIVATEID_BROWSER_RETURN_COOKIE}=${browserReturn}; Path=/privateid/callback; Max-Age=300; HttpOnly; Secure; SameSite=Lax`);
 
 								reply.redirect(asyncSession.launchUrl, 302);
 						} catch (err) {
