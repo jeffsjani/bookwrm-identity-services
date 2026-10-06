@@ -13,6 +13,7 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
   - `PRIVATEID_*` — PrivateID API credentials, redirect/callback URLs, webhook shared secret.
   - `BASE44_BASE_URL`, `IDENTITY_API_PATH`, `BOOKWRM_IDENTITY_API_KEY` — legacy Bookwrm-facing routes only (`routes/identity.ts`); not used by the OIDC login path since Phase 3.
 - On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` and `GET /identity/admin/health` gate readiness.
+- `GET /health/ready` returns 503 only when a core HAPI dependency fails: configuration, Redis (when `REDIS_ENABLED`), Postgres (`SELECT 1`, 2s bound, when `IDENTITY_REGISTRY_DRIVER=postgres`), OIDC signing keys, or the OIDC provider. The Base44 identity platform is a relying-application adapter: its health is probed in the background (at most once per 30s, never awaited by the readiness request) and reported as `dependencies.base44` = `unknown` | `healthy` | `degraded` (timeout, circuit open, 5xx) | `unavailable` (rejected, e.g. 401/403/404). Status transitions are logged as `DEPENDENCY_HEALTH_CHANGED`.
 - The `identity_subjects` and `schema_migrations` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` at process startup in `server.ts` — no separate migration step is required for this table today.
 
 ## 1.1 PrivateID Authentication Provider
