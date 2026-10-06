@@ -100,14 +100,6 @@ function resolveCorrelationId(requestId: string, headers: Record<string, unknown
 				?? requestId;
 }
 
-function redactProviderSubject(providerSubject: string): string {
-		if (providerSubject.length <= 8) {
-				return `${providerSubject}...`;
-		}
-
-		return `${providerSubject.slice(0, 8)}...`;
-}
-
 // Legacy Bookwrm-native path only (no correlationId): still sources identity from Base44's IdentityContext, unchanged.
 function createBookwrmLegacyAuthenticatedUser(privateIdUserId: string, fallbackSessionId: string, fallbackTransactionId: string, identityContext?: IdentityContext): AuthenticatedUser {
 		const fallbackName = configuration.get("PRIVATEID_FALLBACK_NAME", "PrivateID User") ?? "PrivateID User";
@@ -177,7 +169,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 									transactionId: responseContext.transactionId,
 									status: responseContext.parsedStatus,
 									sharedSecretValidated: responseContext.sharedSecretValidated ?? false,
-									resolvedUserId: responseContext.resolvedUserId,
+									resolvedUserIdPresent: Boolean(responseContext.resolvedUserId),
 									sessionCompleted: responseContext.sessionCompleted,
 									responseCode
 								},
@@ -459,7 +451,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 													requestId,
 													sessionId: record.session.sessionId,
 													transactionId: record.session.transactionId,
-													rawResponse: body
+													topLevelKeys: Object.keys(body)
 											},
 											"PrivateID SUCCESS webhook could not be correlated to a pending OIDC authorization"
 									);
@@ -512,7 +504,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 									storePrivateIDIdentityContext(record.session.sessionId, identityContext);
 									resolvedIdentityContext = identityContext.data;
 							} catch (error) {
-									app.log.warn({ error, privateIdUserId }, "Identity resolution failed during PrivateID webhook processing");
+									app.log.warn({ error, requestId, providerSubjectPresent: Boolean(privateIdUserId) }, "Identity resolution failed during PrivateID webhook processing");
 							}
 
 							authenticatedUser = createBookwrmLegacyAuthenticatedUser(privateIdUserId, record.session.sessionId, record.session.transactionId, resolvedIdentityContext);
@@ -520,11 +512,17 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 
 						storePrivateIDAuthenticatedUser(record.session.sessionId, authenticatedUser);
 						responseContext.sessionCompleted = true;
-						// TEMPORARY RELEASE PATCH 6.2.3
-						// REMOVE AFTER PRODUCTION PAT VERIFICATION
-						app.log.info(
-								`providerSubject=${redactProviderSubject(privateIdUserId)} oidcSubject=${authenticatedUser.sub} emailPresent=${typeof authenticatedUser.email === "string" && authenticatedUser.email.length > 0} emailVerified=${authenticatedUser.emailVerified === true}`
-						);
+						// Never log raw PrivateID PUIDs/provider subjects or resolved user identifiers: presence and outcome only.
+						app.log.info({
+								event: "privateid_webhook_identity_resolved",
+								requestId,
+								correlationId,
+								providerSubjectPresent: Boolean(privateIdUserId),
+								oidcSubjectPresent: typeof authenticatedUser.sub === "string" && authenticatedUser.sub.length > 0,
+								emailPresent: typeof authenticatedUser.email === "string" && authenticatedUser.email.length > 0,
+								emailVerified: authenticatedUser.emailVerified === true,
+								outcome: "success"
+						}, "PrivateID webhook identity resolved");
 				} else if (status === "FAILURE") {
 						updatePrivateIDSessionStatus(record.session.sessionId, "failed", Date.now());
 						responseContext.sessionCompleted = true;

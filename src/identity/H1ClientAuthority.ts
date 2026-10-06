@@ -37,3 +37,15 @@ export async function authorizeH1Client(request: FastifyRequest, authority: H1Cl
 	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
 	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId };
 }
+
+// H6 Universal Login: the server already validated this client on GET /authorize, so its H1 authority is
+// resolved by identifier without any browser-held credential. Same eligibility as authorizeH1Client.
+export async function resolveH1ClientAuthority(clientId: string, authority: H1ClientAuthority):
+	Promise<AuthorizedH1Client & { tenantName: string }> {
+	const client = await authority.clients.findByClientId(clientId);
+	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none") throw new VerificationError("UNAUTHORIZED", 401);
+	const application = await authority.applications.findById(client.applicationId);
+	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;
+	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
+	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId, tenantName: tenant.name };
+}

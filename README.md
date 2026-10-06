@@ -19,6 +19,20 @@ It is disabled by default via `HAPI_FACE_ENROLLMENT_ENABLED=false`.
 See [H5 authority, API, migration, and validation guide](docs/H5-Face-Authenticator-Attachment.md).
 No production activation, deployment, or Base44 UI is included.
 
+## HAPI Universal Login
+
+H6 makes interactive `GET /authorize` render a HAPI-hosted sign-in page ("Sign in to
+{tenant}", secured by HAPI ID) where the user chooses **Email** (H4 OTP against an
+existing `HAPI_EMAIL` identity, `amr=["email"]`) or **Face** (the existing PrivateID
+Face login, `amr=["face","privateid"]`). The validated OIDC request (client, redirect_uri,
+state, nonce, scope, PKCE challenge) is held server-side in an opaque, single-use
+Authorization Interaction (Redis, 10-minute absolute expiry, `__Host-hapi_login` cookie)
+and resumed into the normal authorization-code redirect, so relying parties keep using
+`/token` and `/userinfo` unchanged. Face enrollment (H5) is never offered.
+`POST /authorize` with `authentication_result` remains the server-to-server H4 handoff.
+It is disabled by default via `HAPI_UNIVERSAL_LOGIN_ENABLED=false`, in which case
+`GET /authorize` keeps launching PrivateID Face directly.
+
 ## Overview
 
 This service provides identity-facing API routes backed by an internal client and service layer:

@@ -11,7 +11,8 @@ import { registerEmailVerificationRoutes } from "../../routes/emailVerification.
 import { PostgresVerificationChallengeRepository } from "./PostgresVerificationChallengeRepository.js";
 import { ResendEmailDeliveryProvider } from "./resend/ResendEmailDeliveryProvider.js";
 import { registerResendWebhook } from "./resend/ResendWebhookAdapter.js";
-import { authorizeH1Client } from "../../identity/H1ClientAuthority.js";
+import { authorizeH1Client, resolveH1ClientAuthority, type H1ClientAuthority } from "../../identity/H1ClientAuthority.js";
+import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "../../authentication/InteractiveEmailAuthentication.js";
 import { PostgresEmailAuthenticationRepository } from "../../authentication/email/PostgresEmailAuthenticationRepository.js";
 import { EmailAuthenticationService } from "../../authentication/email/EmailAuthenticationService.js";
 import { EmailAuthenticationError } from "../../authentication/email/EmailAuthenticationTypes.js";
@@ -56,6 +57,23 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 			const authorized = await authorizeH1Client(request, authority);
 			if (authorized.clientId !== clientId) throw new EmailAuthenticationError();
 			return authentication.consumeResult(authorized, result);
-		}
+		},
+		interactive: interactiveEmailAuthentication(authentication, authority)
+	};
+}
+
+export function interactiveEmailAuthentication(authentication: EmailAuthenticationService,
+	authority: H1ClientAuthority): InteractiveEmailAuthentication {
+	// H4 receives exactly the H1 client authority shape it is certified with; tenantName is presentation-only.
+	const h1 = ({ context, clientId }: InteractiveEmailAuthority) => ({ context, clientId });
+	return {
+		authority: clientId => resolveH1ClientAuthority(clientId, authority),
+		start: (authorized, email) => authentication.start(h1(authorized), email),
+		resend: (authorized, challengeId) => authentication.resend(h1(authorized), challengeId),
+		async verify(authorized, challengeId, code) {
+			const { authenticationResult } = await authentication.verify(h1(authorized), challengeId, code);
+			return { authenticationResult };
+		},
+		consumeResult: (authorized, result) => authentication.consumeResult(h1(authorized), result)
 	};
 }

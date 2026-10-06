@@ -1,4 +1,4 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
 		createHash,
 		createPrivateKey,
@@ -46,6 +46,18 @@ import type { OIDCLogEntry } from "./types.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
 	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
+import {
+		AUTHORIZATION_INTERACTION_TTL_MS,
+		AuthorizationInteractionStore,
+		type AuthorizationInteraction,
+		type AuthorizationInteractionBinding
+} from "./AuthorizationInteractionStore.js";
+import { chooserPage, codePage, emailPage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
+import type { InteractiveEmailAuthority } from "../authentication/InteractiveEmailAuthentication.js";
+
+// __Host- prefix: Secure, host-only, Path=/ — the interaction handle cannot be scoped to another domain.
+const UNIVERSAL_LOGIN_COOKIE = "__Host-hapi_login";
+const universalLoginEmailSchema = z.string().trim().min(3).max(320).email();
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -164,6 +176,7 @@ export class OIDCService {
 		private readonly redisStore: RedisOIDCStore;
 		private readonly lockService: RedisLockService;
 		private readonly rateLimiter: OIDCRateLimiter;
+		private readonly interactions: AuthorizationInteractionStore;
 		private readonly keyRotationService: OIDCKeyRotationService;
 		private readonly providerAdapter = new RedisOIDCProviderAdapter();
 		private readonly metrics: OIDCMetrics = {
@@ -185,6 +198,7 @@ export class OIDCService {
 				this.lockService = new RedisLockService();
 				this.rateLimiter = new OIDCRateLimiter();
 				this.keyRotationService = new OIDCKeyRotationService();
+				this.interactions = new AuthorizationInteractionStore();
 		}
 
 		configureEmailAuthentication(handoff: EmailOIDCHandoff): void {
@@ -407,23 +421,14 @@ export class OIDCService {
 										const redirect = await this.issueAuthorizationRedirect(principal, pendingContext);
 										return { redirectUri: redirect };
 								}
-								this.authenticationProvider.setPendingAuthorizationContext?.(pendingContext);
-
-								// correlationId ties this authorization request to its PrivateID session without depending on Bookwrm.
-								const correlationId = randomUUID();
-								storeCorrelation(correlationId, pendingContext);
-
-								const beginAsyncAuthentication = this.authenticationProvider.beginAsyncAuthentication?.bind(this.authenticationProvider);
-								if (!beginAsyncAuthentication) {
-										throw new Error("Authentication provider does not support asynchronous authorization");
+								if (request.method === "GET" && this.isUniversalLoginEnabled()) {
+										const handle = await this.createAuthorizationInteraction(app, clientId, pendingContext, query);
+										reply.header("Cache-Control", "no-store");
+										reply.header("Set-Cookie", this.interactionCookie(handle));
+										reply.redirect("/login", 302);
+										return;
 								}
-
-								const asyncSession = await beginAsyncAuthentication(correlationId);
-								const browserReturn = storePrivateIDBrowserReturn(asyncSession.sessionId);
-								if (browserReturn) reply.header("Set-Cookie",
-									`${PRIVATEID_BROWSER_RETURN_COOKIE}=${browserReturn}; Path=/privateid/callback; Max-Age=300; HttpOnly; Secure; SameSite=Lax`);
-
-								reply.redirect(asyncSession.launchUrl, 302);
+								await this.beginFaceAuthorization(reply, pendingContext);
 						} catch (err) {
 								if (request.method === "POST") {
 										if (err instanceof EmailAuthenticationError || err instanceof VerificationError) {
@@ -450,6 +455,7 @@ export class OIDCService {
 								});
 						}
 				}});
+				this.registerUniversalLogin(app);
 				app.get("/jwks", async (request, reply) => {
 						const startedAt = Date.now();
 						let error = "";
@@ -1013,6 +1019,302 @@ export class OIDCService {
 				}
 
 				return redirectTarget.toString();
+		}
+
+		// Existing interactive PrivateID Face path, shared by flag-off GET /authorize and Universal Login "Continue with Face".
+		private async beginFaceAuthorization(reply: FastifyReply, pendingContext: PendingAuthorizationContext): Promise<void> {
+				this.authenticationProvider.setPendingAuthorizationContext?.(pendingContext);
+
+				// correlationId ties this authorization request to its PrivateID session without depending on Bookwrm.
+				const correlationId = randomUUID();
+				storeCorrelation(correlationId, pendingContext);
+
+				const beginAsyncAuthentication = this.authenticationProvider.beginAsyncAuthentication?.bind(this.authenticationProvider);
+				if (!beginAsyncAuthentication) {
+						throw new Error("Authentication provider does not support asynchronous authorization");
+				}
+
+				const asyncSession = await beginAsyncAuthentication(correlationId);
+				const browserReturn = storePrivateIDBrowserReturn(asyncSession.sessionId);
+				if (browserReturn) reply.header("Set-Cookie",
+					`${PRIVATEID_BROWSER_RETURN_COOKIE}=${browserReturn}; Path=/privateid/callback; Max-Age=300; HttpOnly; Secure; SameSite=Lax`);
+
+				reply.redirect(asyncSession.launchUrl, 302);
+		}
+
+		private isUniversalLoginEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_UNIVERSAL_LOGIN_ENABLED", false);
+		}
+
+		private interactionCookie(handle: string | null): string {
+				return handle
+						? `${UNIVERSAL_LOGIN_COOKIE}=${handle}; Path=/; Max-Age=${AUTHORIZATION_INTERACTION_TTL_MS / 1000}; HttpOnly; Secure; SameSite=Lax`
+						: `${UNIVERSAL_LOGIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+		}
+
+		private readInteractionHandle(request: FastifyRequest): string | undefined {
+				return request.headers.cookie?.split(";").map(value => value.trim())
+						.find(value => value.startsWith(`${UNIVERSAL_LOGIN_COOKIE}=`))?.slice(UNIVERSAL_LOGIN_COOKIE.length + 1);
+		}
+
+		private async createAuthorizationInteraction(app: FastifyInstance, clientId: string,
+				authorization: PendingAuthorizationContext, query: AuthorizationQuery): Promise<string> {
+				let binding: AuthorizationInteractionBinding | undefined;
+				const interactive = this.emailAuthentication?.interactive;
+				if (interactive) {
+						try {
+								const authority = await interactive.authority(clientId);
+								if (authority.context.applicationId) binding = {
+										tenantId: authority.context.tenantId,
+										applicationId: authority.context.applicationId,
+										tenantName: authority.tenantName
+								};
+						} catch (error) {
+								if (!(error instanceof VerificationError)) throw error;
+								app.log.warn({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE_FOR_CLIENT", clientId }, "Universal Login email unavailable for client");
+						}
+				}
+				const { handle } = await this.interactions.create({
+						clientId,
+						binding,
+						authorization,
+						request: {
+								client_id: clientId,
+								redirect_uri: authorization.redirectUri,
+								response_type: query.response_type ?? "",
+								scope: query.scope ?? "",
+								...(query.state !== undefined ? { state: query.state } : {}),
+								...(query.nonce !== undefined ? { nonce: query.nonce } : {}),
+								...(query.code_challenge !== undefined ? { code_challenge: query.code_challenge } : {}),
+								...(query.code_challenge_method !== undefined ? { code_challenge_method: query.code_challenge_method } : {})
+						}
+				});
+				app.log.info({ event: "UNIVERSAL_LOGIN_INTERACTION_CREATED", clientId, emailAvailable: Boolean(binding) }, "Universal Login interaction created");
+				return handle;
+		}
+
+		// The client and redirect_uri bound at GET /authorize must still be registered when the interaction completes.
+		private async interactionClientStillValid(interaction: AuthorizationInteraction): Promise<boolean> {
+				const client = await this.resolveClient(interaction.clientId);
+				if (!client || !this.clientAllowsAuthorizationCodeGrant(client)) return false;
+				const redirectUris = this.extractRedirectUris(client);
+				return redirectUris.length === 0 || redirectUris.includes(interaction.authorization.redirectUri);
+		}
+
+		private async interactiveEmailAuthority(interaction: AuthorizationInteraction): Promise<InteractiveEmailAuthority | null> {
+				const interactive = this.emailAuthentication?.interactive;
+				if (!interactive || !interaction.binding) return null;
+				let authority: InteractiveEmailAuthority;
+				try {
+						authority = await interactive.authority(interaction.clientId);
+				} catch (error) {
+						if (error instanceof VerificationError) return null;
+						throw error;
+				}
+				return authority.clientId === interaction.clientId &&
+						authority.context.tenantId === interaction.binding.tenantId &&
+						authority.context.applicationId === interaction.binding.applicationId ? authority : null;
+		}
+
+		private registerUniversalLogin(app: FastifyInstance): void {
+				const send = (reply: FastifyReply, status: number, page: RenderedLoginPage) => reply.code(status)
+						.header("Cache-Control", "no-store").header("Pragma", "no-cache")
+						.header("Referrer-Policy", "no-referrer").header("X-Frame-Options", "DENY")
+						.header("Content-Security-Policy", page.contentSecurityPolicy)
+						.type("text/html; charset=utf-8").send(page.html);
+				const expired = (reply: FastifyReply) => {
+						reply.header("Set-Cookie", this.interactionCookie(null));
+						return send(reply, 400, messagePage({
+								title: "This sign-in request has expired",
+								message: "Return to the application you were signing in to and start again."
+						}));
+				};
+				const unavailable = (reply: FastifyReply) => send(reply, 503, messagePage({
+						title: "Sign-in is temporarily unavailable", message: "Please try again in a few minutes."
+				}));
+				const tooMany = (reply: FastifyReply, interaction: AuthorizationInteraction, page: "email" | "code") => send(reply, 429,
+						(page === "email" ? emailPage : codePage)({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+								error: "Too many attempts. Please wait a few minutes and try again." }));
+				const emailFailed = "We couldn't sign you in with that code. Check the code, request a new one, or use a different email.";
+				const statusOf = (error: unknown) => typeof (error as { statusCode?: unknown })?.statusCode === "number"
+						? (error as { statusCode: number }).statusCode : 500;
+				const logLogin = (request: FastifyRequest, flow: string, interaction: AuthorizationInteraction | null,
+						startedAt: number, success: boolean, error: string, user = "") => this.logOidcRequest(app, {
+						requestId: request.id, clientId: interaction?.clientId ?? "", flow, latency: Date.now() - startedAt,
+						success, error, user, pkce: interaction?.authorization.codeChallenge ? "S256" : "missing",
+						correlationId: this.correlationIdFor(request)
+				});
+				// Loads the live interaction for the browser and enforces the flag, CSRF and rate limits.
+				const load = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean) => {
+						if (!this.isUniversalLoginEnabled()) {
+								reply.code(404).send({ error: "not_found" });
+								return null;
+						}
+						const handle = this.readInteractionHandle(request);
+						const interaction = await this.interactions.find(handle);
+						if (!interaction || !handle) {
+								expired(reply);
+								return null;
+						}
+						if (mutation) {
+								const body = (request.body ?? {}) as Record<string, unknown>;
+								if (!AuthorizationInteractionStore.csrfMatches(interaction, body.csrf)) {
+										expired(reply);
+										return null;
+								}
+								await this.rateLimiter.assertWithinLimits({ ip: request.ip, clientId: interaction.clientId, userId: "" });
+						}
+						return { handle, interaction, body: (request.body ?? {}) as Record<string, unknown> };
+				};
+
+				app.get("/login", async (request, reply) => {
+						const loaded = await load(request, reply, false);
+						if (!loaded) return reply;
+						const { interaction } = loaded;
+						return send(reply, 200, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive) }));
+				});
+
+				app.get("/login/email", async (request, reply) => {
+						const loaded = await load(request, reply, false);
+						if (!loaded) return reply;
+						const { interaction } = loaded;
+						if (!interaction.binding || !this.emailAuthentication?.interactive) return reply.redirect("/login", 303);
+						return send(reply, 200, emailPage({ tenantName: interaction.binding.tenantName, csrf: interaction.csrf }));
+				});
+
+				app.post("/login/email", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true);
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								const authority = await this.interactiveEmailAuthority(interaction);
+								if (!authority) return expired(reply);
+								const email = universalLoginEmailSchema.safeParse(loaded.body.email);
+								if (!email.success) {
+										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+												error: "Enter a valid email address." }));
+								}
+								const started = await this.emailAuthentication!.interactive!.start(authority, email.data);
+								if (!await this.interactions.save(loaded.handle, { ...interaction, email: { challengeId: started.challengeId } })) {
+										return expired(reply);
+								}
+								logLogin(request, "universal_login_email_start", interaction, startedAt, true, "");
+								return reply.header("Cache-Control", "no-store").redirect("/login/email/code", 303);
+						} catch (error) {
+								logLogin(request, "universal_login_email_start", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
+								if (interaction && statusOf(error) === 429) return tooMany(reply, interaction, "email");
+								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
+										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+												error: "Enter a valid email address." }));
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email start failed");
+								return unavailable(reply);
+						}
+				});
+
+				app.get("/login/email/code", async (request, reply) => {
+						const loaded = await load(request, reply, false);
+						if (!loaded) return reply;
+						const { interaction } = loaded;
+						if (!interaction.email) return reply.redirect("/login/email", 303);
+						return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf }));
+				});
+
+				app.post("/login/email/resend", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true);
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								const authority = await this.interactiveEmailAuthority(interaction);
+								if (!authority || !interaction.email) return expired(reply);
+								await this.emailAuthentication!.interactive!.resend(authority, interaction.email.challengeId);
+								logLogin(request, "universal_login_email_resend", interaction, startedAt, true, "");
+								return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+										notice: "We sent a new code. Earlier codes no longer work." }));
+						} catch (error) {
+								logLogin(request, "universal_login_email_resend", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
+								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
+										return send(reply, statusOf(error) === 429 ? 429 : 400, codePage({ tenantName: interaction.binding?.tenantName,
+												csrf: interaction.csrf, error: statusOf(error) === 429
+														? "Please wait before requesting another code."
+														: "A new code can't be sent for this request. Use a different email or start again." }));
+								}
+								if (interaction && statusOf(error) === 429) return tooMany(reply, interaction, "code");
+								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email resend failed");
+								return unavailable(reply);
+						}
+				});
+
+				app.post("/login/email/code", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true);
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								const authority = await this.interactiveEmailAuthority(interaction);
+								if (!authority || !interaction.email || !await this.interactionClientStillValid(interaction)) return expired(reply);
+								const code = typeof loaded.body.code === "string" && loaded.body.code.length <= 128 ? loaded.body.code.trim() : "";
+								const interactive = this.emailAuthentication!.interactive!;
+								const { authenticationResult } = await interactive.verify(authority, interaction.email.challengeId, code);
+								// Single-use: only the request that wins the interaction may turn the H4 result into an authorization code.
+								const consumed = await this.interactions.consume(loaded.handle);
+								if (!consumed) {
+										logLogin(request, "universal_login_email", interaction, startedAt, false, "interaction_replayed");
+										return expired(reply);
+								}
+								const principal = await interactive.consumeResult(authority, authenticationResult);
+								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
+								logLogin(request, "universal_login_email", consumed, startedAt, true, "", principal.id);
+								reply.header("Set-Cookie", this.interactionCookie(null));
+								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
+						} catch (error) {
+								const failed = error instanceof VerificationError || error instanceof EmailAuthenticationError;
+								logLogin(request, "universal_login_email", interaction, startedAt, false,
+										failed ? "email_authentication_failed" : statusOf(error) === 429 ? "rate_limited" : "unavailable");
+								if (interaction && statusOf(error) === 429 && !failed) return tooMany(reply, interaction, "code");
+								if (interaction && failed) {
+										return send(reply, 401, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf, error: emailFailed }));
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email verification failed");
+								return unavailable(reply);
+						}
+				});
+
+				app.post("/login/face", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true);
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								if (!await this.interactionClientStillValid(interaction)) return expired(reply);
+								const consumed = await this.interactions.consume(loaded.handle);
+								if (!consumed) {
+										logLogin(request, "universal_login_face", interaction, startedAt, false, "interaction_replayed");
+										return expired(reply);
+								}
+								reply.header("Set-Cookie", this.interactionCookie(null));
+								reply.header("Cache-Control", "no-store");
+								await this.beginFaceAuthorization(reply, consumed.authorization);
+								logLogin(request, "universal_login_face", consumed, startedAt, true, "");
+								return reply;
+						} catch (error) {
+								logLogin(request, "universal_login_face", interaction, startedAt, false, statusOf(error) === 429 ? "rate_limited" : "unavailable");
+								if (interaction && statusOf(error) === 429) {
+										return send(reply, 429, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+												emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive),
+												error: "Too many attempts. Please wait a few minutes and try again." }));
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_FACE_UNAVAILABLE" }, "Universal Login face start failed");
+								return unavailable(reply);
+						}
+				});
 		}
 
 		// Resumes the same authorization-code path /authorize uses once a PrivateID session completes.
