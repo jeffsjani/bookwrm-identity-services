@@ -54,6 +54,7 @@ import {
 } from "./AuthorizationInteractionStore.js";
 import { chooserPage, codePage, emailPage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
 import type { InteractiveEmailAuthority } from "../authentication/InteractiveEmailAuthentication.js";
+import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
 
 // __Host- prefix: Secure, host-only, Path=/ — the interaction handle cannot be scoped to another domain.
 const UNIVERSAL_LOGIN_COOKIE = "__Host-hapi_login";
@@ -1090,6 +1091,8 @@ export class OIDCService {
 						}
 				});
 				app.log.info({ event: "UNIVERSAL_LOGIN_INTERACTION_CREATED", clientId, emailAvailable: Boolean(binding) }, "Universal Login interaction created");
+				logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_CREATED", route: "GET /authorize", clientId,
+					correlationId: diagnosticCorrelationId(handle), remainingTtlBucket: ">300s" });
 				return handle;
 		}
 
@@ -1145,20 +1148,39 @@ export class OIDCService {
 						correlationId: this.correlationIdFor(request)
 				});
 				// Loads the live interaction for the browser and enforces the flag, CSRF and rate limits.
-				const load = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean) => {
+				const load = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean, routeLabel: string) => {
 						if (!this.isUniversalLoginEnabled()) {
 								reply.code(404).send({ error: "not_found" });
 								return null;
 						}
 						const handle = this.readInteractionHandle(request);
+						const cookiePresent = Boolean(handle);
+						const correlationId = diagnosticCorrelationId(handle);
+						// Diagnostics-only read, captured before find()'s own expiry cleanup can delete the key.
+						const probe = handle ? await this.interactions.inspect(handle) : null;
 						const interaction = await this.interactions.find(handle);
 						if (!interaction || !handle) {
+								logUniversalLoginDiagnostic(app, {
+										event: "UNIVERSAL_LOGIN_INTERACTION_LOADED", route: routeLabel, correlationId, cookiePresent,
+										interactionFound: false,
+										remainingTtlBucket: probe ? bucketRemainingTtl(probe.remainingMs) : "unknown",
+										reasonCode: !cookiePresent ? "COOKIE_MISSING"
+												: probe?.state === "expired" ? "INTERACTION_EXPIRED"
+												: probe?.state === "consumed" ? "INTERACTION_ALREADY_CONSUMED"
+												: "INTERACTION_NOT_FOUND"
+								});
 								expired(reply);
 								return null;
 						}
+						logUniversalLoginDiagnostic(app, {
+								event: "UNIVERSAL_LOGIN_INTERACTION_LOADED", route: routeLabel, clientId: interaction.clientId, correlationId,
+								cookiePresent, interactionFound: true, remainingTtlBucket: bucketRemainingTtl(interaction.expiresAt - Date.now())
+						});
 						if (mutation) {
 								const body = (request.body ?? {}) as Record<string, unknown>;
 								if (!AuthorizationInteractionStore.csrfMatches(interaction, body.csrf)) {
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: routeLabel,
+												clientId: interaction.clientId, correlationId, csrfValid: false, reasonCode: "CSRF_MISMATCH" });
 										expired(reply);
 										return null;
 								}
@@ -1168,7 +1190,7 @@ export class OIDCService {
 				};
 
 				app.get("/login", async (request, reply) => {
-						const loaded = await load(request, reply, false);
+						const loaded = await load(request, reply, false, "GET /login");
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						return send(reply, 200, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
@@ -1176,7 +1198,7 @@ export class OIDCService {
 				});
 
 				app.get("/login/email", async (request, reply) => {
-						const loaded = await load(request, reply, false);
+						const loaded = await load(request, reply, false, "GET /login/email");
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						if (!interaction.binding || !this.emailAuthentication?.interactive) return reply.redirect("/login", 303);
@@ -1187,11 +1209,16 @@ export class OIDCService {
 						const startedAt = Date.now();
 						let interaction: AuthorizationInteraction | null = null;
 						try {
-								const loaded = await load(request, reply, true);
+								const loaded = await load(request, reply, true, "POST /login/email");
 								if (!loaded) return reply;
 								interaction = loaded.interaction;
+								const correlationId = diagnosticCorrelationId(loaded.handle);
 								const authority = await this.interactiveEmailAuthority(interaction);
-								if (!authority) return expired(reply);
+								if (!authority) {
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email",
+												clientId: interaction.clientId, correlationId, authorityValid: false, reasonCode: "AUTHORITY_INVALID" });
+										return expired(reply);
+								}
 								const email = universalLoginEmailSchema.safeParse(loaded.body.email);
 								if (!email.success) {
 										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
@@ -1199,9 +1226,13 @@ export class OIDCService {
 								}
 								const started = await this.emailAuthentication!.interactive!.start(authority, email.data);
 								if (!await this.interactions.save(loaded.handle, { ...interaction, email: { challengeId: started.challengeId } })) {
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email",
+												clientId: interaction.clientId, correlationId, authorityValid: true, reasonCode: "INTERACTION_SAVE_FAILED" });
 										return expired(reply);
 								}
 								logLogin(request, "universal_login_email_start", interaction, startedAt, true, "");
+								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_EMAIL_STARTED", route: "POST /login/email",
+										clientId: interaction.clientId, correlationId, authorityValid: true, authenticationMethod: "email" });
 								return reply.header("Cache-Control", "no-store").redirect("/login/email/code", 303);
 						} catch (error) {
 								logLogin(request, "universal_login_email_start", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
@@ -1216,7 +1247,7 @@ export class OIDCService {
 				});
 
 				app.get("/login/email/code", async (request, reply) => {
-						const loaded = await load(request, reply, false);
+						const loaded = await load(request, reply, false, "GET /login/email/code");
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						if (!interaction.email) return reply.redirect("/login/email", 303);
@@ -1227,7 +1258,7 @@ export class OIDCService {
 						const startedAt = Date.now();
 						let interaction: AuthorizationInteraction | null = null;
 						try {
-								const loaded = await load(request, reply, true);
+								const loaded = await load(request, reply, true, "POST /login/email/resend");
 								if (!loaded) return reply;
 								interaction = loaded.interaction;
 								const authority = await this.interactiveEmailAuthority(interaction);
@@ -1254,23 +1285,38 @@ export class OIDCService {
 						const startedAt = Date.now();
 						let interaction: AuthorizationInteraction | null = null;
 						try {
-								const loaded = await load(request, reply, true);
+								const loaded = await load(request, reply, true, "POST /login/email/code");
 								if (!loaded) return reply;
 								interaction = loaded.interaction;
+								const correlationId = diagnosticCorrelationId(loaded.handle);
 								const authority = await this.interactiveEmailAuthority(interaction);
-								if (!authority || !interaction.email || !await this.interactionClientStillValid(interaction)) return expired(reply);
+								const clientValid = await this.interactionClientStillValid(interaction);
+								if (!authority || !interaction.email || !clientValid) {
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email/code",
+												clientId: interaction.clientId, correlationId, authorityValid: Boolean(authority), clientValid,
+												reasonCode: !authority ? "AUTHORITY_INVALID" : !clientValid ? "CLIENT_INVALID" : "AUTHORITY_INVALID" });
+										return expired(reply);
+								}
 								const code = typeof loaded.body.code === "string" && loaded.body.code.length <= 128 ? loaded.body.code.trim() : "";
 								const interactive = this.emailAuthentication!.interactive!;
 								const { authenticationResult } = await interactive.verify(authority, interaction.email.challengeId, code);
+								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_EMAIL_VERIFIED", route: "POST /login/email/code",
+										clientId: interaction.clientId, correlationId, authorityValid: true, clientValid: true, authenticationMethod: "email" });
 								// Single-use: only the request that wins the interaction may turn the H4 result into an authorization code.
 								const consumed = await this.interactions.consume(loaded.handle);
 								if (!consumed) {
 										logLogin(request, "universal_login_email", interaction, startedAt, false, "interaction_replayed");
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email/code",
+												clientId: interaction.clientId, correlationId, reasonCode: "INTERACTION_ALREADY_CONSUMED" });
 										return expired(reply);
 								}
+								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_CONSUMED", route: "POST /login/email/code",
+										clientId: interaction.clientId, correlationId });
 								const principal = await interactive.consumeResult(authority, authenticationResult);
 								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
 								logLogin(request, "universal_login_email", consumed, startedAt, true, "", principal.id);
+								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_OIDC_REDIRECT_ISSUED", route: "POST /login/email/code",
+										clientId: interaction.clientId, correlationId, authenticationMethod: "email", httpStatus: 303 });
 								reply.header("Set-Cookie", this.interactionCookie(null));
 								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
 						} catch (error) {
@@ -1290,15 +1336,25 @@ export class OIDCService {
 						const startedAt = Date.now();
 						let interaction: AuthorizationInteraction | null = null;
 						try {
-								const loaded = await load(request, reply, true);
+								const loaded = await load(request, reply, true, "POST /login/face");
 								if (!loaded) return reply;
 								interaction = loaded.interaction;
-								if (!await this.interactionClientStillValid(interaction)) return expired(reply);
+								const correlationId = diagnosticCorrelationId(loaded.handle);
+								const clientValid = await this.interactionClientStillValid(interaction);
+								if (!clientValid) {
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/face",
+												clientId: interaction.clientId, correlationId, clientValid: false, reasonCode: "CLIENT_INVALID" });
+										return expired(reply);
+								}
 								const consumed = await this.interactions.consume(loaded.handle);
 								if (!consumed) {
 										logLogin(request, "universal_login_face", interaction, startedAt, false, "interaction_replayed");
+										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/face",
+												clientId: interaction.clientId, correlationId, reasonCode: "INTERACTION_ALREADY_CONSUMED" });
 										return expired(reply);
 								}
+								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_CONSUMED", route: "POST /login/face",
+										clientId: interaction.clientId, correlationId, authenticationMethod: "face" });
 								reply.header("Set-Cookie", this.interactionCookie(null));
 								reply.header("Cache-Control", "no-store");
 								await this.beginFaceAuthorization(reply, consumed.authorization);

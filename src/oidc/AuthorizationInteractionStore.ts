@@ -70,6 +70,27 @@ export class AuthorizationInteractionStore {
 		return interaction;
 	}
 
+	// Diagnostics-only, read-only probe (H6.5B): classifies why find() returned null without ever
+	// mutating state. Never used for authorization decisions -- callers must keep using find()/consume().
+	async inspect(handle: string | undefined): Promise<{ state: "not_found" | "expired" | "consumed" | "valid"; remainingMs?: number }> {
+		if (!handle || !HANDLE_PATTERN.test(handle)) return { state: "not_found" };
+		// Check the consumed marker first: consume() deletes the main key, so a stale/replayed
+		// handle would otherwise be misclassified as "not_found" instead of "consumed".
+		if (await this.redis.get(this.consumedKey(handle))) return { state: "consumed" };
+		const raw = await this.redis.get(this.key(handle));
+		if (!raw) return { state: "not_found" };
+		let interaction: AuthorizationInteraction;
+		try {
+			interaction = JSON.parse(raw) as AuthorizationInteraction;
+		} catch {
+			return { state: "not_found" };
+		}
+		if (interaction.version !== 1) return { state: "not_found" };
+		const remainingMs = interaction.expiresAt - this.clock();
+		if (remainingMs <= 0) return { state: "expired", remainingMs };
+		return { state: "valid", remainingMs };
+	}
+
 	// Persists step state (e.g. the H4 challenge id) without extending the original absolute expiry.
 	async save(handle: string, interaction: AuthorizationInteraction): Promise<boolean> {
 		const remaining = interaction.expiresAt - this.clock();

@@ -25,6 +25,7 @@ import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSess
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
 import { getRedisClient } from "../src/oidc/infrastructure/RedisInfrastructure.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
+import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.js";
 
 const REDIRECT = "https://rp.example/callback";
 const CLIENT_ID = "ul-client";
@@ -591,5 +592,222 @@ describe("H6 Universal Login → existing PrivateID Face", () => {
 			expect(logged).toContain("providerSubjectPresent");
 			expect(logged).toContain("resolvedUserIdPresent");
 		} finally { await app.close(); }
+	});
+});
+
+describe("H6.5B Universal Login safe lifecycle diagnostics", () => {
+	afterEach(() => { setFlag(undefined); vi.restoreAllMocks(); });
+
+	function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
+		return logs
+			.map(line => { try { return JSON.parse(line); } catch { return null; } })
+			.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry!.event === "string"
+				&& (entry!.event as string).startsWith("UNIVERSAL_LOGIN_"));
+	}
+
+	const SENSITIVE_MARKERS = (handle: string, csrf: string, email: string, code: string, state: string, nonce: string) =>
+		[handle, csrf, email, code, state, nonce];
+
+	it("logs COOKIE_MISSING with no cookie sent and no sensitive data", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const response = await f.app.inject({ method: "GET", url: "/login" });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const loaded = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED");
+			expect(loaded).toMatchObject({ reasonCode: "COOKIE_MISSING", cookiePresent: false, interactionFound: false, route: "GET /login" });
+			expect(loaded!.correlationId).toBeUndefined();
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs INTERACTION_NOT_FOUND for a forged/unknown handle", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const forged = "F".repeat(43);
+			const response = await f.app.inject({ method: "GET", url: "/login", headers: { cookie: `${COOKIE}=${forged}` } });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const loaded = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED");
+			expect(loaded).toMatchObject({ reasonCode: "INTERACTION_NOT_FOUND", cookiePresent: true, interactionFound: false });
+			expect(loaded!.correlationId).toBe(diagnosticCorrelationId(forged));
+			expect(f.logs.join("\n")).not.toContain(forged);
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs INTERACTION_NOT_FOUND once the Redis-side PX TTL has physically elapsed (true wall-clock expiry)", async () => {
+		// Our own logical expiresAt check in find()/inspect() and the Redis PX TTL are anchored to the
+		// same 600s window and the same clock. Once wall-clock time truly advances past that window,
+		// the Redis GET itself returns null (physical eviction) before our logical comparison ever runs,
+		// so true TTL expiry surfaces as INTERACTION_NOT_FOUND with an "unknown" bucket -- not a
+		// distinguishable INTERACTION_EXPIRED state. This is the real, observable production behavior.
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "x".repeat(43));
+			const realNow = Date.now();
+			vi.spyOn(Date, "now").mockReturnValue(realNow + AUTHORIZATION_INTERACTION_TTL_MS + 1);
+			const response = await f.app.inject({ method: "GET", url: "/login", headers: interaction.cookie });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const loaded = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED" && e.route === "GET /login" && e.interactionFound === false);
+			expect(loaded).toMatchObject({ reasonCode: "INTERACTION_NOT_FOUND", cookiePresent: true, interactionFound: false, remainingTtlBucket: "unknown" });
+			expect(loaded!.correlationId).toBe(diagnosticCorrelationId(interaction.handle));
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs INTERACTION_EXPIRED when our logical expiry fires ahead of Redis's own physical eviction", async () => {
+		// Narrow edge case / clock-skew window: our expiresAt check can fire slightly before Redis's own
+		// PX-based eviction (e.g. a request lands in the last millisecond of the TTL). We simulate that
+		// here by stubbing find()'s result directly to isolate the branch without relying on Redis timing.
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "k".repeat(43));
+			vi.spyOn(AuthorizationInteractionStore.prototype, "find").mockResolvedValueOnce(null);
+			vi.spyOn(AuthorizationInteractionStore.prototype, "inspect").mockResolvedValueOnce({ state: "expired", remainingMs: -1 });
+			const response = await f.app.inject({ method: "GET", url: "/login", headers: interaction.cookie });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const loaded = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED" && e.reasonCode === "INTERACTION_EXPIRED");
+			expect(loaded).toMatchObject({ reasonCode: "INTERACTION_EXPIRED", cookiePresent: true, interactionFound: false, remainingTtlBucket: "expired" });
+			expect(loaded!.correlationId).toBe(diagnosticCorrelationId(interaction.handle));
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs CSRF_MISMATCH for a forged csrf token", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "y".repeat(43));
+			const response = await f.app.inject({ method: "POST", url: "/login/email",
+				payload: new URLSearchParams({ csrf: "forged-csrf", email: KNOWN_EMAIL }).toString(),
+				headers: { ...form({}).headers, ...interaction.cookie } });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const failed = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_FAILED" && e.reasonCode === "CSRF_MISMATCH");
+			expect(failed).toMatchObject({ reasonCode: "CSRF_MISMATCH", csrfValid: false, route: "POST /login/email" });
+			expect(f.logs.join("\n")).not.toContain("forged-csrf");
+			expect(f.logs.join("\n")).not.toContain(interaction.csrf);
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs AUTHORITY_INVALID when the bound application changes mid-flow", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "z".repeat(43));
+			const record = (await f.h1.clients.findByClientId(CLIENT_ID))!;
+			await f.h1.clients.upsert({ ...record, applicationId: randomUUID() });
+			const response = await startEmail(f, interaction, KNOWN_EMAIL);
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const failed = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_FAILED" && e.reasonCode === "AUTHORITY_INVALID");
+			expect(failed).toMatchObject({ reasonCode: "AUTHORITY_INVALID", authorityValid: false, route: "POST /login/email" });
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs CLIENT_INVALID when the registered redirect_uri is removed", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "r".repeat(43));
+			f.oidcClient.redirect_uris = ["https://rp.example/other"];
+			const response = await f.app.inject({ method: "POST", url: "/login/face",
+				payload: new URLSearchParams({ csrf: interaction.csrf }).toString(), headers: { ...form({}).headers, ...interaction.cookie } });
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const failed = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_FAILED" && e.reasonCode === "CLIENT_INVALID");
+			expect(failed).toMatchObject({ reasonCode: "CLIENT_INVALID", clientValid: false, route: "POST /login/face" });
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs INTERACTION_SAVE_FAILED when the interaction cannot be persisted mid-flow", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "s".repeat(43));
+			vi.spyOn(AuthorizationInteractionStore.prototype, "save").mockResolvedValueOnce(false);
+			const response = await startEmail(f, interaction, KNOWN_EMAIL);
+			expect(response.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			const failed = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_FAILED" && e.reasonCode === "INTERACTION_SAVE_FAILED");
+			expect(failed).toMatchObject({ reasonCode: "INTERACTION_SAVE_FAILED", authorityValid: true, route: "POST /login/email" });
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("logs INTERACTION_ALREADY_CONSUMED on replay after a successful completion", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const interaction = await beginInteraction(f, "q".repeat(43));
+			await startEmail(f, interaction, KNOWN_EMAIL);
+			const done = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(done.statusCode).toBe(303);
+			const replay = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(replay.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			expect(events.some(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_CONSUMED")).toBe(true);
+			expect(events.some(e => e.event === "UNIVERSAL_LOGIN_OIDC_REDIRECT_ISSUED")).toBe(true);
+			// The replay's own load() call detects the consumed marker (the main key is already
+			// deleted by consume()), so it surfaces on the LOADED event rather than a route-specific FAILED one.
+			const replayed = events.find(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED" && e.reasonCode === "INTERACTION_ALREADY_CONSUMED");
+			expect(replayed).toBeDefined();
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("correlates events for the same interaction and distinguishes different interactions", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const a = await beginInteraction(f, "a".repeat(43));
+			const b = await beginInteraction(f, "b".repeat(43));
+			await f.app.inject({ method: "GET", url: "/login", headers: a.cookie });
+			await f.app.inject({ method: "GET", url: "/login", headers: b.cookie });
+			const events = diagnosticEvents(f.logs).filter(e => e.event === "UNIVERSAL_LOGIN_INTERACTION_LOADED" && e.interactionFound === true);
+			const idsForA = new Set(events.filter(e => e.correlationId === diagnosticCorrelationId(a.handle)).map(e => e.correlationId));
+			const idsForB = new Set(events.filter(e => e.correlationId === diagnosticCorrelationId(b.handle)).map(e => e.correlationId));
+			expect(idsForA.size).toBe(1);
+			expect(idsForB.size).toBe(1);
+			expect([...idsForA][0]).not.toBe([...idsForB][0]);
+			expect([...idsForA][0]).toMatch(/^[0-9a-f]{16}$/);
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("never logs the raw handle, cookie, csrf, email, OTP, state/nonce/PKCE, or tokens across a full successful flow", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const verifier = "diag-privacy-verifier-" + randomUUID();
+			const interaction = await beginInteraction(f, verifier);
+			await startEmail(f, interaction, KNOWN_EMAIL);
+			const done = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(done.statusCode).toBe(303);
+			const callback = new URL(done.headers.location as string);
+			const code = callback.searchParams.get("code")!;
+			const token = await f.app.inject({ method: "POST", url: "/token", headers: f.basic,
+				payload: { grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: verifier } });
+			expect(token.statusCode).toBe(200);
+			const idToken = token.json().id_token as string;
+			const accessToken = token.json().access_token as string;
+
+			const events = diagnosticEvents(f.logs);
+			expect(events.length).toBeGreaterThan(0);
+			// state/nonce are part of the GET /authorize querystring and are captured by Fastify's own
+			// default "incoming request" access logging regardless of this diagnostics feature; that
+			// pre-existing behavior is out of scope here. What H6.5B must guarantee is that the new
+			// diagnostic event stream never carries any of these values, which we check explicitly below.
+			const diagnosticText = JSON.stringify(events);
+			for (const sensitive of [interaction.handle, interaction.csrf, KNOWN_EMAIL, f.delivery.messages[0].code,
+				"ul-state-Ω+/=&", "ul-nonce-123", verifier, code, idToken, accessToken, CLIENT_SECRET]) {
+				expect(diagnosticText).not.toContain(sensitive);
+			}
+			const logged = f.logs.join("\n");
+			for (const sensitive of [interaction.handle, interaction.csrf, KNOWN_EMAIL, f.delivery.messages[0].code,
+				verifier, code, idToken, accessToken, CLIENT_SECRET]) {
+				expect(logged).not.toContain(sensitive);
+			}
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
 	});
 });
