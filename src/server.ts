@@ -72,8 +72,9 @@ await registerPrivateIDEnrollmentRoutes(app);
 await registerIdentityAccountLinkRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
 const emailAuthentication = await configureEmailVerification(app);
+const registration = await configureRegistration(app);
+emailAuthentication?.configureRegistration(registration);
 if (emailAuthentication) oidcService.configureEmailAuthentication(emailAuthentication);
-await configureRegistration(app);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {

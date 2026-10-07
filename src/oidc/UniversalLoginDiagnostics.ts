@@ -51,6 +51,10 @@ export function diagnosticCorrelationId(handle: string | undefined): string | un
 }
 
 export type UniversalLoginDiagnosticEvent =
+	| "EMAIL_FLOW_STARTED"
+	| "EMAIL_AUTHENTICATION_COMPLETED"
+	| "EMAIL_REGISTRATION_COMPLETED"
+	| "EMAIL_FLOW_FAILED"
 	| "UNIVERSAL_LOGIN_INTERACTION_CREATED"
 	| "UNIVERSAL_LOGIN_INTERACTION_LOADED"
 	| "UNIVERSAL_LOGIN_EMAIL_STARTED"

@@ -53,12 +53,14 @@ import {
 		type AuthorizationInteractionBinding
 } from "./AuthorizationInteractionStore.js";
 import { chooserPage, codePage, emailPage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
-import type { InteractiveEmailAuthority } from "../authentication/InteractiveEmailAuthentication.js";
+import type { InteractiveEmailAuthority, InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
 
 // __Host- prefix: Secure, host-only, Path=/ — the interaction handle cannot be scoped to another domain.
 const UNIVERSAL_LOGIN_COOKIE = "__Host-hapi_login";
 const universalLoginEmailSchema = z.string().trim().min(3).max(320).email();
+const isInteractiveEmailMode = (value: unknown): value is InteractiveEmailMode =>
+	value === "AUTHENTICATION" || value === "REGISTRATION" || value === "INELIGIBLE";
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -1225,16 +1227,23 @@ export class OIDCService {
 												error: "Enter a valid email address." }));
 								}
 								const started = await this.emailAuthentication!.interactive!.start(authority, email.data);
-								if (!await this.interactions.save(loaded.handle, { ...interaction, email: { challengeId: started.challengeId } })) {
+								if (!await this.interactions.save(loaded.handle, { ...interaction,
+									email: { challengeId: started.challengeId, mode: started.mode } })) {
 										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email",
 												clientId: interaction.clientId, correlationId, authorityValid: true, reasonCode: "INTERACTION_SAVE_FAILED" });
 										return expired(reply);
 								}
 								logLogin(request, "universal_login_email_start", interaction, startedAt, true, "");
+								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_STARTED", route: "POST /login/email",
+										clientId: interaction.clientId, correlationId, authenticationMethod: "email" });
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_EMAIL_STARTED", route: "POST /login/email",
 										clientId: interaction.clientId, correlationId, authorityValid: true, authenticationMethod: "email" });
 								return reply.header("Cache-Control", "no-store").redirect("/login/email/code", 303);
 						} catch (error) {
+								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_FAILED", route: "POST /login/email",
+										clientId: interaction?.clientId,
+										correlationId: diagnosticCorrelationId(this.readInteractionHandle(request)),
+										authenticationMethod: "email" });
 								logLogin(request, "universal_login_email_start", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
 								if (interaction && statusOf(error) === 429) return tooMany(reply, interaction, "email");
 								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
@@ -1263,11 +1272,15 @@ export class OIDCService {
 								interaction = loaded.interaction;
 								const authority = await this.interactiveEmailAuthority(interaction);
 								if (!authority || !interaction.email) return expired(reply);
-								await this.emailAuthentication!.interactive!.resend(authority, interaction.email.challengeId);
+								await this.emailAuthentication!.interactive!.resend(authority, interaction.email.challengeId, interaction.email.mode);
 								logLogin(request, "universal_login_email_resend", interaction, startedAt, true, "");
 								return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
 										notice: "We sent a new code. Earlier codes no longer work." }));
 						} catch (error) {
+								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_FAILED", route: "POST /login/email/resend",
+										clientId: interaction?.clientId,
+										correlationId: diagnosticCorrelationId(this.readInteractionHandle(request)),
+										authenticationMethod: "email" });
 								logLogin(request, "universal_login_email_resend", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
 								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
 										return send(reply, statusOf(error) === 429 ? 429 : 400, codePage({ tenantName: interaction.binding?.tenantName,
@@ -1291,7 +1304,8 @@ export class OIDCService {
 								const correlationId = diagnosticCorrelationId(loaded.handle);
 								const authority = await this.interactiveEmailAuthority(interaction);
 								const clientValid = await this.interactionClientStillValid(interaction);
-								if (!authority || !interaction.email || !clientValid) {
+								const mode = interaction.email?.mode;
+								if (!authority || !interaction.email || !isInteractiveEmailMode(mode) || !clientValid) {
 										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email/code",
 												clientId: interaction.clientId, correlationId, authorityValid: Boolean(authority), clientValid,
 												reasonCode: !authority ? "AUTHORITY_INVALID" : !clientValid ? "CLIENT_INVALID" : "AUTHORITY_INVALID" });
@@ -1299,7 +1313,7 @@ export class OIDCService {
 								}
 								const code = typeof loaded.body.code === "string" && loaded.body.code.length <= 128 ? loaded.body.code.trim() : "";
 								const interactive = this.emailAuthentication!.interactive!;
-								const { authenticationResult } = await interactive.verify(authority, interaction.email.challengeId, code);
+								const verification = await interactive.verify(authority, interaction.email.challengeId, code, mode);
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_EMAIL_VERIFIED", route: "POST /login/email/code",
 										clientId: interaction.clientId, correlationId, authorityValid: true, clientValid: true, authenticationMethod: "email" });
 								// Single-use: only the request that wins the interaction may turn the H4 result into an authorization code.
@@ -1312,7 +1326,13 @@ export class OIDCService {
 								}
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_CONSUMED", route: "POST /login/email/code",
 										clientId: interaction.clientId, correlationId });
-								const principal = await interactive.consumeResult(authority, authenticationResult);
+								const principal = verification.mode === "REGISTRATION" ? verification.principal
+									: await interactive.consumeResult(authority, verification.authenticationResult);
+								logUniversalLoginDiagnostic(app, {
+									event: verification.mode === "REGISTRATION" ? "EMAIL_REGISTRATION_COMPLETED" : "EMAIL_AUTHENTICATION_COMPLETED",
+									route: "POST /login/email/code", clientId: interaction.clientId, correlationId,
+									authenticationMethod: "email"
+								});
 								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
 								logLogin(request, "universal_login_email", consumed, startedAt, true, "", principal.id);
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_OIDC_REDIRECT_ISSUED", route: "POST /login/email/code",
@@ -1321,6 +1341,9 @@ export class OIDCService {
 								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
 						} catch (error) {
 								const failed = error instanceof VerificationError || error instanceof EmailAuthenticationError;
+								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_FAILED", route: "POST /login/email/code",
+										clientId: interaction?.clientId, correlationId: diagnosticCorrelationId(this.readInteractionHandle(request)),
+										authenticationMethod: "email" });
 								logLogin(request, "universal_login_email", interaction, startedAt, false,
 										failed ? "email_authentication_failed" : statusOf(error) === 429 ? "rate_limited" : "unavailable");
 								if (interaction && statusOf(error) === 429 && !failed) return tooMany(reply, interaction, "code");

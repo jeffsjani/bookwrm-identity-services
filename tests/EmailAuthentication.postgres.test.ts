@@ -11,6 +11,7 @@ import { VerificationSecrets } from "../src/email/VerificationSecrets.js";
 import { defaultVerificationPolicy } from "../src/email/VerificationPolicy.js";
 import { PostgresEmailAuthenticationRepository } from "../src/authentication/email/PostgresEmailAuthenticationRepository.js";
 import { EmailAuthenticationService } from "../src/authentication/email/EmailAuthenticationService.js";
+import { PostgresRegistrationRepository } from "../src/registration/PostgresRegistrationRepository.js";
 import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
 import { PostgresOIDCClientRepository } from "../src/identity/PostgresOIDCClientRepository.js";
 import { PostgresApplicationRepository } from "../src/identity/PostgresApplicationRepository.js";
@@ -18,10 +19,11 @@ import { PostgresTenantRepository } from "../src/identity/PostgresTenantReposito
 import { authorizeH1Client } from "../src/identity/H1ClientAuthority.js";
 import { EmailAuthenticationError } from "../src/authentication/email/EmailAuthenticationTypes.js";
 import { registerEmailAuthenticationRoutes } from "../src/routes/emailAuthentication.js";
-import { configureEmailVerification } from "../src/adapters/email/EmailVerificationComposition.js";
+import { configureEmailVerification, interactiveEmailAuthentication } from "../src/adapters/email/EmailVerificationComposition.js";
 import * as postgresInfrastructure from "../src/identity/infrastructure/PostgresInfrastructure.js";
 import { OIDCService } from "../src/oidc/OIDCService.js";
-import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { IdentityRegistry, identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { RegistrationService } from "../src/registration/RegistrationService.js";
 import { ensureOidcTestEnvironment } from "./oidcTestHarness.js";
 import type { AuthenticationProvider } from "../src/authentication/AuthenticationProvider.js";
 import type { IdentityProvider, IdentitySubjectStatus } from "../src/models/IdentitySubject.js";
@@ -47,11 +49,18 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 	const repository = new PostgresEmailAuthenticationRepository(pool);
 	const service = new EmailAuthenticationService(h2, challenges, repository);
 	const subjects = new PostgresIdentitySubjectRepository(pool);
+	const registrationService = new RegistrationService(new PostgresRegistrationRepository(pool));
 	const h1 = {
 		clients: new PostgresOIDCClientRepository(pool),
 		applications: new PostgresApplicationRepository(pool),
 		tenants: new PostgresTenantRepository(pool)
 	};
+	const interactive = interactiveEmailAuthentication(service, h1, {
+		verification: h2,
+		challenges,
+		registration: registrationService,
+		subjects: new IdentityRegistry(subjects)
+	});
 	const headers = { authorization: "Basic " + Buffer.from(clientId + ":h4-test-secret").toString("base64") };
 	let app: ReturnType<typeof Fastify>;
 
@@ -123,6 +132,103 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 		const audits = (await pool.query("SELECT type FROM email_authentication_audit WHERE challenge_id=$1 ORDER BY occurred_at", [flow.challengeId])).rows;
 		expect(audits.map(row => row.type)).toEqual(["EMAIL_AUTHENTICATION_STARTED", "EMAIL_AUTHENTICATION_VERIFIED", "EMAIL_AUTHENTICATION_SUCCEEDED"]);
 	});
+
+	describe("H6.8 unified Universal Login email with PostgreSQL", () => {
+		async function startInteractive(email: string) {
+			const authorized = await interactive.authority(clientId);
+			const started = await interactive.start(authorized, email);
+			const code = provider.messages.findLast(message => message.destination === email)!.code;
+			return { authorized, ...started, code };
+		}
+
+		it("uses H2 registration and H3 to create exactly one verified canonical identity", async () => {
+			const email = `${randomUUID()}@example.com`;
+			const before = await count("identity_subjects");
+			const flow = await startInteractive(email);
+			expect(flow.mode).toBe("REGISTRATION");
+			expect((await challenges.findById(flow.challengeId))?.purpose).toBe("REGISTRATION");
+			const result = await interactive.verify(flow.authorized, flow.challengeId, flow.code, flow.mode);
+			expect(result.mode).toBe("REGISTRATION");
+			if (result.mode !== "REGISTRATION") throw new Error("Expected H3 registration continuation");
+			const subject = await subjects.findByOidcSubject(result.principal.sub);
+			expect(subject).toMatchObject({ primaryProvider: "HAPI_EMAIL", email, emailVerified: true, status: "ACTIVE",
+				applicationId });
+			expect(subject?.oidcSubject).toBeTruthy();
+			expect(await subjects.findByEmail(email)).toHaveLength(1);
+			expect(await count("identity_subjects")).toBe(before + 1);
+			expect(await challenges.findById(flow.challengeId)).toMatchObject({ purpose: "REGISTRATION", status: "CONSUMED" });
+			expect((await pool.query("SELECT identity_subject_id FROM registration_evidence WHERE verification_challenge_id=$1",
+				[flow.challengeId])).rows).toEqual([{ identity_subject_id: subject!.id }]);
+			await expect(interactive.verify(flow.authorized, flow.challengeId, flow.code, flow.mode)).rejects.toThrow();
+			expect(await subjects.findByEmail(email)).toHaveLength(1);
+		});
+
+		it("uses H4 for returning HAPI_EMAIL users without creating a second subject", async () => {
+			const subject = await seed();
+			const before = await count("identity_subjects");
+			const flow = await startInteractive(subject.email!);
+			expect(flow.mode).toBe("AUTHENTICATION");
+			expect((await challenges.findById(flow.challengeId))?.purpose).toBe("AUTHENTICATION");
+			const result = await interactive.verify(flow.authorized, flow.challengeId, flow.code, flow.mode);
+			expect(result.mode).toBe("AUTHENTICATION");
+			if (result.mode !== "AUTHENTICATION") throw new Error("Expected H4 authentication result");
+			const principal = await interactive.consumeResult(flow.authorized, result.authenticationResult);
+			expect(principal).toMatchObject({ id: subject.id, sub: subject.oidcSubject, email: subject.email,
+				emailVerified: true, authenticationMethod: "HAPI_EMAIL" });
+			expect(await count("identity_subjects")).toBe(before);
+		});
+
+		it("fails closed for a PrivateID-primary identity without changing or duplicating it", async () => {
+			const email = `${randomUUID()}@example.com`;
+			const subject = await subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId,
+				primaryProvider: "PrivateID", primaryProviderSubject: `privateid-${randomUUID()}`,
+				email, emailVerified: true, status: "ACTIVE" });
+			const before = await count("identity_subjects");
+			const flow = await startInteractive(email);
+			expect(flow.mode).toBe("INELIGIBLE");
+			expect((await challenges.findById(flow.challengeId))?.purpose).toBe("AUTHENTICATION");
+			await expect(interactive.verify(flow.authorized, flow.challengeId, flow.code, flow.mode))
+				.rejects.toThrow(EmailAuthenticationError);
+			expect(await count("identity_subjects")).toBe(before);
+			expect(await subjects.findByOidcSubject(subject.oidcSubject)).toMatchObject({
+				id: subject.id, oidcSubject: subject.oidcSubject, primaryProvider: "PrivateID",
+				primaryProviderSubject: subject.primaryProviderSubject, email
+			});
+			expect(await subjects.findByProviderSubject("HAPI_EMAIL", email)).toBeUndefined();
+			expect(await challenges.findById(flow.challengeId)).toMatchObject({ status: "CONSUMED" });
+		});
+
+		it("rejects ambiguous email ownership and resolves concurrent registrations to one identity", async () => {
+			const ambiguousEmail = `${randomUUID()}@example.com`;
+			for (const providerName of ["PrivateID", "Enterprise"] as const) {
+				await subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId,
+					primaryProvider: providerName, primaryProviderSubject: `${providerName}-${randomUUID()}`,
+					email: ambiguousEmail, emailVerified: true, status: "ACTIVE" });
+			}
+			const ambiguous = await startInteractive(ambiguousEmail);
+			expect(ambiguous.mode).toBe("INELIGIBLE");
+			await expect(interactive.verify(ambiguous.authorized, ambiguous.challengeId, ambiguous.code, ambiguous.mode))
+				.rejects.toThrow(EmailAuthenticationError);
+			expect(await subjects.findByProviderSubject("HAPI_EMAIL", ambiguousEmail)).toBeUndefined();
+
+			const email = `${randomUUID()}@example.com`;
+			const first = await startInteractive(email);
+			const second = await startInteractive(email);
+			expect([first.mode, second.mode]).toEqual(["REGISTRATION", "REGISTRATION"]);
+			const results = await Promise.all([
+				interactive.verify(first.authorized, first.challengeId, first.code, first.mode),
+				interactive.verify(second.authorized, second.challengeId, second.code, second.mode)
+			]);
+			expect(results.every(result => result.mode === "REGISTRATION")).toBe(true);
+			const matches = await subjects.findByEmail(email);
+			expect(matches).toHaveLength(1);
+			expect(await subjects.findByProviderSubject("HAPI_EMAIL", email)).toMatchObject({
+				id: matches[0].id, oidcSubject: matches[0].oidcSubject,
+				status: "ACTIVE", primaryProvider: "HAPI_EMAIL", emailVerified: true
+			});
+		});
+	});
+
 	it("existing and unknown email start responses are indistinguishable before email proof", async () => {
 		const existing = await seed();
 		const unknown = `${randomUUID()}@example.com`;

@@ -11,12 +11,13 @@ import { registerRegistrationRoutes } from "../routes/registration.js";
 // H3 is always active on the Postgres Identity Registry driver (it has no in-memory production
 // mode -- "memory" is test-only, see InMemoryRegistrationRepository). Mirrors
 // adapters/email/EmailVerificationComposition.ts's wiring shape.
-export async function configureRegistration(app: FastifyInstance, env = process.env): Promise<void> {
-	if ((env.IDENTITY_REGISTRY_DRIVER ?? "postgres").trim().toLowerCase() === "memory") return;
+export async function configureRegistration(app: FastifyInstance, env = process.env): Promise<RegistrationService | undefined> {
+	if ((env.IDENTITY_REGISTRY_DRIVER ?? "postgres").trim().toLowerCase() === "memory") return undefined;
 	const repository = new PostgresRegistrationRepository(getPostgresPool() as pg.Pool);
 	await repository.ensureSchema();
 	const service = new RegistrationService(repository);
 	await registerRegistrationRoutes(app, service, {
 		clients: new PostgresOIDCClientRepository(), applications: new PostgresApplicationRepository(), tenants: new PostgresTenantRepository()
 	});
+	return service;
 }

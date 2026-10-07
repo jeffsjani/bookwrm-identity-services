@@ -19,13 +19,16 @@ import { InMemoryApplicationRepository } from "../src/identity/InMemoryApplicati
 import { InMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClientRepository.js";
 import { interactiveEmailAuthentication } from "../src/adapters/email/EmailVerificationComposition.js";
 import { authorizeH1Client } from "../src/identity/H1ClientAuthority.js";
-import { identityRegistry } from "../src/identity/IdentityRegistry.js";
+import { identityRegistry, IdentityRegistry } from "../src/identity/IdentityRegistry.js";
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
 import { getRedisClient } from "../src/oidc/infrastructure/RedisInfrastructure.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.js";
+import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
+import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
+import { RegistrationService } from "../src/registration/RegistrationService.js";
 
 const REDIRECT = "https://rp.example/callback";
 const CLIENT_ID = "ul-client";
@@ -72,6 +75,14 @@ function decodeJwt(token: string): Record<string, unknown> {
 	return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")) as Record<string, unknown>;
 }
 
+function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
+	return logs
+		.map(line => { try { return JSON.parse(line); } catch { return null; } })
+		.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry!.event === "string"
+			&& ((entry!.event as string).startsWith("UNIVERSAL_LOGIN_") || (entry!.event as string).startsWith("EMAIL_FLOW_")
+				|| (entry!.event as string).startsWith("EMAIL_AUTHENTICATION_") || (entry!.event as string).startsWith("EMAIL_REGISTRATION_")));
+}
+
 async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 	ensureOidcTestEnvironment();
 	const tenantId = randomUUID();
@@ -96,7 +107,11 @@ async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 		new VerificationSecrets("h6-local-test-secret".repeat(3)), defaultVerificationPolicy, () => now);
 
 	// The canonical HAPI_EMAIL subject that already exists (H3). H4/H6 must resolve it and never create one.
-	const subject = { id: randomUUID(), oidcSubject: randomUUID(), email: KNOWN_EMAIL };
+	const subjects = new InMemoryIdentitySubjectRepository();
+	const subjectRegistry = new IdentityRegistry(subjects);
+	const subject = await subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId,
+		primaryProvider: "HAPI_EMAIL", primaryProviderSubject: KNOWN_EMAIL, email: KNOWN_EMAIL,
+		emailVerified: true, status: "ACTIVE" });
 	const results = new Map<string, EmailPrincipal & { context: string }>();
 	const created: string[] = [];
 	const repository: EmailAuthenticationRepository = {
@@ -123,6 +138,8 @@ async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 		})
 	};
 	const service = new EmailAuthenticationService(h2, challenges, repository);
+	const registrationRepository = new InMemoryRegistrationRepository(challenges, subjects);
+	const registration = new RegistrationService(registrationRepository);
 	const provider: AuthenticationProvider = {
 		authenticate: vi.fn(async () => { throw new Error("must not authenticate synchronously"); }),
 		cancel: vi.fn(async () => {}), status: vi.fn(async () => ({ state: "idle" as const })), logout: vi.fn(async () => {}),
@@ -138,19 +155,19 @@ async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 			if (client.clientId !== expectedClient) throw new EmailAuthenticationError();
 			return service.consumeResult(client, token);
 		},
-		...(options.emailInteractive === false ? {} : { interactive: interactiveEmailAuthentication(service, h1) })
+		...(options.emailInteractive === false ? {} : { interactive: interactiveEmailAuthentication(service, h1, {
+			verification: h2, challenges, registration, subjects: subjectRegistry
+		}) })
 	});
 	const logs: string[] = [];
 	const app = Fastify({ logger: { level: "info", stream: new Writable({ write(chunk, _enc, done) { logs.push(String(chunk)); done(); } }) } });
 	await app.register(formbody);
 	await oidc.registerEndpoints(app);
 	await app.ready();
-	const lookup = vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(async sub => sub === subject.oidcSubject
-		? { id: subject.id, oidcSubject: subject.oidcSubject, primaryProvider: "HAPI_EMAIL", primaryProviderSubject: KNOWN_EMAIL,
-			email: KNOWN_EMAIL, emailVerified: true, status: "ACTIVE", displayName: null } as never
-		: undefined as never);
+	const lookup = vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(sub => subjects.findByOidcSubject(sub));
 	const basic = { authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") };
-	return { app, oidc, h1, oidcClient, provider, delivery, service, challenges, repository, subject, created, logs, lookup, basic,
+	return { app, oidc, h1, oidcClient, provider, delivery, service, challenges, repository, registrationRepository,
+		registration, subjects, subject, created, logs, lookup, basic,
 		advance: (ms: number) => { now += ms; }, tenantId, applicationId };
 }
 
@@ -282,7 +299,7 @@ describe("H6 Universal Login", () => {
 			expect(emailForm.statusCode).toBe(200);
 			expect(emailForm.body).toContain('type="email"');
 
-			const started = await startEmail(f, interaction, "Member@Example.com");
+			const started = await startEmail(f, interaction, KNOWN_EMAIL);
 			expect(started.statusCode, started.body).toBe(303);
 			expect(started.headers.location).toBe("/login/email/code");
 			expect(f.delivery.messages).toHaveLength(1);
@@ -343,28 +360,174 @@ describe("H6 Universal Login", () => {
 		} finally { f.lookup.mockRestore(); await f.app.close(); }
 	});
 
-	it("unknown email gets the same generic failure as a wrong code, with no identity created and no enumeration", async () => {
+	it("new email uses H2 registration and H3 to finish the original OIDC interaction", async () => {
 		setFlag(true);
 		const f = await emailFixture();
-		const resolveOrCreate = vi.spyOn(identityRegistry, "resolveOrCreate");
 		try {
-			const unknown = await beginInteraction(f, "u".repeat(43));
-			const unknownStart = await startEmail(f, unknown, "nobody@example.com");
-			const known = await beginInteraction(f, "k".repeat(43));
-			const knownStart = await startEmail(f, known, KNOWN_EMAIL);
-			expect(unknownStart.statusCode).toBe(knownStart.statusCode);
-			expect(unknownStart.headers.location).toBe(knownStart.headers.location);
-			const unknownCode = f.delivery.messages.find(message => message.destination === "nobody@example.com")!.code;
-			const unknownResult = await submitCode(f, unknown, unknownCode);
-			const wrongCode = await submitCode(f, known, "000000000");
-			expect(unknownResult.statusCode).toBe(401);
-			expect(wrongCode.statusCode).toBe(401);
-			const message = (html: string) => /<p class="error"[^>]*>([^<]+)</.exec(html)?.[1];
-			expect(message(unknownResult.body)).toBeDefined();
-			expect(message(unknownResult.body)).toBe(message(wrongCode.body));
-			expect(unknownResult.headers.location).toBeUndefined();
-			expect(resolveOrCreate).not.toHaveBeenCalled();
+			const verifier = "new-user-verifier-" + randomUUID();
+			const interaction = await beginInteraction(f, verifier);
+			const started = await startEmail(f, interaction, "newperson@example.com");
+			expect(started.statusCode).toBe(303);
+			expect(started.headers.location).toBe("/login/email/code");
+			expect(f.delivery.messages[0]).toMatchObject({ purpose: "REGISTRATION", destination: "newperson@example.com" });
+			const registrationChallenge = f.challenges.inspect().challenges.find(challenge =>
+				challenge.destinationNormalized === "newperson@example.com");
+			expect(registrationChallenge).toMatchObject({ purpose: "REGISTRATION", status: "PENDING" });
+			const codeForm = await f.app.inject({ method: "GET", url: "/login/email/code", headers: interaction.cookie });
+			expect(codeForm.statusCode).toBe(200);
+			expect(codeForm.body).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
+
+			const completed = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(completed.statusCode, completed.body).toBe(303);
+			const callback = new URL(completed.headers.location as string);
+			expect(`${callback.origin}${callback.pathname}`).toBe(REDIRECT);
+			expect(callback.searchParams.get("state")).toBe("ul-state-Ω+/=&");
+			expect([...callback.searchParams.keys()].sort()).toEqual(["code", "state"]);
+			const registered = await f.subjects.findByEmail("newperson@example.com");
+			expect(registered).toHaveLength(1);
+			expect(registered[0]).toMatchObject({ status: "ACTIVE", primaryProvider: "HAPI_EMAIL",
+				email: "newperson@example.com", emailVerified: true, applicationId: f.applicationId });
+			expect(registered[0].oidcSubject).toBeTruthy();
+			expect(await f.challenges.findById(registrationChallenge!.id)).toMatchObject({
+				purpose: "REGISTRATION", status: "CONSUMED"
+			});
+			expect(f.registrationRepository.auditLog().some(entry => entry.type === "IDENTITY_REGISTERED")).toBe(true);
+
+			const token = await f.app.inject({ method: "POST", url: "/token", headers: f.basic,
+				payload: { grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+					redirect_uri: REDIRECT, code_verifier: verifier } });
+			expect(token.statusCode, token.body).toBe(200);
+			expect(decodeJwt(token.json().id_token)).toMatchObject({
+				sub: registered[0].oidcSubject, email: "newperson@example.com", email_verified: true,
+				amr: ["email"], nonce: "ul-nonce-123", aud: CLIENT_ID
+			});
+			expect(typeof decodeJwt(token.json().id_token).auth_time).toBe("number");
+			const replay = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(replay.statusCode).toBe(400);
+			const events = diagnosticEvents(f.logs);
+			expect(events.some(event => event.event === "EMAIL_FLOW_STARTED")).toBe(true);
+			expect(events.some(event => event.event === "EMAIL_REGISTRATION_COMPLETED")).toBe(true);
+			const diagnosticText = JSON.stringify(events);
+			for (const sensitive of [interaction.handle, interaction.csrf, "newperson@example.com",
+				f.delivery.messages[0].code, registrationChallenge!.id, "ul-state-Ω+/=&", "ul-nonce-123", verifier,
+				callback.searchParams.get("code")!, token.json().id_token, token.json().access_token, CLIENT_SECRET]) {
+				expect(diagnosticText).not.toContain(sensitive);
+			}
 			expect(f.provider.beginAsyncAuthentication).not.toHaveBeenCalled();
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("fails generically for a PrivateID email without attempting H3 or changing that identity", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const legacyEmail = "legacy@example.com";
+			const legacy = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId: f.applicationId,
+				primaryProvider: "PrivateID", primaryProviderSubject: `legacy-${randomUUID()}`, email: legacyEmail,
+				emailVerified: true, status: "ACTIVE" });
+			const interaction = await beginInteraction(f, "legacy-user-verifier-" + randomUUID());
+			const started = await startEmail(f, interaction, legacyEmail);
+			expect(started.statusCode).toBe(303);
+			expect(f.delivery.messages.at(-1)).toMatchObject({ purpose: "AUTHENTICATION", destination: legacyEmail });
+			const challenge = f.challenges.inspect().challenges.find(item => item.destinationNormalized === legacyEmail);
+			const before = await f.subjects.list();
+			const response = await submitCode(f, interaction, f.delivery.messages.at(-1)!.code);
+			expect(response.statusCode).toBe(401);
+			expect(response.body).toContain("sign you in with that code");
+			expect(await f.subjects.list()).toHaveLength(before.length);
+			expect(await f.subjects.findByOidcSubject(legacy.oidcSubject)).toMatchObject({
+				id: legacy.id, oidcSubject: legacy.oidcSubject, primaryProvider: "PrivateID", email: legacyEmail
+			});
+			expect(f.registrationRepository.auditLog()).toHaveLength(0);
+			expect(challenge).toBeDefined();
+			expect(await f.challenges.findById(challenge!.id)).toMatchObject({ purpose: "AUTHENTICATION", status: "CONSUMED" });
+			expect(diagnosticEvents(f.logs).some(event => event.event === "EMAIL_FLOW_FAILED")).toBe(true);
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("fails closed when multiple subjects claim the same normalized email", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const email = "collision@example.com";
+			await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId: f.applicationId,
+				primaryProvider: "HAPI_EMAIL", primaryProviderSubject: email, email: "different@example.com",
+				emailVerified: true, status: "ACTIVE" });
+			await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId: f.applicationId,
+				primaryProvider: "PrivateID", primaryProviderSubject: `collision-${randomUUID()}`, email,
+				emailVerified: true, status: "ACTIVE" });
+			const interaction = await beginInteraction(f, "collision-verifier-" + randomUUID());
+			const started = await startEmail(f, interaction, email);
+			expect(started.statusCode).toBe(303);
+			expect(f.delivery.messages.at(-1)).toMatchObject({ purpose: "AUTHENTICATION", destination: email });
+			const count = (await f.subjects.list()).length;
+			const response = await submitCode(f, interaction, f.delivery.messages.at(-1)!.code);
+			expect(response.statusCode).toBe(401);
+			expect(response.body).toContain("sign you in with that code");
+			expect(await f.subjects.list()).toHaveLength(count);
+			expect(f.registrationRepository.auditLog()).toHaveLength(0);
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("keeps browser-visible email pages and safe failures uniform across the internal branches", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const legacyEmail = "legacy-enumeration@example.com";
+			await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId: f.applicationId,
+				primaryProvider: "PrivateID", primaryProviderSubject: `legacy-${randomUUID()}`, email: legacyEmail,
+				emailVerified: true, status: "ACTIVE" });
+			const returning = await beginInteraction(f, "returning-enum-" + randomUUID());
+			const newUser = await beginInteraction(f, "new-enum-" + randomUUID());
+			const legacy = await beginInteraction(f, "legacy-enum-" + randomUUID());
+			const starts = await Promise.all([
+				startEmail(f, returning, KNOWN_EMAIL),
+				startEmail(f, newUser, "not-yet-registered@example.com"),
+				startEmail(f, legacy, legacyEmail)
+			]);
+			expect(starts.map(response => [response.statusCode, response.headers.location]))
+				.toEqual([[303, "/login/email/code"], [303, "/login/email/code"], [303, "/login/email/code"]]);
+
+			const codePages = await Promise.all([returning, newUser, legacy].map(interaction =>
+				f.app.inject({ method: "GET", url: "/login/email/code", headers: interaction.cookie })));
+			const publicPage = (html: string) => html.replace(/nonce="[^"]+"/g, 'nonce=""')
+				.replace(/name="csrf" value="[^"]+"/g, 'name="csrf" value=""');
+			expect(publicPage(codePages[0].body)).toBe(publicPage(codePages[1].body));
+			expect(publicPage(codePages[1].body)).toBe(publicPage(codePages[2].body));
+			expect(codePages[0].body).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
+
+			const messages = f.delivery.messages;
+			const responses = await Promise.all([
+				submitCode(f, returning, messages.find(message => message.destination === KNOWN_EMAIL)!.code),
+				submitCode(f, newUser, messages.find(message => message.destination === "not-yet-registered@example.com")!.code),
+				submitCode(f, legacy, messages.find(message => message.destination === legacyEmail)!.code)
+			]);
+			expect(responses[0].statusCode).toBe(303);
+			expect(responses[1].statusCode).toBe(303);
+			expect(responses[2].statusCode).toBe(401);
+			const wrongCode = await beginInteraction(f, "wrong-enum-" + randomUUID());
+			await startEmail(f, wrongCode, KNOWN_EMAIL);
+			const wrong = await submitCode(f, wrongCode, "000000000");
+			expect(wrong.statusCode).toBe(401);
+			expect(publicPage(responses[2].body)).toBe(publicPage(wrong.body));
+		} finally { f.lookup.mockRestore(); await f.app.close(); }
+	});
+
+	it("allows simultaneous first registrations to resolve to at most one canonical subject", async () => {
+		setFlag(true);
+		const f = await emailFixture();
+		try {
+			const email = "concurrent@example.com";
+			const a = await beginInteraction(f, "concurrent-a-" + randomUUID());
+			const b = await beginInteraction(f, "concurrent-b-" + randomUUID());
+			expect((await startEmail(f, a, email)).statusCode).toBe(303);
+			expect((await startEmail(f, b, email)).statusCode).toBe(303);
+			const messages = f.delivery.messages.filter(message => message.destination === email);
+			expect(messages).toHaveLength(2);
+			expect(messages.every(message => message.purpose === "REGISTRATION")).toBe(true);
+			const results = await Promise.all([submitCode(f, a, messages[0].code), submitCode(f, b, messages[1].code)]);
+			expect(results.every(response => response.statusCode === 303)).toBe(true);
+			expect(await f.subjects.findByEmail(email)).toHaveLength(1);
 		} finally { f.lookup.mockRestore(); await f.app.close(); }
 	});
 
@@ -597,13 +760,6 @@ describe("H6 Universal Login → existing PrivateID Face", () => {
 
 describe("H6.5B Universal Login safe lifecycle diagnostics", () => {
 	afterEach(() => { setFlag(undefined); vi.restoreAllMocks(); });
-
-	function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
-		return logs
-			.map(line => { try { return JSON.parse(line); } catch { return null; } })
-			.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry!.event === "string"
-				&& (entry!.event as string).startsWith("UNIVERSAL_LOGIN_"));
-	}
 
 	const SENSITIVE_MARKERS = (handle: string, csrf: string, email: string, code: string, state: string, nonce: string) =>
 		[handle, csrf, email, code, state, nonce];

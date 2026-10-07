@@ -1,5 +1,6 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import type { PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
+import type { InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { getRedisClient, oidcRedisKey, type RedisClient } from "./infrastructure/RedisInfrastructure.js";
 
 export const AUTHORIZATION_INTERACTION_TTL_MS = 600_000;
@@ -32,7 +33,7 @@ export type AuthorizationInteraction = {
 	csrf: string;
 	createdAt: number;
 	expiresAt: number;
-	email?: { challengeId: string };
+	email?: { challengeId: string; mode: InteractiveEmailMode };
 };
 
 export type NewAuthorizationInteraction = Pick<AuthorizationInteraction, "clientId" | "binding" | "authorization" | "request">;
