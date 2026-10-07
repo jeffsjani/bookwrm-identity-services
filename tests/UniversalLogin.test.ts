@@ -59,6 +59,11 @@ function csrfFrom(html: string): string {
 	return match[1];
 }
 
+function publicPage(html: string): string {
+	return html.replace(/nonce="[^"]+"/g, 'nonce=""')
+		.replace(/name="csrf" value="[^"]+"/g, 'name="csrf" value=""');
+}
+
 function form(payload: Record<string, string>): { headers: Record<string, string>; payload: string } {
 	return { headers: { "content-type": "application/x-www-form-urlencoded" }, payload: new URLSearchParams(payload).toString() };
 }
@@ -306,6 +311,9 @@ describe("H6 Universal Login", () => {
 			expect(f.delivery.messages[0]).toMatchObject({ purpose: "AUTHENTICATION" });
 			const codeForm = await f.app.inject({ method: "GET", url: "/login/email/code", headers: interaction.cookie });
 			expect(codeForm.statusCode).toBe(200);
+			expect(codeForm.body).toContain('id="otp-form"');
+			expect(codeForm.body).toContain('otpForm.addEventListener("submit", submitOnce)');
+			expect(codeForm.headers["content-security-policy"]).toMatch(/script-src 'nonce-[A-Za-z0-9+/]+=*'/);
 
 			const done = await submitCode(f, interaction, f.delivery.messages[0].code);
 			expect(done.statusCode, done.body).toBe(303);
@@ -375,7 +383,10 @@ describe("H6 Universal Login", () => {
 			expect(registrationChallenge).toMatchObject({ purpose: "REGISTRATION", status: "PENDING" });
 			const codeForm = await f.app.inject({ method: "GET", url: "/login/email/code", headers: interaction.cookie });
 			expect(codeForm.statusCode).toBe(200);
-			expect(codeForm.body).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
+			expect(codeForm.body).toContain('id="otp-form"');
+			expect(codeForm.body).toContain('otpForm.addEventListener("submit", submitOnce)');
+			expect(codeForm.headers["content-security-policy"]).toMatch(/script-src 'nonce-[A-Za-z0-9+/]+=*'/);
+			expect(publicPage(codeForm.body)).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
 
 			const completed = await submitCode(f, interaction, f.delivery.messages[0].code);
 			expect(completed.statusCode, completed.body).toBe(303);
@@ -490,11 +501,9 @@ describe("H6 Universal Login", () => {
 
 			const codePages = await Promise.all([returning, newUser, legacy].map(interaction =>
 				f.app.inject({ method: "GET", url: "/login/email/code", headers: interaction.cookie })));
-			const publicPage = (html: string) => html.replace(/nonce="[^"]+"/g, 'nonce=""')
-				.replace(/name="csrf" value="[^"]+"/g, 'name="csrf" value=""');
 			expect(publicPage(codePages[0].body)).toBe(publicPage(codePages[1].body));
 			expect(publicPage(codePages[1].body)).toBe(publicPage(codePages[2].body));
-			expect(codePages[0].body).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
+			expect(publicPage(codePages[0].body)).not.toMatch(/register|existing account|new account|H2|H3|H4|IdentitySubject/i);
 
 			const messages = f.delivery.messages;
 			const responses = await Promise.all([
