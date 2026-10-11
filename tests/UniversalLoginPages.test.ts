@@ -55,6 +55,68 @@ afterEach(() => {
 	for (const dom of instances.splice(0)) dom.window.close();
 });
 
+describe("client-aware Universal Login presentation", () => {
+	const BOOKWRM_CLIENT_ID = "bookwrm-base44-production";
+
+	it("renders the Bookwrm welcome and email step only for its registered client id", () => {
+		const branded = emailPage({ clientId: BOOKWRM_CLIENT_ID, csrf: CSRF });
+		const generic = emailPage({ clientId: "another-hapi-client", csrf: CSRF });
+		const dom = new JSDOM(branded.html);
+		instances.push(dom);
+		const visibleText = dom.window.document.body.textContent ?? "";
+		expect(visibleText).toContain("Welcome to Bookwrm");
+		expect(visibleText).toContain("Let's secure your account.");
+		expect(visibleText).toContain("STEP 1 OF 2");
+		expect(visibleText).toContain("Confirm your email");
+		expect(visibleText).toContain("We'll send you a one-time verification code.");
+		expect(visibleText).toContain("Send My Code");
+		expect(visibleText).toContain("Secure identity powered by HAPI ID");
+		expect(branded.html).toContain('aria-label="Bookwrm"');
+		expect(branded.html).toContain("--brand-primary:#176b4d");
+		expect(visibleText)
+			.not.toMatch(/OIDC|H2|H3|H4|IdentitySubject|AuthorizationInteraction|provider|authenticationResult/i);
+		expect(generic.html).not.toContain("Welcome to Bookwrm");
+		expect(generic.html).toContain("Secured by HAPI ID");
+	});
+
+	it("keeps the branded OTP a native, accessible, paste- and autofill-compatible form", () => {
+		const rendered = codePage({ clientId: BOOKWRM_CLIENT_ID, csrf: CSRF });
+		const dom = new JSDOM(rendered.html, { url: "https://hapi.example.test/login/email/code", runScripts: "dangerously" });
+		instances.push(dom);
+		const { document } = dom.window;
+		const form = document.querySelector<HTMLFormElement>("#otp-form")!;
+		const code = document.querySelector<HTMLInputElement>("#code")!;
+		expect(document.querySelector("h1")?.textContent).toBe("Check your inbox");
+		expect(document.body.textContent).toContain("STEP 2 OF 2");
+		expect(document.body.textContent).toContain("We sent a verification code to the email address you entered.");
+		expect(document.body.textContent).toContain("Verify & Continue");
+		expect(document.body.textContent).toContain("Didn't receive it?");
+		expect(document.body.textContent).toContain("Resend code");
+		expect(code.getAttribute("autocomplete")).toBe("one-time-code");
+		expect(code.getAttribute("inputmode")).toBe("numeric");
+		expect(code.getAttribute("pattern")).toBe("[0-9]{6,9}");
+		expect(code.maxLength).toBe(9);
+		expect(document.querySelectorAll('input[name="code"]')).toHaveLength(1);
+		expect(form.method).toBe("post");
+		expect(form.action).toBe("https://hapi.example.test/login/email/code");
+		expect(form.querySelector<HTMLInputElement>('[name="csrf"]')?.value).toBe(CSRF);
+		expect(rendered.contentSecurityPolicy).toContain("default-src 'none'");
+		expect(rendered.contentSecurityPolicy).toMatch(/style-src 'nonce-[A-Za-z0-9+/]+=*'/);
+		expect(rendered.contentSecurityPolicy).toMatch(/script-src 'nonce-[A-Za-z0-9+/]+=*'/);
+		expect(document.body.textContent ?? "")
+			.not.toMatch(/OIDC|H2|H3|H4|IdentitySubject|AuthorizationInteraction|provider|authenticationResult/i);
+	});
+
+	it("does not let an unknown client id inject brand markup or styling", () => {
+		const rendered = emailPage({ clientId: 'bookwrm-base44-production"><script>alert(1)</script>',
+			csrf: CSRF });
+		expect(rendered.html).not.toContain("<script>alert(1)</script>");
+		expect(rendered.html).not.toContain("Welcome to Bookwrm");
+		expect(rendered.html).not.toContain("--brand-primary:");
+		expect(rendered.html.match(/<style /g)).toHaveLength(1);
+	});
+});
+
 describe("Universal Login OTP page submit-once guard", () => {
 	it("preserves the first native POST, its exact encoded fields, and only one submission", async () => {
 		const f = page();

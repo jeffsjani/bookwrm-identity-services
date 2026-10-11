@@ -1138,7 +1138,8 @@ export class OIDCService {
 						title: "Sign-in is temporarily unavailable", message: "Please try again in a few minutes."
 				}));
 				const tooMany = (reply: FastifyReply, interaction: AuthorizationInteraction, page: "email" | "code") => send(reply, 429,
-						(page === "email" ? emailPage : codePage)({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+						(page === "email" ? emailPage : codePage)({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+								csrf: interaction.csrf,
 								error: "Too many attempts. Please wait a few minutes and try again." }));
 				const emailFailed = "We couldn't sign you in with that code. Check the code, request a new one, or use a different email.";
 				const statusOf = (error: unknown) => typeof (error as { statusCode?: unknown })?.statusCode === "number"
@@ -1196,6 +1197,7 @@ export class OIDCService {
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						return send(reply, 200, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+								clientId: interaction.clientId,
 								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive) }));
 				});
 
@@ -1204,7 +1206,8 @@ export class OIDCService {
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						if (!interaction.binding || !this.emailAuthentication?.interactive) return reply.redirect("/login", 303);
-						return send(reply, 200, emailPage({ tenantName: interaction.binding.tenantName, csrf: interaction.csrf }));
+						return send(reply, 200, emailPage({ tenantName: interaction.binding.tenantName, clientId: interaction.clientId,
+								csrf: interaction.csrf }));
 				});
 
 				app.post("/login/email", { bodyLimit: 4096 }, async (request, reply) => {
@@ -1223,7 +1226,8 @@ export class OIDCService {
 								}
 								const email = universalLoginEmailSchema.safeParse(loaded.body.email);
 								if (!email.success) {
-										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+												csrf: interaction.csrf,
 												error: "Enter a valid email address." }));
 								}
 								const started = await this.emailAuthentication!.interactive!.start(authority, email.data);
@@ -1247,7 +1251,8 @@ export class OIDCService {
 								logLogin(request, "universal_login_email_start", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
 								if (interaction && statusOf(error) === 429) return tooMany(reply, interaction, "email");
 								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
-										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+										return send(reply, 400, emailPage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+												csrf: interaction.csrf,
 												error: "Enter a valid email address." }));
 								}
 								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email start failed");
@@ -1260,7 +1265,8 @@ export class OIDCService {
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						if (!interaction.email) return reply.redirect("/login/email", 303);
-						return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf }));
+						return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+								csrf: interaction.csrf }));
 				});
 
 				app.post("/login/email/resend", { bodyLimit: 4096 }, async (request, reply) => {
@@ -1274,7 +1280,8 @@ export class OIDCService {
 								if (!authority || !interaction.email) return expired(reply);
 								await this.emailAuthentication!.interactive!.resend(authority, interaction.email.challengeId, interaction.email.mode);
 								logLogin(request, "universal_login_email_resend", interaction, startedAt, true, "");
-								return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+								return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+										csrf: interaction.csrf,
 										notice: "We sent a new code. Earlier codes no longer work." }));
 						} catch (error) {
 								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_FAILED", route: "POST /login/email/resend",
@@ -1284,6 +1291,7 @@ export class OIDCService {
 								logLogin(request, "universal_login_email_resend", interaction, startedAt, false, error instanceof VerificationError ? error.code : "unavailable");
 								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
 										return send(reply, statusOf(error) === 429 ? 429 : 400, codePage({ tenantName: interaction.binding?.tenantName,
+												clientId: interaction.clientId,
 												csrf: interaction.csrf, error: statusOf(error) === 429
 														? "Please wait before requesting another code."
 														: "A new code can't be sent for this request. Use a different email or start again." }));
@@ -1348,7 +1356,8 @@ export class OIDCService {
 										failed ? "email_authentication_failed" : statusOf(error) === 429 ? "rate_limited" : "unavailable");
 								if (interaction && statusOf(error) === 429 && !failed) return tooMany(reply, interaction, "code");
 								if (interaction && failed) {
-										return send(reply, 401, codePage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf, error: emailFailed }));
+										return send(reply, 401, codePage({ tenantName: interaction.binding?.tenantName,
+												clientId: interaction.clientId, csrf: interaction.csrf, error: emailFailed }));
 								}
 								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email verification failed");
 								return unavailable(reply);
@@ -1387,6 +1396,7 @@ export class OIDCService {
 								logLogin(request, "universal_login_face", interaction, startedAt, false, statusOf(error) === 429 ? "rate_limited" : "unavailable");
 								if (interaction && statusOf(error) === 429) {
 										return send(reply, 429, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+												clientId: interaction.clientId,
 												emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive),
 												error: "Too many attempts. Please wait a few minutes and try again." }));
 								}
