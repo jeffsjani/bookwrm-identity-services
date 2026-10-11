@@ -33,6 +33,11 @@ and resumed into the normal authorization-code redirect, so relying parties keep
 It is disabled by default via `HAPI_UNIVERSAL_LOGIN_ENABLED=false`, in which case
 `GET /authorize` keeps launching PrivateID Face directly.
 
+H6.11.1 makes the Bookwrm landing screen email-only for this release: one **Continue**
+button opens the existing Email screen without creating a challenge. Face is not offered
+to Bookwrm users merely because H5 or legacy Face code exists. Other clients keep their
+existing choices; H2/H3/H4, OTP, H5, and OIDC semantics are unchanged.
+
 ## Overview
 
 This service provides identity-facing API routes backed by an internal client and service layer:

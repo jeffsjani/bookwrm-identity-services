@@ -11,7 +11,6 @@ type ClientBrand = {
 	brandName: string;
 	logo: "bookwrm-sprouting-books";
 	tokens: { primary: string; background: string; foreground: string; surface: string; border: string; focus: string };
-	welcomeCopy: string;
 	supportCopy: string;
 };
 
@@ -24,7 +23,6 @@ const CLIENT_BRANDS: Readonly<Record<string, ClientBrand>> = {
 			primary: "#176b4d", background: "#fbfaf6", foreground: "#172321",
 			surface: "#ffffff", border: "#dce5df", focus: "#176b4d"
 		},
-		welcomeCopy: "Let's secure your account.",
 		supportCopy: "Secure identity powered by HAPI ID"
 	}
 };
@@ -139,20 +137,24 @@ const alert = (message?: string, kind: "error" | "notice" = "error") =>
 	message ? `<p class="${kind}" role="${kind === "error" ? "alert" : "status"}">${escapeHtml(message)}</p>` : "";
 const csrfField = (csrf: string) => `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">`;
 
-export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; error?: string }): RenderedLoginPage {
+export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; faceAvailable?: boolean; error?: string }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
+	// Bookwrm Face is not certified for this release. A future caller must establish
+	// client/release capability and returning-user enrollment before opting in.
+	const faceAvailable = input.faceAvailable ?? !brand;
 	const email = input.emailAvailable
-		? `<form method="get" action="/login/email"><button type="submit">${brand ? "Continue with email" : "Continue with Email"}</button></form>` : "";
+		? `<form method="get" action="/login/email"><button type="submit">${brand && !faceAvailable ? "Continue" : "Continue with Email"}</button></form>` : "";
+	const face = faceAvailable
+		? `<form method="post" action="/login/face">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Face</button></form>` : "";
 	return render(heading(input.tenantName), brand ? `Welcome to ${brand.brandName}` : heading(input.tenantName), `${alert(input.error)}
-<p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>${email}
-<form method="post" action="/login/face">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Face</button></form>`,
+<p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>${email}${face}`,
 		undefined, brand);
 }
 
 export function emailPage(input: { tenantName?: string; clientId?: string; csrf: string; error?: string }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
 	const content = brand
-		? `<p class="welcome-copy">${escapeHtml(brand.welcomeCopy)}</p>${alert(input.error)}
+		? `${alert(input.error)}
 <p class="progress">STEP 1 OF 2</p><div class="step-heading">Confirm your email</div>
 <p>We'll send you a one-time verification code.</p>
 <form method="post" action="/login/email">${csrfField(input.csrf)}

@@ -58,6 +58,44 @@ afterEach(() => {
 describe("client-aware Universal Login presentation", () => {
 	const BOOKWRM_CLIENT_ID = "bookwrm-base44-production";
 
+	it("renders one Bookwrm Continue CTA using the existing Email GET without a challenge or script", () => {
+		const rendered = chooserPage({ clientId: BOOKWRM_CLIENT_ID, csrf: CSRF, emailAvailable: true });
+		const dom = new JSDOM(rendered.html, { url: "https://hapi.example.test/login" });
+		instances.push(dom);
+		const { document } = dom.window;
+		expect(document.querySelectorAll("button")).toHaveLength(1);
+		expect(document.querySelector("button")?.textContent).toBe("Continue");
+		expect(document.forms).toHaveLength(1);
+		expect(document.forms[0].method).toBe("get");
+		expect(document.forms[0].action).toBe("https://hapi.example.test/login/email");
+		expect(document.querySelectorAll("input")).toHaveLength(0);
+		expect(document.querySelector("svg")?.getAttribute("aria-label")).toBe("Bookwrm");
+		expect(document.querySelector("h1")?.textContent).toBe("Welcome to Bookwrm");
+		expect(document.body.textContent).toContain("Let's get you securely into your account.");
+		expect(document.body.textContent).toContain("Secure identity powered by HAPI ID");
+		expect(rendered.html).not.toContain("/login/face");
+		expect(document.scripts).toHaveLength(0);
+	});
+
+	it("requires explicit Face availability for Bookwrm and retains other clients' chooser", () => {
+		for (const clientId of [undefined, "another-hapi-client", BOOKWRM_CLIENT_ID]) {
+			const rendered = chooserPage({ clientId, csrf: CSRF, emailAvailable: true,
+				...(clientId === BOOKWRM_CLIENT_ID ? { faceAvailable: true } : {}) });
+			const dom = new JSDOM(rendered.html);
+			instances.push(dom);
+			expect([...dom.window.document.querySelectorAll("button")].map(button => button.textContent))
+				.toEqual(["Continue with Email", "Continue with Face"]);
+			expect(dom.window.document.querySelector<HTMLFormElement>('form[action="/login/face"]')?.method).toBe("post");
+			expect(dom.window.document.querySelector<HTMLInputElement>('[name="csrf"]')?.value).toBe(CSRF);
+		}
+	});
+
+	it("does not offer an unavailable Email or uncertified Face path for Bookwrm", () => {
+		const rendered = chooserPage({ clientId: BOOKWRM_CLIENT_ID, csrf: CSRF, emailAvailable: false });
+		expect(rendered.html).not.toContain("<form");
+		expect(rendered.html).not.toContain("Continue");
+	});
+
 	it("renders the Bookwrm welcome and email step only for its registered client id", () => {
 		const branded = emailPage({ clientId: BOOKWRM_CLIENT_ID, csrf: CSRF });
 		const generic = emailPage({ clientId: "another-hapi-client", csrf: CSRF });
@@ -65,7 +103,7 @@ describe("client-aware Universal Login presentation", () => {
 		instances.push(dom);
 		const visibleText = dom.window.document.body.textContent ?? "";
 		expect(visibleText).toContain("Welcome to Bookwrm");
-		expect(visibleText).toContain("Let's secure your account.");
+		expect(visibleText).not.toContain("Let's secure your account.");
 		expect(visibleText).toContain("STEP 1 OF 2");
 		expect(visibleText).toContain("Confirm your email");
 		expect(visibleText).toContain("We'll send you a one-time verification code.");

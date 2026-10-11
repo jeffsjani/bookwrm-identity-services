@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import formbody from "@fastify/formbody";
+import { JSDOM } from "jsdom";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { configuration } from "../src/config/ConfigurationService.js";
 import { OIDCService, type OIDCClient } from "../src/oidc/OIDCService.js";
@@ -88,8 +89,9 @@ function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
 				|| (entry!.event as string).startsWith("EMAIL_AUTHENTICATION_") || (entry!.event as string).startsWith("EMAIL_REGISTRATION_")));
 }
 
-async function emailFixture(options: { emailInteractive?: boolean } = {}) {
+async function emailFixture(options: { emailInteractive?: boolean; clientId?: string } = {}) {
 	ensureOidcTestEnvironment();
+	const clientId = options.clientId ?? CLIENT_ID;
 	const tenantId = randomUUID();
 	const applicationId = randomUUID();
 	const tenants = new InMemoryTenantRepository();
@@ -97,11 +99,11 @@ async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 	const clients = new InMemoryOIDCClientRepository();
 	await tenants.upsert({ id: tenantId, name: "Bookwrm", slug: `bookwrm-${tenantId}`, status: "active" });
 	await applications.upsert({ id: applicationId, tenantId, name: "Bookwrm Web", slug: "web", status: "active" });
-	await clients.upsert({ id: randomUUID(), applicationId, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+	await clients.upsert({ id: randomUUID(), applicationId, clientId, clientSecret: CLIENT_SECRET,
 		redirectUris: [REDIRECT], scopes: ["openid", "profile", "email"], grantTypes: ["authorization_code"],
 		responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
 	const h1 = { clients, applications, tenants };
-	const oidcClient: OIDCClient = { client_id: CLIENT_ID, client_secret: CLIENT_SECRET, redirect_uris: [REDIRECT],
+	const oidcClient: OIDCClient = { client_id: clientId, client_secret: CLIENT_SECRET, redirect_uris: [REDIRECT],
 		scope: "openid profile email", grant_types: ["authorization_code"], response_types: ["code"],
 		token_endpoint_auth_method: "client_secret_basic", require_pkce: true };
 
@@ -170,7 +172,7 @@ async function emailFixture(options: { emailInteractive?: boolean } = {}) {
 	await oidc.registerEndpoints(app);
 	await app.ready();
 	const lookup = vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(sub => subjects.findByOidcSubject(sub));
-	const basic = { authorization: "Basic " + Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64") };
+	const basic = { authorization: "Basic " + Buffer.from(`${clientId}:${CLIENT_SECRET}`).toString("base64") };
 	return { app, oidc, h1, oidcClient, provider, delivery, service, challenges, repository, registrationRepository,
 		registration, subjects, subject, created, logs, lookup, basic,
 		advance: (ms: number) => { now += ms; }, tenantId, applicationId };
@@ -253,6 +255,103 @@ describe("H6 AuthorizationInteractionStore", () => {
 
 describe("H6 Universal Login", () => {
 	afterEach(() => { setFlag(undefined); vi.restoreAllMocks(); });
+
+	it.each([
+		{ email: KNOWN_EMAIL, purpose: "AUTHENTICATION", h5: "false" },
+		{ email: "zero-choice-new@example.com", purpose: "REGISTRATION", h5: "false" },
+		{ email: KNOWN_EMAIL, purpose: "AUTHENTICATION", h5: "true" },
+		{ email: "zero-choice-new@example.com", purpose: "REGISTRATION", h5: "true" }
+	])("Bookwrm zero-choice login preserves one $purpose OTP with H5=$h5", async ({ email, purpose, h5 }) => {
+		setFlag(true);
+		vi.stubEnv("HAPI_FACE_ENROLLMENT_ENABLED", h5);
+		configuration.reload();
+		const clientId = "bookwrm-base44-production";
+		const f = await emailFixture({ clientId });
+		try {
+			expect(configuration.getFeatureFlag("HAPI_FACE_ENROLLMENT_ENABLED", false)).toBe(h5 === "true");
+			const verifier = "zero-choice-verifier-" + randomUUID();
+			const remoteAddress = "192.0.2.11";
+			const authorize = await f.app.inject({ method: "GET", remoteAddress,
+				url: `/authorize?${authorizeQuery(verifier, { client_id: clientId })}` });
+			expect(authorize.statusCode, authorize.body).toBe(302);
+			expect(authorize.headers.location).toBe("/login");
+			const handle = cookieFrom(authorize)!;
+			const cookie = { cookie: `${COOKIE}=${handle}` };
+			const store = new AuthorizationInteractionStore();
+			const initialInteraction = await store.find(handle);
+			expect(initialInteraction).not.toBeNull();
+			const chooser = await f.app.inject({ method: "GET", url: "/login", headers: cookie, remoteAddress });
+			expect(chooser.statusCode).toBe(200);
+			const dom = new JSDOM(chooser.body);
+			let action: string;
+			try {
+				const { document } = dom.window;
+				expect(document.querySelectorAll("button")).toHaveLength(1);
+				expect(document.querySelector("button")?.textContent).toBe("Continue");
+				expect(document.forms).toHaveLength(1);
+				expect(document.forms[0].method).toBe("get");
+				action = document.forms[0].getAttribute("action")!;
+				expect(action).toBe("/login/email");
+				expect(document.querySelector("svg")?.getAttribute("aria-label")).toBe("Bookwrm");
+			} finally { dom.window.close(); }
+			expect(chooser.body).not.toContain("Continue with Face");
+			expect(chooser.body).not.toContain("/login/face");
+			expect(f.challenges.inspect().challenges).toHaveLength(0);
+			expect(f.delivery.messages).toHaveLength(0);
+
+			const emailForm = await f.app.inject({ method: "GET", url: action, headers: cookie, remoteAddress });
+			expect(emailForm.statusCode).toBe(200);
+			expect(emailForm.body).toContain("Welcome to Bookwrm");
+			expect(emailForm.body).toContain("STEP 1 OF 2");
+			expect(emailForm.body).toContain("Confirm your email");
+			expect(emailForm.body).toContain("We'll send you a one-time verification code.");
+			expect(emailForm.body).toContain("Send My Code");
+			expect(f.challenges.inspect().challenges).toHaveLength(0);
+			expect(f.delivery.messages).toHaveLength(0);
+			expect(await store.find(handle)).toEqual(initialInteraction);
+			const csrf = csrfFrom(emailForm.body);
+			const started = await f.app.inject({ method: "POST", url: "/login/email", remoteAddress,
+				...form({ csrf, email }), headers: { ...form({}).headers, ...cookie } });
+			expect(started.statusCode, started.body).toBe(303);
+			expect(started.headers.location).toBe("/login/email/code");
+			expect(f.delivery.messages).toHaveLength(1);
+			expect(f.delivery.messages[0]).toMatchObject({ purpose, destination: email });
+			expect(f.challenges.inspect().challenges).toHaveLength(1);
+			const codeForm = await f.app.inject({ method: "GET", url: "/login/email/code", headers: cookie, remoteAddress });
+			expect(codeForm.statusCode).toBe(200);
+			expect(codeForm.body).toContain("STEP 2 OF 2");
+			expect(codeForm.body).toContain("Check your inbox");
+			expect(codeForm.body).toContain("Verify &amp; Continue");
+			expect(codeForm.body).toContain("Resend code");
+			const done = await f.app.inject({ method: "POST", url: "/login/email/code", remoteAddress,
+				...form({ csrf, code: f.delivery.messages[0].code }), headers: { ...form({}).headers, ...cookie } });
+			expect(done.statusCode, done.body).toBe(303);
+			const callback = new URL(done.headers.location as string);
+			expect(callback.searchParams.get("state")).toBe("ul-state-Ω+/=&");
+			const token = await f.app.inject({ method: "POST", url: "/token", headers: f.basic, remoteAddress,
+				payload: { grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+					redirect_uri: REDIRECT, code_verifier: verifier } });
+			expect(token.statusCode, token.body).toBe(200);
+			const subjects = await f.subjects.findByEmail(email);
+			expect(subjects).toHaveLength(1);
+			expect(decodeJwt(token.json().id_token)).toMatchObject({
+				sub: subjects[0].oidcSubject, email, email_verified: true, amr: ["email"],
+				nonce: "ul-nonce-123", aud: clientId
+			});
+			if (purpose === "AUTHENTICATION") expect(subjects[0].oidcSubject).toBe(f.subject.oidcSubject);
+			expect(f.challenges.inspect().challenges).toHaveLength(1);
+			expect(f.challenges.inspect().challenges[0]).toMatchObject({
+				purpose, status: purpose === "REGISTRATION" ? "CONSUMED" : "VERIFIED"
+			});
+			expect(f.delivery.messages).toHaveLength(1);
+			expect(f.provider.beginAsyncAuthentication).not.toHaveBeenCalled();
+		} finally {
+			f.lookup.mockRestore();
+			await f.app.close();
+			vi.unstubAllEnvs();
+			configuration.reload();
+		}
+	});
 
 	it("flag off (default): GET /authorize keeps the existing PrivateID Face launch and /login routes are absent", async () => {
 		setFlag(undefined);
