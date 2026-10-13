@@ -13,6 +13,21 @@ CREATE TABLE IF NOT EXISTS hapi_face_enrollment_bindings (
 CREATE INDEX IF NOT EXISTS hapi_face_enrollment_subject_idx
 	ON hapi_face_enrollment_bindings (identity_subject_id);
 
+-- HAPI-owned, versioned consent evidence; Base44 consent records are never authorization evidence.
+CREATE TABLE IF NOT EXISTS hapi_face_authentication_consents (
+	id UUID PRIMARY KEY,
+	identity_subject_id UUID NOT NULL REFERENCES identity_subjects(id),
+	tenant_id UUID NOT NULL REFERENCES tenants(id),
+	application_id UUID NOT NULL REFERENCES applications(id),
+	client_id TEXT NOT NULL REFERENCES oidc_clients(client_id),
+	purpose TEXT NOT NULL CHECK (purpose = 'FACE_AUTHENTICATION'),
+	consent_version TEXT NOT NULL,
+	accepted_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS hapi_face_authentication_consents_subject_context_idx
+	ON hapi_face_authentication_consents (identity_subject_id, tenant_id, application_id, client_id, accepted_at DESC);
+
 CREATE TABLE IF NOT EXISTS authenticator_enrollment_audit (
 	id UUID PRIMARY KEY,
 	tenant_id UUID NOT NULL REFERENCES tenants(id),

@@ -7,7 +7,7 @@ import { InMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUse
 import type { IdentitySubject } from "../src/models/IdentitySubject.js";
 
 function user(overrides: Partial<IdentitySubject> = {}): IdentitySubject {
-	return { id: randomUUID(), oidcSubject: randomUUID(), primaryProvider: "PrivateID", primaryProviderSubject: "legacy", email: "canonical@example.test", emailVerified: true, displayName: "Canonical User", status: "ACTIVE", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...overrides };
+	return { id: randomUUID(), oidcSubject: randomUUID(), primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "canonical@example.test", email: "canonical@example.test", emailVerified: true, displayName: "Canonical User", status: "ACTIVE", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...overrides };
 }
 
 describe("AuthenticatorLoginResolver", () => {
@@ -38,6 +38,32 @@ describe("AuthenticatorLoginResolver", () => {
 		await authenticators.create({ id: randomUUID(), userId: inactiveUser.id, provider: "privateid", providerSubject: "inactive-puid", authenticatorType: "face", status: "active" });
 		const resolver = new AuthenticatorLoginResolver(authenticators, { async findById() { return inactiveUser; } }, new InMemoryAuthenticatorLoginTransactionRepository());
 		await expect(resolver.resolveLogin("privateid", randomUUID(), "inactive-puid")).rejects.toBeInstanceOf(AuthenticatorLoginError);
+	});
+	it.each([
+		{ primaryProvider: "PrivateID" as const },
+		{ emailVerified: false },
+		{ email: "different@example.test" },
+		{ oidcSubject: "not-a-uuid" }
+	])("rejects a noncanonical HAPI Email subject: %j", async overrides => {
+		const authenticators = new InMemoryUserAuthenticatorRepository();
+		const subject = user(overrides);
+		await authenticators.create({ id: randomUUID(), userId: subject.id, provider: "privateid",
+			providerSubject: "policy-puid", authenticatorType: "face", status: "active" });
+		const resolver = new AuthenticatorLoginResolver(authenticators,
+			{ async findById(id) { return id === subject.id ? subject : undefined; } },
+			new InMemoryAuthenticatorLoginTransactionRepository());
+		await expect(resolver.resolveLogin("privateid", randomUUID(), "policy-puid"))
+			.rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
+	});
+	it("rejects an authenticator whose user reference does not resolve to that canonical subject", async () => {
+		const authenticators = new InMemoryUserAuthenticatorRepository();
+		const subject = user();
+		await authenticators.create({ id: randomUUID(), userId: randomUUID(), provider: "privateid",
+			providerSubject: "orphan-puid", authenticatorType: "face", status: "active" });
+		const resolver = new AuthenticatorLoginResolver(authenticators,
+			{ async findById() { return subject; } }, new InMemoryAuthenticatorLoginTransactionRepository());
+		await expect(resolver.resolveLogin("privateid", randomUUID(), "orphan-puid"))
+			.rejects.toMatchObject({ code: "AUTHENTICATION_FAILED" });
 	});
 
 	it("does not permit duplicate PUID links", async () => {

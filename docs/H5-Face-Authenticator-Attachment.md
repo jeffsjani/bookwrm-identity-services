@@ -192,15 +192,57 @@ IdentitySubject, registration evidence, or claim provenance. Primary provider st
 HAPI_EMAIL; email, verification state, identity IDs and HAPI_EMAIL provenance remain
 unchanged. No `IdentityAccountLink` or product membership is required.
 
-Face login already resolves `PUID → UserAuthenticator → IdentitySubject` using
-`AuthenticatorLoginResolver`, without email lookup or identity creation. A successful
-Face OIDC webhook now carries `PRIVATEID_FACE` and its authentication timestamp;
-the callback preserves that timestamp instead of refreshing it. Existing ID-token
-issuance emits `amr: ["face", "privateid"]` and `auth_time` for that method.
+Face login resolves `PUID → active UserAuthenticator → ACTIVE IdentitySubject`
+using `AuthenticatorLoginResolver`, without email lookup or identity creation. It
+fails closed unless the subject is a verified `HAPI_EMAIL` identity whose canonical
+email matches its primary provider subject and whose OIDC subject is a UUID. Legacy
+PrivateID canonical identities are not eligible for HAPI Face login. Duplicate
+provider-credential rows are treated as ambiguous ownership and rejected. A
+successful Face OIDC webhook carries `PRIVATEID_FACE` and its authentication
+timestamp; the callback preserves that timestamp instead of refreshing it. Existing
+ID-token issuance emits `amr: ["face", "privateid"]` and `auth_time` for that method.
 H4 remains `amr: ["email"]` with its original H4 authentication timestamp.
 Both methods use the same stable canonical `sub`, code/token store and `/userinfo`.
 This supports email **or** Face authentication conceptually; full recovery, removal,
 replacement, UI and cross-provider identity consolidation are outside this scope.
+
+## H5.2 consent and subject-bound capability
+
+Face enrollment now requires explicit HAPI-side consent in addition to the existing
+recent HAPI Email authentication and active, verified canonical-subject/H1 checks.
+The current consent policy is `FACE_AUTH_V1` for purpose `FACE_AUTHENTICATION`:
+
+> Face is an optional sign-in method and enrollment uses PrivateID. Email remains
+> available as a fallback. Enrollment is optional.
+
+`GET /v1/authenticators/privateid/status` returns the authenticated subject's safe
+capability state and the current consent text/version. It requires a valid bearer
+access-token record and reports only booleans and lifecycle state; it never returns
+the provider credential. `POST /v1/authenticators/privateid/consent` accepts only
+strict affirmative consent (`accepted: true`) with the exact current purpose and
+version. HAPI rechecks recent Email authentication and active subject/client/
+application/tenant authority before recording immutable metadata in
+`hapi_face_authentication_consents`. The evidence is bound to the canonical subject,
+tenant, application, client, purpose, policy version and acceptance timestamp.
+Base44 biometric and consent records are not queried or accepted as HAPI evidence.
+
+Enrollment reservation independently checks this persisted evidence and fails
+closed when consent is absent, obsolete, or from another subject/client context.
+The status contract reports `consentRequired` independently from
+`faceEnrollmentEligible`; enrollment eligibility is true only when H5 is enabled,
+the subject/context and recent Email authority are valid, current consent exists,
+and no active Face credential or live reservation blocks enrollment. The state is
+one of `NOT_ENROLLED`, `PENDING`, `ACTIVE`, `FAILED`, or `REVOKED`. Face login
+eligibility is separately server-derived from the active HAPI subject and an active,
+owned Face authenticator; H5 being enabled is not sufficient.
+
+The existing reservation and callback transaction continues to capture and attach
+the credential to the same `IdentitySubject.id`; it does not identify the subject by
+email or create a second canonical identity. Legacy Base44 `BiometricIdentity`
+records remain migration inputs only and cannot establish HAPI Face enrollment or
+login eligibility. Bookwrm Universal Login remains unchanged and must keep Face
+hidden until a later separately approved consumer-UX change. H5 remains disabled in
+production; H5.2 does not enroll users or change deployment configuration.
 
 ## Audit and isolation
 

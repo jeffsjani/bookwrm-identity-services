@@ -61,9 +61,10 @@ async function sendSuccessWebhook(
 }
 
 async function createKnownFaceUser(providerSubject: string) {
+	const email = `canonical-${randomUUID()}@example.test`;
 	const subject = await identityRegistry.resolveOrCreate({
-		provider: "PrivateID", providerSubject: `seed-${randomUUID()}`,
-		email: "canonical@example.test", emailVerified: true, displayName: "Canonical User"
+		provider: "HAPI_EMAIL", providerSubject: email,
+		email, emailVerified: true, displayName: "Canonical User"
 	});
 	await inMemoryUserAuthenticatorRepository.create({
 		id: randomUUID(), userId: subject.id, provider: "privateid", providerSubject,
@@ -87,11 +88,11 @@ describe("OIDC face login identity resolution", () => {
 				expect(authenticatedUser).toBeDefined();
 				expect(authenticatedUser?.id).toBe(subject.id);
 				expect(authenticatedUser?.sub).toBe(subject.oidcSubject);
-				expect(authenticatedUser?.email).toBe("canonical@example.test");
+				expect(authenticatedUser?.email).toBe(subject.email);
 				expect(authenticatedUser?.emailVerified).toBe(true);
 				expect(authenticatedUser?.name).toBe("Canonical User");
 
-				expect(subject?.email).toBe("canonical@example.test");
+				expect(subject?.email).toMatch(/^canonical-/);
 				expect(subject?.emailVerified).toBe(true);
 
 				const claimsResponse = await app.inject({
@@ -102,9 +103,9 @@ describe("OIDC face login identity resolution", () => {
 				});
 				expect(claimsResponse.statusCode).toBe(200);
 				const claims = claimsResponse.json() as Record<string, any>;
-				expect(claims.identityRegistry.email).toBe("canonical@example.test");
-				expect(claims.idTokenClaims.email).toBe("canonical@example.test");
-				expect(claims.userInfoClaims.email).toBe("canonical@example.test");
+				expect(claims.identityRegistry.email).toBe(subject.email);
+				expect(claims.idTokenClaims.email).toBe(subject.email);
+				expect(claims.userInfoClaims.email).toBe(subject.email);
 
 				await app.close();
 		});

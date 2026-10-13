@@ -5,8 +5,10 @@ import { PrivateIDEnrollmentTransactionRepository } from "../identity/PrivateIDE
 import { UserAuthenticatorRepository } from "../identity/UserAuthenticatorRepository.js";
 import type { PrivateIDSession } from "../privateid/PrivateIDSession.js";
 import {
-	FaceEnrollmentError, FACE_ENROLLMENT_TTL_MS, requireRecentEmailAuthority, requireStatusAuthority,
-	type FaceEnrollmentAuthority, type FaceEnrollmentReply, type FaceEnrollmentReservation, type FaceEnrollmentStatus
+	FaceEnrollmentError, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_TEXT, FACE_AUTH_CONSENT_VERSION, FACE_ENROLLMENT_TTL_MS,
+	requireRecentEmailAuthority, requireStatusAuthority,
+	type FaceCapabilityStatus, type FaceEnrollmentAuthority, type FaceEnrollmentReply,
+	type FaceEnrollmentReservation, type FaceEnrollmentStatus
 } from "./FaceEnrollmentTypes.js";
 
 type Binding = {
@@ -63,6 +65,24 @@ export class PostgresFaceEnrollmentRepository {
 		return result.rows[0];
 	}
 
+	async acceptConsent(authority: FaceEnrollmentAuthority, consentVersion: string, purpose: string): Promise<void> {
+		if (consentVersion !== FACE_AUTH_CONSENT_VERSION || purpose !== FACE_AUTH_CONSENT_PURPOSE) {
+			throw new FaceEnrollmentError("INVALID_CONSENT", 400);
+		}
+		await this.transaction(async client => {
+			const subject = (await client.query<{ id: string }>(
+				"SELECT id FROM identity_subjects WHERE oidc_subject::text=$1 FOR UPDATE", [authority.sub])).rows[0];
+			const context = subject ? await this.activeContext(client, subject.id, authority.clientId) : undefined;
+			const now = await this.now(client);
+			requireRecentEmailAuthority(authority, now.getTime());
+			if (!subject || !context) throw new FaceEnrollmentError("ENROLLMENT_NOT_AUTHORIZED", 403);
+			await client.query(`INSERT INTO hapi_face_authentication_consents
+				(id,identity_subject_id,tenant_id,application_id,client_id,purpose,consent_version,accepted_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [randomUUID(), subject.id, context.tenant_id,
+				context.application_id, context.client_id, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, now]);
+		});
+	}
+
 	async reserve(authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReservation> {
 		const result = await this.transaction(async client => {
 			const subject = (await client.query<{ id: string }>(
@@ -77,6 +97,11 @@ export class PostgresFaceEnrollmentRepository {
 				await this.audit(client, context, null, "AUTHENTICATOR_ALREADY_ACTIVE", "ALREADY_ACTIVE");
 				return { alreadyEnrolled: true } as const;
 			}
+			const consent = (await client.query(`SELECT 1 FROM hapi_face_authentication_consents
+				WHERE identity_subject_id=$1 AND tenant_id=$2 AND application_id=$3 AND client_id=$4
+				AND purpose=$5 AND consent_version=$6 LIMIT 1`, [subject.id, context.tenant_id,
+				context.application_id, context.client_id, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION])).rows[0];
+			if (!consent) throw new FaceEnrollmentError("FACE_CONSENT_REQUIRED", 403);
 			const pending = (await client.query<Binding>(`SELECT b.*,e.provider_transaction_id,e.status,e.expires_at
 				FROM hapi_face_enrollment_bindings b JOIN privateid_enrollment_transactions e ON e.id=b.enrollment_id
 				WHERE b.identity_subject_id=$1 AND e.status='pending' FOR UPDATE OF e`, [subject.id])).rows;
@@ -103,6 +128,60 @@ export class PostgresFaceEnrollmentRepository {
 		});
 		if (result instanceof FaceEnrollmentError) throw result;
 		return result;
+	}
+
+	async capabilityStatus(authority: FaceEnrollmentAuthority, enabled: boolean): Promise<FaceCapabilityStatus> {
+		return this.transaction(async client => {
+			requireStatusAuthority(authority, (await this.now(client)).getTime());
+			const subject = (await client.query<{ id: string; status: string }>(
+				"SELECT id,status FROM identity_subjects WHERE oidc_subject::text=$1", [authority.sub])).rows[0];
+			if (!subject) throw new FaceEnrollmentError("ENROLLMENT_NOT_AUTHORIZED", 403);
+			const context = subject.status === "ACTIVE"
+				? await this.activeContext(client, subject.id, authority.clientId) : undefined;
+			const now = await this.now(client);
+			const authenticatorRows = (await new UserAuthenticatorRepository(client).findByUser(subject.id))
+				.filter(authenticator => authenticator.provider === "privateid" && authenticator.authenticatorType === "face");
+			const active = authenticatorRows.filter(authenticator => authenticator.status === "active");
+			const revoked = authenticatorRows.some(authenticator => authenticator.status === "revoked");
+			const activeFace = active.length === 1 && Boolean(context);
+			const consent = context ? (await client.query(`SELECT 1 FROM hapi_face_authentication_consents
+				WHERE identity_subject_id=$1 AND tenant_id=$2 AND application_id=$3 AND client_id=$4
+				AND purpose=$5 AND consent_version=$6 LIMIT 1`, [subject.id, context.tenant_id,
+				context.application_id, context.client_id, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION])).rows[0] : undefined;
+			const pending = context ? (await client.query<{ expires_at: Date }>(`SELECT e.expires_at
+				FROM hapi_face_enrollment_bindings b JOIN privateid_enrollment_transactions e ON e.id=b.enrollment_id
+				WHERE b.identity_subject_id=$1 AND b.tenant_id=$2 AND b.application_id=$3 AND b.client_id=$4
+				AND e.status='pending' AND e.expires_at>$5 ORDER BY e.created_at DESC LIMIT 1`,
+			[subject.id, context.tenant_id, context.application_id, context.client_id, now])).rows[0] : undefined;
+			const priorFailure = context ? (await client.query<{ status: string }>(`SELECT e.status
+				FROM hapi_face_enrollment_bindings b JOIN privateid_enrollment_transactions e ON e.id=b.enrollment_id
+				WHERE b.identity_subject_id=$1 AND b.tenant_id=$2 AND b.application_id=$3 AND b.client_id=$4
+				ORDER BY e.created_at DESC LIMIT 1`, [subject.id, context.tenant_id,
+				context.application_id, context.client_id])).rows[0] : undefined;
+			let recentEmailAuthentication = false;
+			try {
+				requireRecentEmailAuthority(authority, now.getTime());
+				recentEmailAuthentication = true;
+			} catch (error) {
+				if (!(error instanceof FaceEnrollmentError)) throw error;
+			}
+			const consentRequired = !consent;
+			const enrollmentState: FaceEnrollmentStatus = active.length > 1 ? "FAILED"
+				: activeFace ? "ACTIVE"
+				: pending ? "PENDING"
+				: revoked ? "REVOKED"
+				: priorFailure?.status ? "FAILED" : "NOT_ENROLLED";
+			return {
+				faceEnrollmentEligible: Boolean(enabled && context && recentEmailAuthentication && consent &&
+					active.length === 0 && !pending),
+				faceLoginEligible: Boolean(context && activeFace),
+				consentRequired,
+				enrollmentState,
+				consentVersion: FACE_AUTH_CONSENT_VERSION,
+				consentPurpose: FACE_AUTH_CONSENT_PURPOSE,
+				consentText: FACE_AUTH_CONSENT_TEXT
+			};
+		});
 	}
 
 	private async find(client: pg.Pool | pg.PoolClient, transactionId?: string, sessionId?: string): Promise<Binding | undefined> {

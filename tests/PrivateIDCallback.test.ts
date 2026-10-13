@@ -106,11 +106,12 @@ describe("PrivateID callback", () => {
 				const client = new PrivateIDClient();
 				const session = await client.createAuthenticationSession();
 				const providerSubject = "dev-user-1";
+				const email = `callback-${randomUUID()}@bookwrm.local`;
 
 				const canonicalUser = await identityRegistry.resolveOrCreate({
-						provider: "PrivateID",
-						providerSubject: `seed-${randomUUID()}`,
-						email: "dev.user@bookwrm.local",
+						provider: "HAPI_EMAIL",
+						providerSubject: email,
+						email,
 						emailVerified: true
 				});
 				await inMemoryUserAuthenticatorRepository.create({

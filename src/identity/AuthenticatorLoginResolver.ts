@@ -41,6 +41,8 @@ function defaultUsers(): UserStore {
 
 export const inMemoryUserRepository = inMemoryIdentitySubjectRepository;
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 // Authentication resolves a pre-existing authenticator and user. It never creates either identity record.
 export class AuthenticatorLoginResolver {
 	constructor(
@@ -53,16 +55,21 @@ export class AuthenticatorLoginResolver {
 		const authenticator = await this.authenticators.findByProviderSubject(provider, providerSubject);
 		if (!authenticator) throw new AuthenticatorLoginError("AUTHENTICATION_FAILED");
 		if (authenticator.status === "revoked") throw new AuthenticatorLoginError("AUTHENTICATOR_REVOKED");
+		if (authenticator.status !== "active" || authenticator.provider !== "privateid" ||
+			authenticator.authenticatorType !== "face" || authenticator.providerSubject !== providerSubject) {
+			throw new AuthenticatorLoginError("AUTHENTICATION_FAILED");
+		}
 		return authenticator;
 	}
 
 	async resolveUserFromAuthenticator(authenticator: UserAuthenticator): Promise<IdentitySubject> {
 		const user = await this.users.findById(authenticator.userId);
-		// TEMPORARY RELEASE C4.7 - REMOVE AFTER PRODUCTION CERTIFICATION. Diagnostics only, no UUIDs/PII.
-		console.info("STATUS_CHECK", { status: user?.status ?? null });
-		if (!user || user.status !== "ACTIVE") {
-			console.info("STATUS_ABORT", { reason: "USER_INACTIVE" });
-			throw new AuthenticatorLoginError("USER_INACTIVE");
+		if (!user || user.id !== authenticator.userId) throw new AuthenticatorLoginError("AUTHENTICATION_FAILED");
+		if (user.status !== "ACTIVE") throw new AuthenticatorLoginError("USER_INACTIVE");
+		if (user.primaryProvider !== "HAPI_EMAIL" || user.emailVerified !== true ||
+			!user.email || user.email !== user.primaryProviderSubject ||
+			!UUID_PATTERN.test(user.oidcSubject)) {
+			throw new AuthenticatorLoginError("AUTHENTICATION_FAILED");
 		}
 		return user;
 	}

@@ -46,7 +46,7 @@ function createInMemoryEnrollmentTransactions() {
 }
 
 describe("Release C4.2: Bookwrm-native IdentitySubject creation", () => {
-	it("enrollment mints an IdentitySubject for a Bookwrm-native user, and /privateid/callback resolves PUID -> UserAuthenticator -> IdentitySubject -> ACTIVE -> OIDC -> 302", async () => {
+	it("legacy PrivateID enrollment may mint its record, but cannot authenticate as a canonical HAPI Face identity", async () => {
 		const { app } = await buildOidcTestApp();
 		const bookwrmUserId = randomUUID();
 		const puid = `puid-${randomUUID()}`;
@@ -100,11 +100,8 @@ describe("Release C4.2: Bookwrm-native IdentitySubject creation", () => {
 			url: `/privateid/callback?reason=success&sessionId=${encodeURIComponent(record.session.sessionId)}&transactionId=${encodeURIComponent(record.session.transactionId)}`
 		});
 
-		expect(callbackResponse.statusCode).toBe(302);
-		const location = callbackResponse.headers.location;
-		expect(location).toBeDefined();
-		const redirectUrl = new URL(location as string);
-		expect(redirectUrl.searchParams.get("code")).toBeTruthy();
+		expect(callbackResponse.statusCode).toBe(200);
+		expect(callbackResponse.json()).toMatchObject({ status: "failed" });
 
 		await app.close();
 	});

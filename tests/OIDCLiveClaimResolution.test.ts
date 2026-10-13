@@ -22,12 +22,11 @@ const STUB_PENDING_CONTEXT: PendingAuthorizationContext = {
 };
 
 async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp>>["app"], providerSubject: string) {
-	if (!await inMemoryUserAuthenticatorRepository.findByProviderSubject("privateid", providerSubject)) {
+	let authenticator = await inMemoryUserAuthenticatorRepository.findByProviderSubject("privateid", providerSubject);
+	if (!authenticator) {
+		const email = `live-claim-${randomUUID()}@example.test`;
 		const user = await identityRegistry.resolveOrCreate({
-			provider: "PrivateID",
-			providerSubject: `seed-${randomUUID()}`,
-			email: "user@example.com",
-			emailVerified: true
+			provider: "HAPI_EMAIL", providerSubject: email, email, emailVerified: true
 		});
 		await inMemoryUserAuthenticatorRepository.create({
 			id: randomUUID(),
@@ -37,6 +36,7 @@ async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp
 			authenticatorType: "face",
 			status: "active"
 		});
+		authenticator = await inMemoryUserAuthenticatorRepository.findByProviderSubject("privateid", providerSubject);
 	}
 		const correlationId = randomUUID();
 		storeCorrelation(correlationId, STUB_PENDING_CONTEXT);
@@ -85,7 +85,8 @@ async function createOidcSession(app: Awaited<ReturnType<typeof buildOidcTestApp
 				throw new Error("Expected authenticated user to be recorded after webhook processing");
 		}
 
-		return { code, oidcSubject: authenticatedUser.sub };
+		const canonicalUser = await identityRegistry.findById(authenticator!.userId);
+		return { code, oidcSubject: authenticatedUser.sub, canonicalEmail: canonicalUser!.email! };
 }
 
 function decodeIdTokenPayload(idToken: string): Record<string, unknown> {
@@ -150,7 +151,7 @@ describe("Release Patch 6.1: live claim resolution at token issuance", () => {
 
 				const first = await createOidcSession(app, privateIdUserId);
 				await identityRegistry.applyClaimUpdate(first.oidcSubject, {
-						email: "case3-stable@bookwrm.local",
+						email: first.canonicalEmail,
 						emailVerified: true,
 						displayName: "Case Three"
 				});
@@ -166,7 +167,7 @@ describe("Release Patch 6.1: live claim resolution at token issuance", () => {
 				const idTokenPayload = decodeIdTokenPayload(String(tokens.id_token));
 
 				expect(idTokenPayload.sub).toBe(first.oidcSubject);
-				expect(idTokenPayload.email).toBe("case3-stable@bookwrm.local");
+				expect(idTokenPayload.email).toBe(first.canonicalEmail);
 				expect(idTokenPayload.email_verified).toBe(true);
 				expect(idTokenPayload.name).toBe("Case Three");
 
@@ -176,7 +177,7 @@ describe("Release Patch 6.1: live claim resolution at token issuance", () => {
 						headers: { authorization: `Bearer ${String(tokens.access_token)}` }
 				});
 				const userInfoPayload = userInfoResponse.json() as Record<string, unknown>;
-				expect(userInfoPayload.email).toBe("case3-stable@bookwrm.local");
+				expect(userInfoPayload.email).toBe(first.canonicalEmail);
 				expect(userInfoPayload.email_verified).toBe(true);
 				expect(userInfoPayload.name).toBe("Case Three");
 

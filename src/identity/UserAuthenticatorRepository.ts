@@ -86,6 +86,9 @@ export class UserAuthenticatorRepository {
 			`SELECT * FROM user_authenticators WHERE provider = $1 AND provider_subject = $2`,
 			[provider, providerSubject]
 		);
+		if (result.rows.length > 1) {
+			throw new Error("Ambiguous authenticator ownership");
+		}
 		return result.rows[0] ? toUserAuthenticator(result.rows[0]) : undefined;
 	}
 

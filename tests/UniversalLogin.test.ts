@@ -527,6 +527,87 @@ describe("H6 Universal Login", () => {
 		} finally { f.lookup.mockRestore(); await f.app.close(); }
 	});
 
+	it.each([
+		{ journey: "new", email: "invited-new@example.com", purpose: "REGISTRATION" },
+		{ journey: "returning", email: KNOWN_EMAIL, purpose: "AUTHENTICATION" }
+	])("H6.9 $journey invited user authenticates without invitation state and preserves RP return correlation",
+		async ({ email, purpose }) => {
+			setFlag(true);
+			const f = await emailFixture();
+			try {
+				const invitationToken = randomBytes(32).toString("base64url");
+				const returnDestination = `/invite/${invitationToken}`;
+				const state = randomBytes(32).toString("base64url");
+				// RP-only stand-in, not a Base44 implementation: HAPI receives only the random state.
+				const rpReturns = new Map([[state, returnDestination]]);
+				const verifier = randomBytes(32).toString("base64url");
+				const nonce = randomBytes(32).toString("base64url");
+				const existingAuthenticator = await inMemoryUserAuthenticatorRepository.create({
+					id: randomUUID(), userId: f.subject.id, provider: "privateid",
+					providerSubject: `h69-face-${randomUUID()}`, authenticatorType: "face", status: "active"
+				});
+				const register = vi.spyOn(f.registration, "complete");
+				const h5 = vi.spyOn(HapiFaceEnrollmentService.prototype, "start");
+				const interaction = await beginInteraction(f, verifier, { state, nonce });
+				const saved = await new AuthorizationInteractionStore().find(interaction.handle);
+				expect(saved?.authorization).toMatchObject({ state, nonce, redirectUri: REDIRECT,
+					codeChallenge: pkceChallengeFromVerifier(verifier) });
+				expect(JSON.stringify(saved)).not.toContain(invitationToken);
+				const started = await startEmail(f, interaction, email);
+				expect(started.statusCode, started.body).toBe(303);
+				expect(f.delivery.messages[0]).toMatchObject({ destination: email, purpose });
+				const done = await submitCode(f, interaction, f.delivery.messages[0].code);
+				expect(done.statusCode, done.body).toBe(303);
+				const callback = new URL(done.headers.location as string);
+				expect(`${callback.origin}${callback.pathname}`).toBe(REDIRECT);
+				expect([...callback.searchParams.keys()].sort()).toEqual(["code", "state"]);
+				expect(callback.searchParams.get("state")).toBe(state);
+				expect(rpReturns.get(callback.searchParams.get("state")!)).toBe(returnDestination);
+				expect(done.headers.location).not.toContain(invitationToken);
+				expect(await new AuthorizationInteractionStore().find(interaction.handle)).toBeNull();
+
+				const subjects = await f.subjects.findByEmail(email);
+				expect(subjects).toHaveLength(1);
+				const canonical = subjects[0];
+				expect(canonical).toMatchObject({ applicationId: f.applicationId, status: "ACTIVE",
+					primaryProvider: "HAPI_EMAIL", primaryProviderSubject: email, email, emailVerified: true });
+				if (purpose === "REGISTRATION") {
+					expect(register).toHaveBeenCalledOnce();
+					expect(f.repository.establish).not.toHaveBeenCalled();
+				} else {
+					expect(register).not.toHaveBeenCalled();
+					expect(f.repository.establish).toHaveBeenCalledOnce();
+					expect(canonical.id).toBe(f.subject.id);
+					expect(canonical.oidcSubject).toBe(f.subject.oidcSubject);
+				}
+				const token = await f.app.inject({ method: "POST", url: "/token", headers: f.basic,
+					payload: { grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+						redirect_uri: REDIRECT, code_verifier: verifier } });
+				expect(token.statusCode, token.body).toBe(200);
+				expect(decodeJwt(token.json().id_token)).toMatchObject({ sub: canonical.oidcSubject,
+					email: canonical.email, email_verified: true, nonce, aud: CLIENT_ID, amr: ["email"] });
+				const userinfo = await f.app.inject({ method: "GET", url: "/userinfo",
+					headers: { authorization: `Bearer ${token.json().access_token}` } });
+				expect(userinfo.statusCode, userinfo.body).toBe(200);
+				expect(userinfo.json()).toMatchObject({ sub: canonical.oidcSubject,
+					email: canonical.email, email_verified: true });
+				expect(await f.subjects.findById(f.subject.id)).toEqual(f.subject);
+				expect(await f.subjects.findById(canonical.id)).toEqual(canonical);
+				expect(await inMemoryUserAuthenticatorRepository.findByProviderSubject(
+					"privateid", existingAuthenticator.providerSubject)).toEqual(existingAuthenticator);
+				if (purpose === "REGISTRATION") {
+					expect(await inMemoryUserAuthenticatorRepository.findByUser(canonical.id)).toEqual([]);
+				}
+				expect(h5).not.toHaveBeenCalled();
+				expect(f.provider.beginAsyncAuthentication).not.toHaveBeenCalled();
+				expect(JSON.stringify(canonical)).not.toContain(invitationToken);
+				expect(f.logs.join("\n")).not.toContain(invitationToken);
+				expect(f.logs.join("\n")).not.toContain(returnDestination);
+				const replay = await submitCode(f, interaction, f.delivery.messages[0].code);
+				expect(replay.statusCode).toBe(400);
+			} finally { f.lookup.mockRestore(); await f.app.close(); }
+		});
+
 	it("fails generically for a PrivateID email without attempting H3 or changing that identity", async () => {
 		setFlag(true);
 		const f = await emailFixture();
@@ -828,8 +909,9 @@ describe("H6 Universal Login → existing PrivateID Face", () => {
 			const record = getCurrentPrivateIDSessionRecord()!;
 			expect(record.session.sessionId).not.toBe(before);
 			const puid = `puid-${randomUUID()}`;
-			const user = await identityRegistry.resolveOrCreate({ provider: "PrivateID", providerSubject: `seed-${randomUUID()}`,
-				email: "dev.user@bookwrm.local", emailVerified: true });
+			const email = `face-login-${randomUUID()}@bookwrm.local`;
+			const user = await identityRegistry.resolveOrCreate({ provider: "HAPI_EMAIL", providerSubject: email,
+				email, emailVerified: true });
 			await inMemoryUserAuthenticatorRepository.create({ id: randomUUID(), userId: user.id, provider: "privateid",
 				providerSubject: puid, authenticatorType: "face", status: "active" });
 			const webhook = await app.inject({ method: "POST", url: "/privateid/webhook",

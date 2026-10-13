@@ -17,13 +17,13 @@ function decodeIdTokenPayload(idToken: string): Record<string, unknown> {
 		return JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8"));
 }
 
-// Seeds an IdentitySubject the way PrivateIDEnrollmentService.completeEnrollment() currently does:
-// no email/emailVerified at all -- reproducing the Release C5.1 investigation findings.
-async function seedFaceLoginUserWithoutEmail() {
+async function seedFaceLoginUserWithoutEmail(canonicalHapiEmail = false) {
 		const providerSubject = `puid-${randomUUID()}`;
+		const email = `jeff-${randomUUID()}@bookwrm.local`;
 		const subject = await identityRegistry.resolveOrCreate({
-				provider: "PrivateID",
-				providerSubject
+				provider: canonicalHapiEmail ? "HAPI_EMAIL" : "PrivateID",
+				providerSubject: canonicalHapiEmail ? email : `seed-${providerSubject}`,
+				...(canonicalHapiEmail ? { email, emailVerified: true } : {})
 		});
 		await inMemoryUserAuthenticatorRepository.create({
 				id: randomUUID(),
@@ -89,7 +89,7 @@ async function driveOidcLoginToCode(app: Awaited<ReturnType<typeof buildOidcTest
 describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 		it("populates email/emailVerified and flows through to the ID Token and /userinfo", async () => {
 				const { app } = await buildOidcTestApp();
-				const { subject, providerSubject } = await seedFaceLoginUserWithoutEmail();
+				const { subject, providerSubject } = await seedFaceLoginUserWithoutEmail(true);
 				const externalUserId = "6a1f25b6f6771ce75374f8ad";
 				const verifier = "account-link-verifier-123456789";
 
@@ -102,7 +102,7 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 						payload: {
 								source: "bookwrm",
 								oidcSubject: subject.oidcSubject,
-								email: "jeff@bookwrm.local",
+								email: subject.email,
 								emailVerified: true
 						}
 				});
@@ -114,9 +114,9 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 				const reloaded = await identityRegistry.findByOidcSubject(subject.oidcSubject);
 				expect(reloaded?.id).toBe(subject.id);
 				expect(reloaded?.oidcSubject).toBe(subject.oidcSubject);
-				expect(reloaded?.primaryProviderSubject).toBe(providerSubject);
+				expect(reloaded?.primaryProviderSubject).toBe(subject.primaryProviderSubject);
 				expect(reloaded?.status).toBe("ACTIVE");
-				expect(reloaded?.email).toBe("jeff@bookwrm.local");
+				expect(reloaded?.email).toBe(subject.email);
 				expect(reloaded?.emailVerified).toBe(true);
 
 				const tokenResponse = await exchangeAuthorizationCode(app, code, verifier);
@@ -125,7 +125,7 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 				const idTokenPayload = decodeIdTokenPayload(String(tokens.id_token));
 
 				expect(idTokenPayload.sub).toBe(subject.oidcSubject);
-				expect(idTokenPayload.email).toBe("jeff@bookwrm.local");
+				expect(idTokenPayload.email).toBe(subject.email);
 				expect(idTokenPayload.email_verified).toBe(true);
 
 				const userInfoResponse = await app.inject({
@@ -136,7 +136,7 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 				expect(userInfoResponse.statusCode).toBe(200);
 				const userInfoPayload = userInfoResponse.json() as Record<string, unknown>;
 				expect(userInfoPayload.sub).toBe(subject.oidcSubject);
-				expect(userInfoPayload.email).toBe("jeff@bookwrm.local");
+				expect(userInfoPayload.email).toBe(subject.email);
 				expect(userInfoPayload.email_verified).toBe(true);
 
 				await app.close();
@@ -233,7 +233,7 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 				expect(response.statusCode).toBe(400);
 
 				const reloaded = await identityRegistry.findByOidcSubject(subject.oidcSubject);
-				expect(reloaded?.primaryProviderSubject).toBe(providerSubject);
+				expect(reloaded?.primaryProviderSubject).toBe(subject.primaryProviderSubject);
 				expect(reloaded?.email).toBeUndefined();
 
 				await app.close();

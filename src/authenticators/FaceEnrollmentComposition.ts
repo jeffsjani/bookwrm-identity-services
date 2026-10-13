@@ -29,7 +29,7 @@ export async function configureFaceEnrollment(app: FastifyInstance, env = proces
 		markHapiFaceEnrollmentSession(session.sessionId);
 		return session;
 	}, enabled);
-	if (enabled) await registerHapiFaceEnrollmentRoutes(app, service, new RedisOIDCStore());
+	await registerHapiFaceEnrollmentRoutes(app, service, new RedisOIDCStore());
 	// Always recognize durable H5 transactions so disabling cannot send them into legacy identity creation.
 	return service;
 }

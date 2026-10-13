@@ -289,8 +289,14 @@ describe("Task 9: Identity Merge (implemented)", () => {
 		});
 
 		it("Release C4.1: re-points the loser's UserAuthenticator to the survivor so login keeps resolving an ACTIVE canonical user", async () => {
-				const survivor = await createTestSubject(`merge-c41-survivor-${randomUUID()}@example.com`);
-				const loser = await createTestSubject(`merge-c41-loser-${randomUUID()}@example.com`);
+				const survivorEmail = `merge-c41-survivor-${randomUUID()}@example.com`;
+				const survivor = await identityRegistry.resolveOrCreate({
+						provider: "HAPI_EMAIL",
+						providerSubject: survivorEmail,
+						email: survivorEmail,
+						emailVerified: true
+				});
+				const loser = await createTestSubject(survivorEmail);
 
 				await inMemoryUserAuthenticatorRepository.create({
 						id: randomUUID(),

@@ -85,10 +85,11 @@ export function pkceChallengeFromVerifier(verifier: string): string {
 
 async function seedFaceLoginUser(): Promise<string> {
 		const providerSubject = `puid-${randomUUID()}`;
+	const email = `hapi-email-${randomUUID()}@bookwrm.local`;
 		const user = await identityRegistry.resolveOrCreate({
-			provider: "PrivateID",
-			providerSubject: `seed-${randomUUID()}`,
-			email: "dev.user@bookwrm.local",
+			provider: "HAPI_EMAIL",
+			providerSubject: email,
+			email,
 			emailVerified: true
 		});
 		await inMemoryUserAuthenticatorRepository.create({

@@ -8,7 +8,7 @@ import { decodeJwt } from "jose";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PostgresFaceEnrollmentRepository } from "../src/authenticators/PostgresFaceEnrollmentRepository.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
-import type { FaceEnrollmentAuthority } from "../src/authenticators/FaceEnrollmentTypes.js";
+import { FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, type FaceEnrollmentAuthority } from "../src/authenticators/FaceEnrollmentTypes.js";
 import { configureFaceEnrollment } from "../src/authenticators/FaceEnrollmentComposition.js";
 import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
 import { UserAuthenticatorRepository } from "../src/identity/UserAuthenticatorRepository.js";
@@ -57,6 +57,7 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 	const tenantId = randomUUID(), applicationId = randomUUID(), otherApplication = randomUUID(), otherTenant = randomUUID();
 	const context = { tenantId, applicationId };
 	const clientId = "h5-fixture-" + randomUUID(), otherClientId = "h5-other-" + randomUUID();
+	const sameApplicationClient = "h5-same-app-" + randomUUID();
 	const h1 = { clients: new PostgresOIDCClientRepository(pool), applications: new PostgresApplicationRepository(pool),
 		tenants: new PostgresTenantRepository(pool) };
 	const headers = { authorization: "Basic " + Buffer.from(clientId + ":fixture-secret").toString("base64") };
@@ -66,13 +67,15 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 	}));
 	const service = new HapiFaceEnrollmentService(repository, createSession);
 
-	async function seed() {
+	async function seed(withConsent = true) {
 		const email = `${randomUUID()}@example.test`;
 		const challenge = await h2.start(context, email, "REGISTRATION");
 		const code = provider.messages.findLast(message => message.destination === email)!.code;
 		await h2.verify(context, challenge.challengeId, code, "REGISTRATION");
 		const registered = await registration.complete({ context, verificationId: challenge.challengeId });
-		return (await subjects.findByOidcSubject(registered.subject))!;
+		const subject = (await subjects.findByOidcSubject(registered.subject))!;
+		if (withConsent) await service.acceptConsent(authority(subject.oidcSubject), FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+		return subject;
 	}
 	function authority(sub: string, overrides: Partial<FaceEnrollmentAuthority> = {}): FaceEnrollmentAuthority {
 		return { sub, clientId, scope: "openid email", expiresAt: Date.now() + 600_000,
@@ -107,7 +110,8 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			provenance: (await pool.query("SELECT * FROM identity_claim_provenance WHERE identity_subject_id=$1 ORDER BY claim_name", [subjectId])).rows,
 			evidence: (await pool.query("SELECT * FROM registration_evidence WHERE identity_subject_id=$1", [subjectId])).rows,
 			identities: (await pool.query("SELECT count(*)::int AS n FROM identity_subjects")).rows[0].n,
-			links: (await pool.query("SELECT count(*)::int AS n FROM identity_account_links")).rows[0].n
+			links: (await pool.query("SELECT count(*)::int AS n FROM identity_account_links")).rows[0].n,
+			consents: (await pool.query("SELECT count(*)::int AS n FROM hapi_face_authentication_consents")).rows[0].n
 		};
 	}
 	beforeAll(async () => {
@@ -127,6 +131,9 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 				clientSecret: "fixture-secret", redirectUris: ["https://rp.example/callback"], scopes: ["openid", "email"],
 				grantTypes: ["authorization_code"], responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
 		}
+		await h1.clients.upsert({ id: randomUUID(), applicationId, clientId: sameApplicationClient,
+			clientSecret: "fixture-secret", redirectUris: ["https://rp.example/callback"], scopes: ["openid", "email"],
+			grantTypes: ["authorization_code"], responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
 	});
 	afterAll(async () => {
 		await pool.end();
@@ -151,6 +158,62 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		for (const audit of audits) expect(audit).toMatchObject({ tenant_id: tenantId, application_id: applicationId, client_id: clientId,
 			identity_subject_id: subject.id, provider: "privateid", occurred_at: expect.any(Date) });
 		expect(JSON.stringify(audits)).not.toContain(puid);
+	});
+	it("requires current FACE_AUTH_V1 consent recorded for the exact subject, application and client", async () => {
+		const subject = await seed(false);
+		await expect(service.start(authority(subject.oidcSubject))).rejects.toMatchObject({ code: "FACE_CONSENT_REQUIRED", statusCode: 403 });
+		await pool.query(`INSERT INTO hapi_face_authentication_consents
+			(id,identity_subject_id,tenant_id,application_id,client_id,purpose,consent_version,accepted_at)
+			VALUES ($1,$2,$3,$4,$5,$6,'FACE_AUTH_V0',NOW())`,
+		[randomUUID(), subject.id, tenantId, applicationId, clientId, FACE_AUTH_CONSENT_PURPOSE]);
+		await expect(service.start(authority(subject.oidcSubject))).rejects.toMatchObject({ code: "FACE_CONSENT_REQUIRED" });
+		await expect(service.acceptConsent(authority(subject.oidcSubject), "FACE_AUTH_V0", FACE_AUTH_CONSENT_PURPOSE))
+			.rejects.toMatchObject({ code: "INVALID_CONSENT", statusCode: 400 });
+		await expect(service.acceptConsent(authority(subject.oidcSubject), FACE_AUTH_CONSENT_VERSION, "ACCOUNT_LINKING"))
+			.rejects.toMatchObject({ code: "INVALID_CONSENT", statusCode: 400 });
+		const other = await seed(false);
+		await service.acceptConsent(authority(other.oidcSubject), FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+		await expect(service.start(authority(subject.oidcSubject))).rejects.toMatchObject({ code: "FACE_CONSENT_REQUIRED" });
+		await expect(service.acceptConsent(authority(subject.oidcSubject, { clientId: otherClientId }),
+			FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE))
+			.rejects.toMatchObject({ code: "ENROLLMENT_NOT_AUTHORIZED", statusCode: 403 });
+		await service.acceptConsent(authority(subject.oidcSubject, { clientId: sameApplicationClient }),
+			FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+		await expect(service.start(authority(subject.oidcSubject))).rejects.toMatchObject({ code: "FACE_CONSENT_REQUIRED" });
+		const consent = (await pool.query(`SELECT identity_subject_id,tenant_id,application_id,client_id,purpose,consent_version
+			FROM hapi_face_authentication_consents WHERE identity_subject_id=$1 AND consent_version=$2`,
+		[subject.id, FACE_AUTH_CONSENT_VERSION])).rows;
+		expect(consent).toEqual([{
+			identity_subject_id: subject.id, tenant_id: tenantId, application_id: applicationId,
+			client_id: sameApplicationClient, purpose: FACE_AUTH_CONSENT_PURPOSE, consent_version: FACE_AUTH_CONSENT_VERSION
+		}]);
+		await expect(service.start(authority(subject.oidcSubject, { clientId: otherClientId })))
+			.rejects.toMatchObject({ code: "ENROLLMENT_NOT_AUTHORIZED", statusCode: 403 });
+		const result = await service.start(authority(subject.oidcSubject, { clientId: sameApplicationClient }));
+		expect(result.enrolled).toBe(false);
+	});
+	it("derives enrollment and login capability from current canonical subject, consent and authenticator state", async () => {
+		const subject = await seed();
+		expect(await repository.capabilityStatus(authority(subject.oidcSubject), true)).toMatchObject({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired: false, enrollmentState: "NOT_ENROLLED"
+		});
+		const flow = await pending(subject.oidcSubject);
+		expect(await repository.capabilityStatus(authority(subject.oidcSubject), true)).toMatchObject({
+			faceEnrollmentEligible: false, faceLoginEligible: false, enrollmentState: "PENDING"
+		});
+		const puid = randomUUID();
+		await complete(flow, puid);
+		expect(await repository.capabilityStatus(authority(subject.oidcSubject), true)).toMatchObject({
+			faceEnrollmentEligible: false, faceLoginEligible: true, consentRequired: false, enrollmentState: "ACTIVE"
+		});
+		const authenticator = (await authenticators.findByProviderSubject("privateid", puid))!;
+		await authenticators.revoke(authenticator.id);
+		expect(await repository.capabilityStatus(authority(subject.oidcSubject), true)).toMatchObject({
+			faceEnrollmentEligible: true, faceLoginEligible: false, enrollmentState: "REVOKED"
+		});
+		expect(await repository.capabilityStatus(authority(subject.oidcSubject), false)).toMatchObject({
+			faceEnrollmentEligible: false, faceLoginEligible: false
+		});
 	});
 	it("makes repeated completion and repeated enrollment idempotent without another provider ceremony", async () => {
 		const subject = await seed(), flow = await pending(subject.oidcSubject), puid = randomUUID();
@@ -424,8 +487,10 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		const app = Fastify();
 		try {
 			const callbacks = await configureFaceEnrollment(app, { HAPI_FACE_ENROLLMENT_ENABLED: "false" });
-			expect(callbacks).toBeDefined();
-			expect((await app.inject({ method: "POST", url: "/v1/authenticators/privateid/enroll", payload: {} })).statusCode).toBe(404);
+			if (!callbacks) throw new Error("PostgreSQL H5 callbacks were not configured");
+			await expect(callbacks.start(authority(subject.oidcSubject))).rejects.toMatchObject({
+				code: "FACE_ENROLLMENT_DISABLED", statusCode: 404
+			});
 			await repository.ensureSchema();
 			await repository.ensureSchema();
 			expect(await snapshot(subject.id)).toEqual(before);

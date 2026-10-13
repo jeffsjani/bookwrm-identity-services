@@ -46,10 +46,11 @@ function postSuccessWebhook(
 }
 
 async function seedFaceLoginUser(providerSubject: string) {
+	const email = `legacy-fallback-${randomUUID()}@example.test`;
 	const user = await identityRegistry.resolveOrCreate({
-		provider: "PrivateID",
-		providerSubject: `seed-${randomUUID()}`,
-		email: "user@example.com",
+		provider: "HAPI_EMAIL",
+		providerSubject: email,
+		email,
 		emailVerified: true
 	});
 	await inMemoryUserAuthenticatorRepository.create({

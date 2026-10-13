@@ -49,7 +49,8 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 				const correlationId = randomUUID();
 				const session = await createOidcSession(correlationId);
 				const puid = `puid-${randomUUID()}`;
-				const subject = await identityRegistry.resolveOrCreate({ provider: "PrivateID", providerSubject: `seed-${randomUUID()}`, status: undefined, email: "known@example.test", emailVerified: true, displayName: "Known User" });
+				const email = `known-${randomUUID()}@example.test`;
+				const subject = await identityRegistry.resolveOrCreate({ provider: "HAPI_EMAIL", providerSubject: email, email, emailVerified: true, displayName: "Known User" });
 				await inMemoryUserAuthenticatorRepository.create({ id: randomUUID(), userId: subject.id, provider: "privateid", providerSubject: puid, authenticatorType: "face", status: "active" });
 
 				// Production SUCCESS webhook shape: sessionId, status, puid, guid, identityInformation, contactInformation.
@@ -96,7 +97,8 @@ describe("Release Patch 6 - puid provider subject mapping", () => {
 				const session = await createOidcSession(correlationId);
 				const puid = `puid-${randomUUID()}`;
 				const guid = `guid-${randomUUID()}`;
-				const subject = await identityRegistry.resolveOrCreate({ provider: "PrivateID", providerSubject: `seed-${randomUUID()}`, email: "known@example.test", emailVerified: true, displayName: "Known User" });
+				const email = `known-${randomUUID()}@example.test`;
+				const subject = await identityRegistry.resolveOrCreate({ provider: "HAPI_EMAIL", providerSubject: email, email, emailVerified: true, displayName: "Known User" });
 				await inMemoryUserAuthenticatorRepository.create({ id: randomUUID(), userId: subject.id, provider: "privateid", providerSubject: puid, authenticatorType: "face", status: "active" });
 
 				await postSuccessWebhook(app, {

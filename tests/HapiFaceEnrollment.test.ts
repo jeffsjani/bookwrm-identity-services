@@ -3,7 +3,7 @@ import { runInNewContext } from "node:vm";
 import Fastify from "fastify";
 import { describe, expect, it, vi } from "vitest";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
-import { FACE_ENROLLMENT_FRESHNESS_MS, requireRecentEmailAuthority,
+import { FACE_AUTH_CONSENT_TEXT, FACE_ENROLLMENT_FRESHNESS_MS, requireRecentEmailAuthority,
 	type FaceEnrollmentAuthority, type FaceEnrollmentRepository } from "../src/authenticators/FaceEnrollmentTypes.js";
 import { registerHapiFaceEnrollmentRoutes } from "../src/routes/hapiFaceEnrollment.js";
 import { configureFaceEnrollment } from "../src/authenticators/FaceEnrollmentComposition.js";
@@ -19,6 +19,11 @@ function fixture() {
 	const reservation = { alreadyEnrolled: false as const, transactionId: randomUUID(), providerTransactionId: randomUUID() };
 	const repository: FaceEnrollmentRepository = {
 		reserve: vi.fn(async () => reservation), bind: vi.fn(async () => new Date(Date.now() + 300_000).toISOString()),
+		acceptConsent: vi.fn(async () => {}),
+		capabilityStatus: vi.fn(async () => ({ faceEnrollmentEligible: false, faceLoginEligible: false,
+			consentRequired: true, enrollmentState: "NOT_ENROLLED" as const,
+			consentVersion: "FACE_AUTH_V1" as const, consentPurpose: "FACE_AUTHENTICATION" as const,
+			consentText: FACE_AUTH_CONSENT_TEXT })),
 		status: vi.fn(async () => ({ statusCode: 200, body: { status: "PENDING" } })),
 		fail: vi.fn(async () => {}), webhook: vi.fn(async () => undefined), callback: vi.fn(async () => undefined)
 	};
@@ -91,6 +96,18 @@ describe("H5 recent HAPI authority and provider orchestration", () => {
 		expect(repository.webhook).toHaveBeenCalledWith("transaction", "session", "SUCCESS", "puid", false);
 		expect(createSession).not.toHaveBeenCalled();
 	});
+	it("requires versioned affirmative consent and recent HAPI Email authority before recording it", async () => {
+		const { service, repository } = fixture();
+		await expect(service.acceptConsent(authority(), "FACE_AUTH_V0", "FACE_AUTHENTICATION"))
+			.rejects.toMatchObject({ code: "INVALID_CONSENT", statusCode: 400 });
+		await expect(service.acceptConsent(authority(), "FACE_AUTH_V1", "UNRELATED_SERVICE"))
+			.rejects.toMatchObject({ code: "INVALID_CONSENT", statusCode: 400 });
+		await expect(service.acceptConsent(authority({ authenticationMethod: "PRIVATEID_FACE" }), "FACE_AUTH_V1", "FACE_AUTHENTICATION"))
+			.rejects.toMatchObject({ statusCode: 401 });
+		expect(repository.acceptConsent).not.toHaveBeenCalled();
+		await service.acceptConsent(authority(), "FACE_AUTH_V1", "FACE_AUTHENTICATION");
+		expect(repository.acceptConsent).toHaveBeenCalledOnce();
+	});
 });
 
 describe("H5 application-neutral route", () => {
@@ -121,6 +138,29 @@ describe("H5 application-neutral route", () => {
 				expect((await app.inject({ method: "POST", url: "/v1/authenticators/privateid/enroll", headers, payload: {} })).statusCode).toBe(401);
 			}
 			expect(createSession).not.toHaveBeenCalled();
+		} finally { await app.close(); }
+	});
+	it("returns server-derived, subject-scoped Face capability and records policy-versioned consent", async () => {
+		const { service, repository } = fixture();
+		const token = { ...authority(), nonce: "nonce" };
+		const app = Fastify();
+		await registerHapiFaceEnrollmentRoutes(app, service, { getAccessTokenRecord: async () => token });
+		try {
+			const status = await app.inject({ url: "/v1/authenticators/privateid/status", headers: { authorization: "Bearer valid" } });
+			expect(status.statusCode).toBe(200);
+			expect(status.json()).toMatchObject({ faceEnrollmentEligible: false, faceLoginEligible: false,
+				consentRequired: true, enrollmentState: "NOT_ENROLLED", consentVersion: "FACE_AUTH_V1",
+				consentPurpose: "FACE_AUTHENTICATION" });
+			expect(status.json()).not.toHaveProperty("providerSubject");
+			const consent = await app.inject({ method: "POST", url: "/v1/authenticators/privateid/consent",
+				headers: { authorization: "Bearer valid" },
+				payload: { accepted: true, consentVersion: "FACE_AUTH_V1", purpose: "FACE_AUTHENTICATION" } });
+			expect(consent.statusCode).toBe(200);
+			expect(repository.acceptConsent).toHaveBeenCalledWith(token, "FACE_AUTH_V1", "FACE_AUTHENTICATION");
+			const invalid = await app.inject({ method: "POST", url: "/v1/authenticators/privateid/consent",
+				headers: { authorization: "Bearer valid" }, payload: { accepted: true } });
+			expect(invalid.statusCode).toBe(400);
+			expect(consent.headers["cache-control"]).toBe("no-store");
 		} finally { await app.close(); }
 	});
 	it("rejects all browser-supplied authority and PUID fields", async () => {

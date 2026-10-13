@@ -3,6 +3,9 @@ import type { PrivateIDSession } from "../privateid/PrivateIDSession.js";
 
 export const FACE_ENROLLMENT_FRESHNESS_MS = 300_000;
 export const FACE_ENROLLMENT_TTL_MS = 300_000;
+export const FACE_AUTH_CONSENT_VERSION = "FACE_AUTH_V1";
+export const FACE_AUTH_CONSENT_PURPOSE = "FACE_AUTHENTICATION";
+export const FACE_AUTH_CONSENT_TEXT = "Face is an optional sign-in method and enrollment uses PrivateID. Email remains available as a fallback. Enrollment is optional.";
 
 export class FaceEnrollmentError extends Error {
 	constructor(public readonly code: string, public readonly statusCode = 409) {
@@ -29,7 +32,18 @@ export type FaceEnrollmentReservation =
 
 export type FaceEnrollmentReply = { statusCode: number; body: Record<string, unknown> };
 
-export type FaceEnrollmentStatus = "PENDING" | "COMPLETED" | "FAILED" | "CONFLICT" | "EXPIRED";
+export type FaceCapabilityEnrollmentState = "NOT_ENROLLED" | "PENDING" | "ACTIVE" | "FAILED" | "REVOKED";
+export type FaceEnrollmentStatus = FaceCapabilityEnrollmentState | "COMPLETED" | "CONFLICT";
+
+export type FaceCapabilityStatus = {
+	faceEnrollmentEligible: boolean;
+	faceLoginEligible: boolean;
+	consentRequired: boolean;
+	enrollmentState: FaceCapabilityEnrollmentState;
+	consentVersion: typeof FACE_AUTH_CONSENT_VERSION;
+	consentPurpose: typeof FACE_AUTH_CONSENT_PURPOSE;
+	consentText: typeof FACE_AUTH_CONSENT_TEXT;
+};
 
 export function requireStatusAuthority(authority: FaceEnrollmentAuthority, now = Date.now()): void {
 	if (!Number.isFinite(authority.expiresAt) || authority.expiresAt <= now ||
@@ -40,6 +54,8 @@ export function requireStatusAuthority(authority: FaceEnrollmentAuthority, now =
 
 export interface FaceEnrollmentRepository {
 	reserve(authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReservation>;
+	acceptConsent(authority: FaceEnrollmentAuthority, consentVersion: string, purpose: string): Promise<void>;
+	capabilityStatus(authority: FaceEnrollmentAuthority, enabled: boolean): Promise<FaceCapabilityStatus>;
 	status(enrollmentId: string, authority: FaceEnrollmentAuthority): Promise<FaceEnrollmentReply>;
 	bind(reservation: Extract<FaceEnrollmentReservation, { alreadyEnrolled: false }>,
 		session: PrivateIDSession): Promise<string>;
