@@ -8,6 +8,7 @@ const IORedis = IORedisModule as unknown as {
 };
 
 export interface RedisClient {
+		eval(script: string, numberOfKeys: number, ...args: Array<string | number>): Promise<unknown>;
 		set(key: string, value: string, ...args: unknown[]): Promise<unknown>;
 		get(key: string): Promise<string | null>;
 		del(...keys: string[]): Promise<number>;

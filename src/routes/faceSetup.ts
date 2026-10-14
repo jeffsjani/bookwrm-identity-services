@@ -7,13 +7,14 @@ import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "
 import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
 import {
 	FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, FACE_ENROLLMENT_FRESHNESS_MS,
-	FaceEnrollmentError, type FaceEnrollmentAuthority
+	FaceEnrollmentError, requireRecentEmailAuthority, type FaceEnrollmentAuthority
 } from "../authenticators/FaceEnrollmentTypes.js";
 import type { HapiFaceEnrollmentService } from "../authenticators/HapiFaceEnrollmentService.js";
 import { FaceSetupInteractionStore } from "../authenticators/FaceSetupInteractionStore.js";
 import {
-	FACE_SETUP_COOKIE, buildOutcomeRedirect, type FaceSetupInteraction
+	FACE_SETUP_COOKIE, FaceSetupError, buildOutcomeRedirect, type FaceSetupInteraction
 } from "../authenticators/FaceSetupTypes.js";
+import { logFaceSetup, type FaceSetupReason } from "../authenticators/FaceSetupDiagnostics.js";
 import {
 	faceSetupCodePage, faceSetupConsentPage, faceSetupEmailPage, faceSetupMessagePage, faceSetupProcessingPage
 } from "../authenticators/FaceSetupPages.js";
@@ -36,6 +37,10 @@ const expiredPage = () => faceSetupMessagePage({
 });
 
 const notEligiblePage = (message: string) => faceSetupMessagePage({ title: "Face Login isn't available", message });
+const continuationFailedPage = () => faceSetupMessagePage({
+	title: "We couldn't continue Face Login setup.",
+	message: "Return to Bookwrm and start Face Login setup again."
+});
 
 function cookieHeader(handle: string | null): string {
 	return handle
@@ -56,7 +61,21 @@ function sendPage(reply: FastifyReply, status: number, rendered: { html: string;
 }
 
 export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSetupDependencies): Promise<void> {
+	await app.register(async scope => registerRoutes(scope, deps));
+}
+
+async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies): Promise<void> {
 	const { interactions, service, interactive, identitySubjects, clientAuthority, isPilotSubject, isEnabled } = deps;
+
+	app.setErrorHandler((error, request, reply) => {
+		const reason = error instanceof FaceSetupError
+			? error.code === "INTERACTION_SAVE_FAILED" ? "INTERACTION_SAVE_FAILED" : "INTERACTION_STORE_UNAVAILABLE"
+			: "UNEXPECTED_FAILURE";
+		const status = error instanceof FaceSetupError ? error.statusCode
+			: error instanceof Error && "statusCode" in error && typeof error.statusCode === "number" ? error.statusCode : 500;
+		logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", status, undefined, reason);
+		return sendPage(reply, status, continuationFailedPage());
+	});
 
 	const guardEnabled = (reply: FastifyReply): boolean => {
 		if (isEnabled()) return true;
@@ -69,6 +88,7 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 	const finish = async (reply: FastifyReply, handle: string | undefined, interaction: FaceSetupInteraction,
 		outcome: "success" | "cancelled" | "failed") => {
 		await interactions.clear(handle);
+		logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_CONSUMED", 302, interaction);
 		reply.header("Set-Cookie", cookieHeader(null));
 		return reply.code(302).header("Location", buildOutcomeRedirect(interaction.returnUri, outcome)).send();
 	};
@@ -76,15 +96,70 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 	const load = async (request: FastifyRequest, reply: FastifyReply): Promise<{ handle: string; interaction: FaceSetupInteraction } | null> => {
 		if (!guardEnabled(reply)) return null;
 		const handle = readHandle(request);
-		const interaction = await interactions.find(handle);
+		const inspection = await interactions.inspect(handle);
+		const interaction = inspection.interaction;
 		if (!interaction || !handle) {
-			sendPage(reply, 400, expiredPage());
+			const reason: FaceSetupReason = !handle ? "COOKIE_MISSING"
+				: inspection.state === "expired" ? "INTERACTION_EXPIRED"
+				: inspection.state === "invalid" ? "INTERACTION_INVALID"
+				: inspection.state === "consumed" ? "INTERACTION_ALREADY_CONSUMED" : "INTERACTION_NOT_FOUND";
+			logFaceSetup(request, "FACE_SETUP_INTERACTION_LOADED", 400, undefined, reason, inspection);
+			logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 400, undefined, reason, inspection);
+			sendPage(reply, 400, inspection.state === "expired" ? expiredPage() : continuationFailedPage());
 			return null;
 		}
+		logFaceSetup(request, "FACE_SETUP_INTERACTION_LOADED", 200, interaction, undefined, inspection);
 		return { handle, interaction };
 	};
 
 	const csrfOk = (interaction: FaceSetupInteraction, candidate: unknown) => FaceSetupInteractionStore.csrfMatches(interaction, candidate);
+	const reject = (reply: FastifyReply, interaction: FaceSetupInteraction, reason: FaceSetupReason, status = 400) => {
+		logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_FAILED", status, interaction, reason);
+		return sendPage(reply, status, continuationFailedPage());
+	};
+	const persist = async (reply: FastifyReply, handle: string, interaction: FaceSetupInteraction) => {
+		if (await interactions.save(handle, interaction)) return true;
+		reject(reply, interaction, "INTERACTION_SAVE_FAILED", 503);
+		return false;
+	};
+
+	const consentAuthorityValid = async (reply: FastifyReply, interaction: FaceSetupInteraction): Promise<boolean> => {
+		const authority = interaction.authority;
+		if (!authority || authority.clientId !== interaction.clientId) {
+			reject(reply, interaction, "AUTHORITY_INVALID", 403);
+			return false;
+		}
+		try { requireRecentEmailAuthority(authority); }
+		catch (error) {
+			if (!(error instanceof FaceEnrollmentError)) throw error;
+			reject(reply, interaction, "AUTHORITY_INVALID", 403);
+			return false;
+		}
+		const client = await clientAuthority.clients.findByClientId(interaction.clientId);
+		if (!client || !client.redirectUris.includes(interaction.returnUri) || !await emailAuthority(interaction)) {
+			reject(reply, interaction, "CLIENT_INVALID", 403);
+			return false;
+		}
+		const subject = await identitySubjects.findByOidcSubject(authority.sub);
+		if (!subject || subject.oidcSubject !== authority.sub || !isPilotSubject(subject.oidcSubject) ||
+			subject.primaryProvider !== "HAPI_EMAIL" || subject.status !== "ACTIVE" ||
+			subject.emailVerified !== true || subject.email !== subject.primaryProviderSubject) {
+			reject(reply, interaction, "AUTHORITY_INVALID", 403);
+			return false;
+		}
+		return true;
+	};
+
+	const continuation = (reply: FastifyReply, interaction: FaceSetupInteraction) => {
+		if (interaction.phase === "STARTING") {
+			return sendPage(reply, 200, faceSetupProcessingPage("/face-setup/continue"));
+		}
+		if (interaction.phase !== "ENROLLING" || !interaction.enrollment ||
+			Date.parse(interaction.enrollment.expiresAt) <= Date.now()) {
+			return reject(reply, interaction, "PHASE_INVALID");
+		}
+		return reply.code(302).header("Cache-Control", "no-store").header("Location", interaction.enrollment.launchUrl).send();
+	};
 
 	// Resolves the same H1 client authority already bound at /face-setup/start; a client disabled or
 	// reconfigured mid-ceremony fails closed rather than silently trusting the stale binding.
@@ -113,7 +188,8 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 		if (!record || !record.redirectUris.includes(query.data.return_uri)) {
 			return reply.code(400).send({ error: "INVALID_RETURN_URI" });
 		}
-		const { handle } = await interactions.create({ clientId: authority.clientId, returnUri: query.data.return_uri });
+		const { handle, interaction } = await interactions.create({ clientId: authority.clientId, returnUri: query.data.return_uri });
+		logFaceSetup(request, "FACE_SETUP_INTERACTION_CREATED", 302, interaction);
 		reply.header("Set-Cookie", cookieHeader(handle));
 		return reply.code(302).header("Location", "/face-setup/email").send();
 	});
@@ -154,7 +230,7 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 			}));
 		}
 		interaction.email = { challengeId: started.challengeId };
-		await interactions.save(handle, interaction);
+		if (!await persist(reply, handle, interaction)) return undefined;
 		return sendPage(reply, 200, faceSetupCodePage({ csrf: interaction.csrf }));
 	});
 
@@ -231,13 +307,17 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 		};
 		interaction.authority = faceAuthority;
 		interaction.phase = "CONSENT";
-		await interactions.save(handle, interaction);
+		if (!await persist(reply, handle, interaction)) return undefined;
 		return sendPage(reply, 200, faceSetupConsentPage({ csrf: interaction.csrf }));
 	});
 
 	app.get("/face-setup/consent", async (request, reply) => {
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
+		if (loaded.interaction.phase === "STARTING" || loaded.interaction.phase === "ENROLLING") {
+			if (!await consentAuthorityValid(reply, loaded.interaction)) return undefined;
+			return continuation(reply, loaded.interaction);
+		}
 		if (loaded.interaction.phase !== "CONSENT" || !loaded.interaction.authority) {
 			return finish(reply, loaded.handle, loaded.interaction, "failed");
 		}
@@ -248,29 +328,57 @@ export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSe
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
 		const { handle, interaction } = loaded;
-		if (interaction.phase !== "CONSENT" || !interaction.authority) return finish(reply, handle, interaction, "failed");
 		const body = z.object({ csrf: z.string(), decision: z.enum(["agree", "not_now"]) }).safeParse(request.body ?? {});
 		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
-			return sendPage(reply, 400, faceSetupConsentPage({ csrf: interaction.csrf }));
+			return reject(reply, interaction, "CSRF_MISMATCH");
+		}
+		if (!await consentAuthorityValid(reply, interaction)) return undefined;
+		const authority = interaction.authority;
+		if (!authority) return reject(reply, interaction, "AUTHORITY_INVALID", 403);
+		const duplicate = (current: FaceSetupInteraction) => {
+			if (current.phase !== "STARTING" && current.phase !== "ENROLLING") return reject(reply, current, "PHASE_INVALID");
+			logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, current);
+			return reply.code(303).header("Cache-Control", "no-store").header("Location", "/face-setup/continue").send();
+		};
+		if (interaction.phase !== "CONSENT") return duplicate(interaction);
+		if (!await interactions.claimConsent(handle, interaction, body.data.decision)) {
+			const current = await load(request, reply);
+			if (!current) return undefined;
+			if (!csrfOk(current.interaction, body.data.csrf)) return reject(reply, current.interaction, "CSRF_MISMATCH");
+			if (!await consentAuthorityValid(reply, current.interaction)) return undefined;
+			if (current.interaction.phase === "CONSENT") return reject(reply, current.interaction, "INTERACTION_SAVE_FAILED", 503);
+			return duplicate(current.interaction);
 		}
 		// "Not Now" creates no consent record and starts no enrollment -- it only clears the ceremony.
 		if (body.data.decision === "not_now") return finish(reply, handle, interaction, "cancelled");
 
+		logFaceSetup(request, "FACE_SETUP_CONSENT_STARTED", 200, interaction);
 		try {
-			await service.acceptConsent(interaction.authority, FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
-			const started = await service.start(interaction.authority);
+			await service.acceptConsent(authority, FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+			logFaceSetup(request, "FACE_SETUP_CONSENT_ACCEPTED", 200, interaction);
+			const started = await service.start(authority);
 			if (typeof started.enrollmentId !== "string" || typeof started.launchUrl !== "string" || typeof started.expiresAt !== "string") {
-				const status = await service.capabilityStatus(interaction.authority);
+				const status = await service.capabilityStatus(authority);
 				return finish(reply, handle, interaction, status.enrollmentState === "ACTIVE" && status.faceLoginEligible ? "success" : "failed");
 			}
-			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt };
+			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt, launchUrl: started.launchUrl };
 			interaction.phase = "ENROLLING";
-			await interactions.save(handle, interaction);
+			if (!await persist(reply, handle, interaction)) return undefined;
+			logFaceSetup(request, "FACE_SETUP_ENROLLMENT_STARTED", 302, interaction);
 			return reply.code(302).header("Location", started.launchUrl).send();
 		} catch (error) {
-			if (error instanceof FaceEnrollmentError) return finish(reply, handle, interaction, "failed");
+			if (error instanceof FaceEnrollmentError) {
+				logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 302, interaction, "ENROLLMENT_FAILED");
+				return finish(reply, handle, interaction, "failed");
+			}
 			throw error;
 		}
+	});
+
+	app.get("/face-setup/continue", async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded || !await consentAuthorityValid(reply, loaded.interaction)) return undefined;
+		return continuation(reply, loaded.interaction);
 	});
 
 	app.get("/face-setup/callback", async (request, reply) => {

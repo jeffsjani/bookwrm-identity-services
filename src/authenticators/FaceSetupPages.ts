@@ -76,7 +76,7 @@ ${input.error ? `<div class="error">${escapeHtml(input.error)}</div>` : ""}
 
 export function faceSetupConsentPage(input: { csrf: string }): RenderedFaceSetupPage {
 	const nonce = randomBytes(16).toString("base64");
-	return page(nonce, "Set up Face Login", `<h1>Set up Face Login</h1>
+	const rendered = page(nonce, "Set up Face Login", `<h1>Set up Face Login</h1>
 <p>${escapeHtml(FACE_AUTH_CONSENT_TEXT)}</p>
 <form method="POST" action="/face-setup/consent">
 <input type="hidden" name="csrf" value="${escapeHtml(input.csrf)}">
@@ -87,5 +87,18 @@ export function faceSetupConsentPage(input: { csrf: string }): RenderedFaceSetup
 <input type="hidden" name="csrf" value="${escapeHtml(input.csrf)}">
 <input type="hidden" name="decision" value="not_now">
 <button type="submit" class="secondary">Not Now</button>
-</form>`);
+</form>
+<p id="setup-progress" role="status" hidden>Setting up Face Login...</p>
+<script nonce="${nonce}">
+let submitting = false;
+for (const form of document.querySelectorAll("form")) {
+  form.addEventListener("submit", event => {
+    if (submitting) { event.preventDefault(); return; }
+    submitting = true;
+    for (const button of document.querySelectorAll("button")) button.disabled = true;
+    document.getElementById("setup-progress").hidden = false;
+  });
+}
+</script>`);
+	return { ...rendered, contentSecurityPolicy: `${rendered.contentSecurityPolicy}; script-src 'nonce-${nonce}'` };
 }

@@ -7,13 +7,13 @@ export const FACE_SETUP_PURPOSE = "FACE_SETUP";
 export const FACE_SETUP_TTL_MS = 600_000; // outer ceremony cap (email entry/verification window)
 export const FACE_SETUP_COOKIE = "hapi_face_setup";
 
-export type FaceSetupPhase = "EMAIL" | "CONSENT" | "ENROLLING";
+export type FaceSetupPhase = "EMAIL" | "CONSENT" | "STARTING" | "ENROLLING" | "CANCELLED";
 
 export type FaceSetupOutcome = "success" | "cancelled" | "failed";
 
 export class FaceSetupError extends Error {
-	constructor(public readonly code: string, public readonly statusCode = 400) {
-		super(code);
+	constructor(public readonly code: string, public readonly statusCode = 400, options?: ErrorOptions) {
+		super(code, options);
 	}
 }
 
@@ -30,7 +30,7 @@ export type FaceSetupInteraction = {
 	expiresAt: number;
 	email?: { challengeId: string };
 	authority?: FaceEnrollmentAuthority;
-	enrollment?: { enrollmentId: string; expiresAt: string };
+	enrollment?: { enrollmentId: string; expiresAt: string; launchUrl: string };
 };
 
 export function buildOutcomeRedirect(returnUri: string, outcome: FaceSetupOutcome): string {

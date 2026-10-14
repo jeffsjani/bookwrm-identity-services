@@ -8,6 +8,9 @@ import { decodeJwt } from "jose";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PostgresFaceEnrollmentRepository } from "../src/authenticators/PostgresFaceEnrollmentRepository.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
+import { FaceSetupInteractionStore } from "../src/authenticators/FaceSetupInteractionStore.js";
+import { FACE_SETUP_COOKIE } from "../src/authenticators/FaceSetupTypes.js";
+import { registerFaceSetupRoutes } from "../src/routes/faceSetup.js";
 import { FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, type FaceEnrollmentAuthority } from "../src/authenticators/FaceEnrollmentTypes.js";
 import { configureFaceEnrollment } from "../src/authenticators/FaceEnrollmentComposition.js";
 import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
@@ -139,6 +142,43 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		await pool.end();
 		await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
 		await admin.end();
+	});
+
+	it("persists one consent, reservation and provider session for concurrent and replayed Face Setup submissions", async () => {
+		const subject = await seed(false);
+		const before = await snapshot(subject.id);
+		const interactions = new FaceSetupInteractionStore();
+		const { handle, interaction } = await interactions.create({ clientId, returnUri: "https://rp.example/callback" });
+		interaction.phase = "CONSENT";
+		interaction.authority = authority(subject.oidcSubject);
+		expect(await interactions.save(handle, interaction)).toBe(true);
+		const sessionCount = createSession.mock.calls.length;
+		const unused = (): never => { throw new Error("Unexpected email operation"); };
+		const app = Fastify();
+		await registerFaceSetupRoutes(app, {
+			interactions, service, clientAuthority: h1, identitySubjects: subjects,
+			interactive: {
+				authority: async () => ({ context, clientId, tenantName: "H5" }),
+				start: unused, resend: unused, verify: unused, consumeResult: unused
+			},
+			isPilotSubject: sub => sub === subject.oidcSubject, isEnabled: () => true
+		});
+		try {
+			const request = { method: "POST" as const, url: "/face-setup/consent",
+				headers: { cookie: `${FACE_SETUP_COOKIE}=${handle}` }, payload: { csrf: interaction.csrf, decision: "agree" } };
+			const responses = await Promise.all([app.inject(request), app.inject(request)]);
+			expect(responses.map(response => response.statusCode).sort()).toEqual([302, 303]);
+			expect((await app.inject(request)).statusCode).toBe(303);
+			expect((await interactions.find(handle))?.phase).toBe("ENROLLING");
+			expect(createSession.mock.calls.length - sessionCount).toBe(1);
+			const counts = (await pool.query(`SELECT
+				(SELECT count(*)::int FROM hapi_face_authentication_consents WHERE identity_subject_id=$1 AND consent_version='FACE_AUTH_V1') AS consent,
+				(SELECT count(*)::int FROM privateid_enrollment_transactions WHERE user_id=$1::text) AS enrollment,
+				(SELECT count(*)::int FROM hapi_face_enrollment_bindings WHERE identity_subject_id=$1 AND session_id IS NOT NULL) AS binding,
+				(SELECT count(*)::int FROM user_authenticators WHERE user_id=$1::text) AS authenticator`, [subject.id])).rows[0];
+			expect(counts).toEqual({ consent: 1, enrollment: 1, binding: 1, authenticator: 0 });
+			expect(await snapshot(subject.id)).toEqual({ ...before, consents: 1 });
+		} finally { await app.close(); await interactions.clear(handle); }
 	});
 
 	it("attaches to the H3 canonical subject without altering any identity, claims, provenance, evidence or links", async () => {
