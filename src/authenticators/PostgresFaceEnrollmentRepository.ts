@@ -76,6 +76,11 @@ export class PostgresFaceEnrollmentRepository {
 			const now = await this.now(client);
 			requireRecentEmailAuthority(authority, now.getTime());
 			if (!subject || !context) throw new FaceEnrollmentError("ENROLLMENT_NOT_AUTHORIZED", 403);
+			const existing = (await client.query(`SELECT 1 FROM hapi_face_authentication_consents
+				WHERE identity_subject_id=$1 AND tenant_id=$2 AND application_id=$3 AND client_id=$4
+				AND purpose=$5 AND consent_version=$6 LIMIT 1`, [subject.id, context.tenant_id,
+				context.application_id, context.client_id, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION])).rows[0];
+			if (existing) return;
 			await client.query(`INSERT INTO hapi_face_authentication_consents
 				(id,identity_subject_id,tenant_id,application_id,client_id,purpose,consent_version,accepted_at)
 				VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [randomUUID(), subject.id, context.tenant_id,

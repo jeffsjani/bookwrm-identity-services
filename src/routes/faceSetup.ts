@@ -173,6 +173,54 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		}
 	};
 
+	const submitConsent = async (request: FastifyRequest, reply: FastifyReply, handle: string,
+		interaction: FaceSetupInteraction, csrf: string, decision: "agree" | "not_now") => {
+		if (!csrfOk(interaction, csrf)) return reject(reply, interaction, "CSRF_MISMATCH");
+		if (!await consentAuthorityValid(reply, interaction)) return undefined;
+		const authority = interaction.authority;
+		if (!authority) return reject(reply, interaction, "AUTHORITY_INVALID", 403);
+		const duplicate = (current: FaceSetupInteraction) => {
+			if (current.phase !== "STARTING" && current.phase !== "ENROLLING") return reject(reply, current, "PHASE_INVALID");
+			logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, current);
+			return reply.code(303).header("Cache-Control", "no-store").header("Location", "/face-setup/continue").send();
+		};
+		if (interaction.phase !== "CONSENT") return duplicate(interaction);
+		if (!await interactions.claimConsent(handle, interaction, decision)) {
+			const current = await load(request, reply);
+			if (!current) return undefined;
+			if (!csrfOk(current.interaction, csrf)) return reject(reply, current.interaction, "CSRF_MISMATCH");
+			if (!await consentAuthorityValid(reply, current.interaction)) return undefined;
+			if (current.interaction.phase === "CONSENT") return reject(reply, current.interaction, "INTERACTION_SAVE_FAILED", 503);
+			return duplicate(current.interaction);
+		}
+		if (decision === "not_now") return finish(reply, handle, interaction, "cancelled");
+
+		logFaceSetup(request, "FACE_SETUP_CONSENT_STARTED", 200, interaction);
+		try {
+			const capability = await service.capabilityStatus(authority);
+			if (capability.consentRequired) {
+				await service.acceptConsent(authority, FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+				logFaceSetup(request, "FACE_SETUP_CONSENT_ACCEPTED", 200, interaction);
+			}
+			const started = await service.start(authority);
+			if (typeof started.enrollmentId !== "string" || typeof started.launchUrl !== "string" || typeof started.expiresAt !== "string") {
+				const status = await service.capabilityStatus(authority);
+				return finish(reply, handle, interaction, status.enrollmentState === "ACTIVE" && status.faceLoginEligible ? "success" : "failed");
+			}
+			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt, launchUrl: started.launchUrl };
+			interaction.phase = "ENROLLING";
+			if (!await persist(reply, handle, interaction)) return undefined;
+			logFaceSetup(request, "FACE_SETUP_ENROLLMENT_STARTED", 302, interaction);
+			return reply.code(302).header("Location", started.launchUrl).send();
+		} catch (error) {
+			if (error instanceof FaceEnrollmentError) {
+				logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 302, interaction, "ENROLLMENT_FAILED");
+				return finish(reply, handle, interaction, "failed");
+			}
+			throw error;
+		}
+	};
+
 	app.get("/face-setup/start", async (request, reply) => {
 		if (!guardEnabled(reply)) return undefined;
 		const query = z.object({ client_id: z.string().min(1), return_uri: z.string().url() }).safeParse(request.query ?? {});
@@ -308,6 +356,10 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		interaction.authority = faceAuthority;
 		interaction.phase = "CONSENT";
 		if (!await persist(reply, handle, interaction)) return undefined;
+		const capability = await service.capabilityStatus(faceAuthority);
+		if (!capability.consentRequired) {
+			return submitConsent(request, reply, handle, interaction, body.data.csrf, "agree");
+		}
 		return sendPage(reply, 200, faceSetupConsentPage({ csrf: interaction.csrf }));
 	});
 
@@ -332,47 +384,7 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
 			return reject(reply, interaction, "CSRF_MISMATCH");
 		}
-		if (!await consentAuthorityValid(reply, interaction)) return undefined;
-		const authority = interaction.authority;
-		if (!authority) return reject(reply, interaction, "AUTHORITY_INVALID", 403);
-		const duplicate = (current: FaceSetupInteraction) => {
-			if (current.phase !== "STARTING" && current.phase !== "ENROLLING") return reject(reply, current, "PHASE_INVALID");
-			logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, current);
-			return reply.code(303).header("Cache-Control", "no-store").header("Location", "/face-setup/continue").send();
-		};
-		if (interaction.phase !== "CONSENT") return duplicate(interaction);
-		if (!await interactions.claimConsent(handle, interaction, body.data.decision)) {
-			const current = await load(request, reply);
-			if (!current) return undefined;
-			if (!csrfOk(current.interaction, body.data.csrf)) return reject(reply, current.interaction, "CSRF_MISMATCH");
-			if (!await consentAuthorityValid(reply, current.interaction)) return undefined;
-			if (current.interaction.phase === "CONSENT") return reject(reply, current.interaction, "INTERACTION_SAVE_FAILED", 503);
-			return duplicate(current.interaction);
-		}
-		// "Not Now" creates no consent record and starts no enrollment -- it only clears the ceremony.
-		if (body.data.decision === "not_now") return finish(reply, handle, interaction, "cancelled");
-
-		logFaceSetup(request, "FACE_SETUP_CONSENT_STARTED", 200, interaction);
-		try {
-			await service.acceptConsent(authority, FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
-			logFaceSetup(request, "FACE_SETUP_CONSENT_ACCEPTED", 200, interaction);
-			const started = await service.start(authority);
-			if (typeof started.enrollmentId !== "string" || typeof started.launchUrl !== "string" || typeof started.expiresAt !== "string") {
-				const status = await service.capabilityStatus(authority);
-				return finish(reply, handle, interaction, status.enrollmentState === "ACTIVE" && status.faceLoginEligible ? "success" : "failed");
-			}
-			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt, launchUrl: started.launchUrl };
-			interaction.phase = "ENROLLING";
-			if (!await persist(reply, handle, interaction)) return undefined;
-			logFaceSetup(request, "FACE_SETUP_ENROLLMENT_STARTED", 302, interaction);
-			return reply.code(302).header("Location", started.launchUrl).send();
-		} catch (error) {
-			if (error instanceof FaceEnrollmentError) {
-				logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 302, interaction, "ENROLLMENT_FAILED");
-				return finish(reply, handle, interaction, "failed");
-			}
-			throw error;
-		}
+		return submitConsent(request, reply, handle, interaction, body.data.csrf, body.data.decision);
 	});
 
 	app.get("/face-setup/continue", async (request, reply) => {

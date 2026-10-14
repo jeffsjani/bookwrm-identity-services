@@ -64,7 +64,7 @@ function serviceFixture() {
 		start: vi.fn(async () => ({ enrolled: false, enrollmentId: "enrollment-1", launchUrl: "https://privateid.example.test/launch", expiresAt: new Date(Date.now() + 300_000).toISOString() })),
 		status: vi.fn(async () => ({ statusCode: 200, body: { status: "PENDING" } })),
 		capabilityStatus: vi.fn(async () => ({
-			faceEnrollmentEligible: true, faceLoginEligible: true, consentRequired: false,
+			faceEnrollmentEligible: true, faceLoginEligible: true, consentRequired: true,
 			enrollmentState: "ACTIVE" as const, consentVersion: FACE_AUTH_CONSENT_VERSION,
 			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: "text"
 		}))
@@ -179,6 +179,25 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		expect(code.body).toContain("Set up Face Login");
 		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
 		expect(deps.identitySubjects.findByOidcSubject).toHaveBeenCalledWith(SUBJECT);
+	});
+
+	it("recognizes reusable consent after H4 and starts enrollment without a duplicate consent screen or write", async () => {
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValue({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired: false,
+			enrollmentState: "FAILED", consentVersion: FACE_AUTH_CONSENT_VERSION,
+			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: "text"
+		});
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.consumeResult).toHaveBeenCalledTimes(1);
+		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("ENROLLING");
+		const repeat = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
+		expect(repeat.statusCode).toBe(303);
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
 	});
 
 	it("never creates an IdentitySubject when the email is not an existing AUTHENTICATION-mode subject", async () => {

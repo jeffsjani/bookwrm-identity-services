@@ -181,6 +181,107 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		} finally { await app.close(); await interactions.clear(handle); }
 	});
 
+	it.each([false, true])("recovers an expired enrollment through fresh H4 without replacing history or consent (concurrent=%s)", async concurrent => {
+		const subject = await seed();
+		const oldFlow = await pending(subject.oidcSubject);
+		await pool.query("UPDATE privateid_enrollment_transactions SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE provider_transaction_id=$1", [oldFlow.transactionId]);
+		expect(await complete(oldFlow)).toMatchObject({ statusCode: 409 });
+		expect(await service.capabilityStatus(authority(subject.oidcSubject))).toMatchObject({
+			enrollmentState: "FAILED", consentRequired: false, faceEnrollmentEligible: true, faceLoginEligible: false
+		});
+		const before = await snapshot(subject.id);
+		const identityCount = (await pool.query("SELECT count(*)::int AS n FROM identity_subjects")).rows[0].n;
+		const oldRecord = async () => (await pool.query(`SELECT to_jsonb(e) AS enrollment, to_jsonb(b) AS binding
+			FROM privateid_enrollment_transactions e JOIN hapi_face_enrollment_bindings b ON b.enrollment_id=e.id
+			WHERE e.provider_transaction_id=$1`, [oldFlow.transactionId])).rows[0];
+		const history = await oldRecord();
+		const sessionsBefore = createSession.mock.calls.length;
+		const interactions = new FaceSetupInteractionStore();
+		const app = Fastify();
+		const interactive = {
+			authority: vi.fn(async () => ({ context, clientId, tenantName: "H5" })),
+			start: vi.fn(async () => ({ mode: "AUTHENTICATION" as const, challengeId: randomUUID(), expiresIn: 300, resendAfter: 30 })),
+			resend: vi.fn(async () => { throw new Error("Unexpected resend"); }),
+			verify: vi.fn(async () => ({ mode: "AUTHENTICATION" as const, authenticationResult: "local-result" })),
+			consumeResult: vi.fn(async () => ({
+				sub: subject.oidcSubject, clientId, authenticationMethod: "HAPI_EMAIL" as const,
+				authenticatedAt: new Date().toISOString(), assurance: "email_otp" as const
+			}))
+		};
+		await registerFaceSetupRoutes(app, {
+			interactions, service, clientAuthority: h1, identitySubjects: subjects, interactive,
+			isPilotSubject: sub => sub === subject.oidcSubject, isEnabled: () => true
+		});
+		const handles: string[] = [];
+		try {
+			const prepare = async () => {
+				const start = await app.inject({ method: "GET", url: `/face-setup/start?client_id=${clientId}&return_uri=${encodeURIComponent("https://rp.example/callback")}` });
+				expect(start.statusCode).toBe(302);
+				const cookie = String(start.headers["set-cookie"]).split(";")[0];
+				const handle = cookie.slice(FACE_SETUP_COOKIE.length + 1);
+				handles.push(handle);
+				const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+				const csrf = page.body.match(/name="csrf" value="([^"]+)"/)![1];
+				expect((await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: subject.email } })).statusCode).toBe(200);
+				return { cookie, csrf, handle };
+			};
+			const attempts = await Promise.all(Array.from({ length: concurrent ? 2 : 1 }, prepare));
+			const responses = await Promise.all(attempts.map(({ cookie, csrf }) => app.inject({
+				method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "local-otp" }
+			})));
+			expect(responses.every(response => response.statusCode === 302)).toBe(true);
+			const winner = responses.findIndex(response => response.headers.location === "https://privateid.example.test/enroll");
+			expect(winner).toBeGreaterThanOrEqual(0);
+			expect(responses.filter(response => response.headers.location === "https://privateid.example.test/enroll")).toHaveLength(1);
+			for (let i = 0; i < 2; i++) {
+				const { cookie, csrf } = attempts[winner];
+				const duplicate = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
+				expect(duplicate.statusCode).toBe(303);
+				expect(duplicate.headers["set-cookie"]).toBeUndefined();
+			}
+			const rows = (await pool.query(`SELECT e.*, b.identity_subject_id, b.authenticator_id, b.session_id
+				FROM privateid_enrollment_transactions e JOIN hapi_face_enrollment_bindings b ON b.enrollment_id=e.id
+				WHERE e.user_id=$1::text ORDER BY e.created_at`, [subject.id])).rows;
+			expect(rows).toHaveLength(2);
+			expect(rows[0].status).toBe("expired");
+			expect(rows[1]).toMatchObject({ status: "pending", identity_subject_id: subject.id, authenticator_id: null });
+			expect(rows[1].id).not.toBe(rows[0].id);
+			expect(rows[1].provider_transaction_id).not.toBe(oldFlow.transactionId);
+			expect(rows[1].session_id).not.toBe(oldFlow.sessionId);
+			expect(createSession.mock.calls.length - sessionsBefore).toBe(1);
+			expect(createSession.mock.calls.at(-1)![0]).toBe(rows[1].provider_transaction_id);
+			expect(await authenticators.findByUser(subject.id)).toHaveLength(0);
+			expect(await snapshot(subject.id)).toEqual(before);
+			expect((await pool.query("SELECT count(*)::int AS n FROM identity_subjects")).rows[0].n).toBe(identityCount);
+			expect((await pool.query("SELECT count(*)::int AS n FROM hapi_face_authentication_consents WHERE identity_subject_id=$1 AND consent_version='FACE_AUTH_V1'", [subject.id])).rows[0].n).toBe(1);
+			expect(await oldRecord()).toEqual(history);
+			expect(await complete(oldFlow)).toMatchObject({ statusCode: 409, body: { error: "ENROLLMENT_NOT_PENDING" } });
+			expect(await oldRecord()).toEqual(history);
+			expect(interactive.verify).toHaveBeenCalledTimes(attempts.length);
+			expect(interactive.consumeResult).toHaveBeenCalledTimes(attempts.length);
+		} finally {
+			await app.close();
+			for (const handle of handles) await interactions.clear(handle);
+		}
+	});
+
+	it("reuses existing purpose/version/context consent under concurrent acceptance without rewriting evidence", async () => {
+		const subject = await seed();
+		const before = (await pool.query("SELECT * FROM hapi_face_authentication_consents WHERE identity_subject_id=$1", [subject.id])).rows;
+		await Promise.all(Array.from({ length: 2 }, () => service.acceptConsent(
+			authority(subject.oidcSubject), FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE)));
+		expect((await pool.query("SELECT * FROM hapi_face_authentication_consents WHERE identity_subject_id=$1", [subject.id])).rows).toEqual(before);
+	});
+
+	it("records only one effective consent when initial acceptance is concurrent", async () => {
+		const subject = await seed(false);
+		await Promise.all(Array.from({ length: 2 }, () => service.acceptConsent(
+			authority(subject.oidcSubject), FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE)));
+		expect((await pool.query(`SELECT count(*)::int AS n FROM hapi_face_authentication_consents
+			WHERE identity_subject_id=$1 AND client_id=$2 AND purpose=$3 AND consent_version=$4`,
+		[subject.id, clientId, FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION])).rows[0].n).toBe(1);
+	});
+
 	it("attaches to the H3 canonical subject without altering any identity, claims, provenance, evidence or links", async () => {
 		const subject = await seed(), before = await snapshot(subject.id);
 		const flow = await pending(subject.oidcSubject), puid = randomUUID();

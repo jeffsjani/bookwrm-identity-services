@@ -83,6 +83,14 @@ failure is audited. The H5 provider request has a ten-second
 abort deadline. Failed/expired reservations permit a new authorized ceremony.
 No password or new OTP/session-identity system is introduced.
 
+FACE_AUTH_V1 consent is purpose/version authorization scoped to the canonical
+subject and tenant/application/client, not to an enrollment transaction. An
+expired enrollment does not revoke it. Repeated acceptance under the subject lock
+reuses existing evidence without updating its acceptance timestamp or inserting
+another row. New version or different-context consent is still required.
+Expired enrollment rows, bindings and audits remain historical; a fresh authorized
+start creates a new transaction-specific binding and provider transaction.
+
 ## Completion, correlation, conflicts
 
 Only the existing **authenticated provider webhook** may attach a PUID. H5 requires
