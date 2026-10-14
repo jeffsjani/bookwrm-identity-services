@@ -28,6 +28,7 @@ export type FaceSetupInteraction = {
 	phase: FaceSetupPhase;
 	createdAt: number;
 	expiresAt: number;
+	emailOperation?: "START" | "VERIFY" | "RESEND";
 	email?: { challengeId: string };
 	authority?: FaceEnrollmentAuthority;
 	enrollment?: { enrollmentId: string; expiresAt: string; launchUrl: string };

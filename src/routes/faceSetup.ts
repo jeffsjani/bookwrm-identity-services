@@ -87,7 +87,10 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 	// back to the registered Bookwrm return URI with only an outcome flag -- never a token, PUID, or identifier.
 	const finish = async (reply: FastifyReply, handle: string | undefined, interaction: FaceSetupInteraction,
 		outcome: "success" | "cancelled" | "failed") => {
-		await interactions.clear(handle);
+		if (!await interactions.consume(handle, interaction)) {
+			logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_FAILED", 409, interaction, "INTERACTION_SAVE_FAILED");
+			return sendPage(reply, 409, continuationFailedPage());
+		}
 		logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_CONSUMED", 302, interaction);
 		reply.header("Set-Cookie", cookieHeader(null));
 		return reply.code(302).header("Location", buildOutcomeRedirect(interaction.returnUri, outcome)).send();
@@ -173,6 +176,28 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		}
 	};
 
+	const resumeVerifiedEmail = async (request: FastifyRequest, reply: FastifyReply, interaction: FaceSetupInteraction) => {
+		if (interaction.phase !== "CONSENT" && interaction.phase !== "STARTING" && interaction.phase !== "ENROLLING") {
+			return reject(reply, interaction, "PHASE_INVALID");
+		}
+		if (!await consentAuthorityValid(reply, interaction)) return undefined;
+		logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, interaction);
+		return reply.code(303).header("Cache-Control", "no-store")
+			.header("Location", interaction.phase === "CONSENT" ? "/face-setup/consent" : "/face-setup/continue").send();
+	};
+
+	const repeatEmail = async (request: FastifyRequest, reply: FastifyReply, handle: string) => {
+		const current = await load(request, reply);
+		if (!current) return undefined;
+		if (current.handle !== handle) return reject(reply, current.interaction, "INTERACTION_INVALID");
+		if (current.interaction.phase !== "EMAIL") return resumeVerifiedEmail(request, reply, current.interaction);
+		if (!current.interaction.emailOperation && !current.interaction.email) {
+			return reject(reply, current.interaction, "INTERACTION_SAVE_FAILED", 503);
+		}
+		logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, current.interaction);
+		return reply.code(303).header("Cache-Control", "no-store").header("Location", "/face-setup/email/code").send();
+	};
+
 	const submitConsent = async (request: FastifyRequest, reply: FastifyReply, handle: string,
 		interaction: FaceSetupInteraction, csrf: string, decision: "agree" | "not_now") => {
 		if (!csrfOk(interaction, csrf)) return reject(reply, interaction, "CSRF_MISMATCH");
@@ -245,7 +270,8 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 	app.get("/face-setup/email", async (request, reply) => {
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
-		if (loaded.interaction.phase !== "EMAIL") return finish(reply, loaded.handle, loaded.interaction, "failed");
+		if (loaded.interaction.phase !== "EMAIL") return resumeVerifiedEmail(request, reply, loaded.interaction);
+		if (loaded.interaction.emailOperation || loaded.interaction.email) return repeatEmail(request, reply, loaded.handle);
 		return sendPage(reply, 200, faceSetupEmailPage({ csrf: loaded.interaction.csrf }));
 	});
 
@@ -253,18 +279,23 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
 		const { handle, interaction } = loaded;
-		if (interaction.phase !== "EMAIL") return finish(reply, handle, interaction, "failed");
 		const body = z.object({ csrf: z.string(), email: z.string().email() }).safeParse(request.body ?? {});
 		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			if (interaction.phase !== "EMAIL") return reject(reply, interaction, "CSRF_MISMATCH");
 			return sendPage(reply, 400, faceSetupEmailPage({ csrf: interaction.csrf, error: "Please try again." }));
 		}
+		if (interaction.phase !== "EMAIL") return resumeVerifiedEmail(request, reply, interaction);
+		if (interaction.email || interaction.emailOperation) return repeatEmail(request, reply, handle);
 		const authority = await emailAuthority(interaction);
-		if (!authority) return finish(reply, handle, interaction, "failed");
+		if (!authority) return reject(reply, interaction, "CLIENT_INVALID", 403);
+		if (!await interactions.claimEmail(handle, interaction, "START")) return repeatEmail(request, reply, handle);
 		let started;
 		try {
 			started = await interactive.start(authority, body.data.email);
 		} catch (error) {
 			if (error instanceof VerificationError || error instanceof EmailAuthenticationError) {
+				delete interaction.emailOperation;
+				if (!await persist(reply, handle, interaction)) return undefined;
 				return sendPage(reply, 429, faceSetupEmailPage({ csrf: interaction.csrf, error: "Too many attempts. Please wait and try again." }));
 			}
 			throw error;
@@ -272,12 +303,15 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		// H5.4 #2: Face setup only ever reauthenticates an existing HAPI_EMAIL subject -- a brand-new or
 		// ineligible email never creates an IdentitySubject or enters the registration path here.
 		if (started.mode !== "AUTHENTICATION") {
+			delete interaction.emailOperation;
+			if (!await persist(reply, handle, interaction)) return undefined;
 			return sendPage(reply, 200, faceSetupEmailPage({
 				csrf: interaction.csrf,
 				error: "We couldn't find an existing Bookwrm account with that email. Use the email you already sign in with."
 			}));
 		}
 		interaction.email = { challengeId: started.challengeId };
+		delete interaction.emailOperation;
 		if (!await persist(reply, handle, interaction)) return undefined;
 		return sendPage(reply, 200, faceSetupCodePage({ csrf: interaction.csrf }));
 	});
@@ -285,7 +319,11 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 	app.get("/face-setup/email/code", async (request, reply) => {
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
-		if (loaded.interaction.phase !== "EMAIL" || !loaded.interaction.email) return finish(reply, loaded.handle, loaded.interaction, "failed");
+		if (loaded.interaction.phase !== "EMAIL") return resumeVerifiedEmail(request, reply, loaded.interaction);
+		if (loaded.interaction.emailOperation) {
+			return sendPage(reply, 200, faceSetupProcessingPage("/face-setup/email/code"));
+		}
+		if (!loaded.interaction.email) return reject(reply, loaded.interaction, "PHASE_INVALID");
 		return sendPage(reply, 200, faceSetupCodePage({ csrf: loaded.interaction.csrf }));
 	});
 
@@ -293,18 +331,27 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
 		const { interaction } = loaded;
-		if (interaction.phase !== "EMAIL" || !interaction.email) return finish(reply, loaded.handle, interaction, "failed");
 		const body = z.object({ csrf: z.string() }).safeParse(request.body ?? {});
 		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			if (interaction.phase !== "EMAIL") return reject(reply, interaction, "CSRF_MISMATCH");
 			return sendPage(reply, 400, faceSetupCodePage({ csrf: interaction.csrf, error: "Please try again." }));
 		}
+		if (interaction.phase !== "EMAIL") return resumeVerifiedEmail(request, reply, interaction);
+		if (interaction.emailOperation) return repeatEmail(request, reply, loaded.handle);
+		if (!interaction.email) return reject(reply, interaction, "PHASE_INVALID");
 		const authority = await emailAuthority(interaction);
-		if (!authority) return finish(reply, loaded.handle, interaction, "failed");
+		if (!authority) return reject(reply, interaction, "CLIENT_INVALID", 403);
+		if (!await interactions.claimEmail(loaded.handle, interaction, "RESEND")) return repeatEmail(request, reply, loaded.handle);
 		try {
 			await interactive.resend(authority, interaction.email.challengeId, "AUTHENTICATION");
-		} catch {
+		} catch (error) {
+			if (!(error instanceof VerificationError) && !(error instanceof EmailAuthenticationError)) throw error;
+			delete interaction.emailOperation;
+			if (!await persist(reply, loaded.handle, interaction)) return undefined;
 			return sendPage(reply, 429, faceSetupCodePage({ csrf: interaction.csrf, error: "Too many attempts. Please wait and try again." }));
 		}
+		delete interaction.emailOperation;
+		if (!await persist(reply, loaded.handle, interaction)) return undefined;
 		return sendPage(reply, 200, faceSetupCodePage({ csrf: interaction.csrf }));
 	});
 
@@ -312,17 +359,26 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		const loaded = await load(request, reply);
 		if (!loaded) return undefined;
 		const { handle, interaction } = loaded;
-		if (interaction.phase !== "EMAIL" || !interaction.email) return finish(reply, handle, interaction, "failed");
 		const body = z.object({ csrf: z.string(), code: z.string().min(1) }).safeParse(request.body ?? {});
+		if (interaction.phase !== "EMAIL") {
+			if (!body.success || !csrfOk(interaction, body.data.csrf)) return reject(reply, interaction, "CSRF_MISMATCH");
+			return resumeVerifiedEmail(request, reply, interaction);
+		}
 		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
 			return sendPage(reply, 400, faceSetupCodePage({ csrf: interaction.csrf, error: "Please try again." }));
 		}
+		if (interaction.emailOperation) return repeatEmail(request, reply, handle);
+		if (!interaction.email) return reject(reply, interaction, "PHASE_INVALID");
 		const authority = await emailAuthority(interaction);
-		if (!authority) return finish(reply, handle, interaction, "failed");
+		if (!authority) return reject(reply, interaction, "CLIENT_INVALID", 403);
+		if (!await interactions.claimEmail(handle, interaction, "VERIFY")) return repeatEmail(request, reply, handle);
 		let verification;
 		try {
 			verification = await interactive.verify(authority, interaction.email.challengeId, body.data.code, "AUTHENTICATION");
-		} catch {
+		} catch (error) {
+			if (!(error instanceof VerificationError) && !(error instanceof EmailAuthenticationError)) throw error;
+			delete interaction.emailOperation;
+			if (!await persist(reply, handle, interaction)) return undefined;
 			return sendPage(reply, 401, faceSetupCodePage({
 				csrf: interaction.csrf,
 				error: "We couldn't sign you in with that code. Check the code or request a new one."
@@ -335,14 +391,14 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		const subject = await identitySubjects.findByOidcSubject(principal.sub);
 		if (!subject || subject.primaryProvider !== "HAPI_EMAIL" || subject.status !== "ACTIVE" ||
 			subject.emailVerified !== true || subject.email !== subject.primaryProviderSubject) {
-			await interactions.clear(handle);
+			if (!await interactions.consume(handle, interaction)) return reject(reply, interaction, "INTERACTION_SAVE_FAILED", 409);
 			reply.header("Set-Cookie", cookieHeader(null));
 			return sendPage(reply, 403, notEligiblePage("This account isn't eligible for Face setup yet."));
 		}
 
 		// H5.4 #10: pilot gate decided only after fresh canonical authentication, keyed on the stable sub.
 		if (!isPilotSubject(principal.sub)) {
-			await interactions.clear(handle);
+			if (!await interactions.consume(handle, interaction)) return reject(reply, interaction, "INTERACTION_SAVE_FAILED", 409);
 			reply.header("Set-Cookie", cookieHeader(null));
 			return sendPage(reply, 403, notEligiblePage("Face Login isn't available for your account yet."));
 		}
@@ -355,6 +411,7 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		};
 		interaction.authority = faceAuthority;
 		interaction.phase = "CONSENT";
+		delete interaction.emailOperation;
 		if (!await persist(reply, handle, interaction)) return undefined;
 		const capability = await service.capabilityStatus(faceAuthority);
 		if (!capability.consentRequired) {
@@ -371,7 +428,7 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 			return continuation(reply, loaded.interaction);
 		}
 		if (loaded.interaction.phase !== "CONSENT" || !loaded.interaction.authority) {
-			return finish(reply, loaded.handle, loaded.interaction, "failed");
+			return reject(reply, loaded.interaction, "PHASE_INVALID");
 		}
 		return sendPage(reply, 200, faceSetupConsentPage({ csrf: loaded.interaction.csrf }));
 	});
@@ -398,8 +455,9 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		if (!loaded) return undefined;
 		const { handle, interaction } = loaded;
 		if (interaction.phase !== "ENROLLING" || !interaction.enrollment || !interaction.authority) {
-			return finish(reply, handle, interaction, "failed");
+			return reject(reply, interaction, "PHASE_INVALID");
 		}
+		if (!await consentAuthorityValid(reply, interaction)) return undefined;
 		let result;
 		try {
 			result = await service.status(interaction.enrollment.enrollmentId, interaction.authority);
@@ -430,6 +488,8 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 				message: "You can close this page and return to Bookwrm."
 			}));
 		}
+		const query = z.object({ csrf: z.string() }).safeParse(request.query ?? {});
+		if (!query.success || !csrfOk(interaction, query.data.csrf)) return reject(reply, interaction, "CSRF_MISMATCH");
 		return finish(reply, handle, interaction, "cancelled");
 	});
 }

@@ -235,10 +235,17 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			expect(responses.filter(response => response.headers.location === "https://privateid.example.test/enroll")).toHaveLength(1);
 			for (let i = 0; i < 2; i++) {
 				const { cookie, csrf } = attempts[winner];
-				const duplicate = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
-				expect(duplicate.statusCode).toBe(303);
-				expect(duplicate.headers["set-cookie"]).toBeUndefined();
+				for (const url of ["/face-setup/email/code", "/face-setup/consent"]) {
+					const duplicate = await app.inject({ method: "POST", url, headers: { cookie }, payload: { csrf, code: "local-otp", decision: "agree" } });
+					expect(duplicate.statusCode).toBe(303);
+					expect(duplicate.headers.location).toBe("/face-setup/continue");
+					expect(duplicate.headers["set-cookie"]).toBeUndefined();
+				}
 			}
+			const stalePage = await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie: attempts[winner].cookie } });
+			expect(stalePage.statusCode).toBe(303);
+			expect(stalePage.headers.location).toBe("/face-setup/continue");
+			expect(stalePage.headers["set-cookie"]).toBeUndefined();
 			const rows = (await pool.query(`SELECT e.*, b.identity_subject_id, b.authenticator_id, b.session_id
 				FROM privateid_enrollment_transactions e JOIN hapi_face_enrollment_bindings b ON b.enrollment_id=e.id
 				WHERE e.user_id=$1::text ORDER BY e.created_at`, [subject.id])).rows;

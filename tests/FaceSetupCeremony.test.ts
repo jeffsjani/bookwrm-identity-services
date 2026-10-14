@@ -15,6 +15,7 @@ import { FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, FaceEnrollmentErr
 import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "../src/authentication/InteractiveEmailAuthentication.js";
 import type { EmailPrincipal } from "../src/authentication/email/EmailAuthenticationTypes.js";
 import type { IdentitySubject } from "../src/models/IdentitySubject.js";
+import { VerificationError } from "../src/email/VerificationChallenge.js";
 
 const CLIENT_ID = "bookwrm-client";
 const RETURN_URI = "https://bookwrm.example.test/bookwrm/settings/account";
@@ -49,7 +50,7 @@ function interactiveFixture(principal: EmailPrincipal, mode: "AUTHENTICATION" | 
 		start: vi.fn(async () => ({ challengeId: "challenge-1", expiresIn: 300, resendAfter: 30, mode })),
 		resend: vi.fn(async () => ({ challengeId: "challenge-1", expiresIn: 300, resendAfter: 30 })),
 		verify: vi.fn(async (_authority, _challengeId, code) => {
-			if (code !== "123456") throw new Error("bad code");
+			if (code !== "123456") throw new VerificationError("INVALID_CODE");
 			return mode === "AUTHENTICATION" ? { mode: "AUTHENTICATION" as const, authenticationResult: "result-token" }
 				: { mode: "REGISTRATION" as const, principal };
 		}),
@@ -198,6 +199,133 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		expect(repeat.statusCode).toBe(303);
 		expect(deps.service.start).toHaveBeenCalledTimes(1);
 		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
+	});
+
+	it("preserves enrollment across the live sequence of three OTP POSTs with reusable consent", async () => {
+		const fixture = enrollmentFixture();
+		fixture.repository.capabilityStatus.mockResolvedValue({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired: false,
+			enrollmentState: "FAILED", consentVersion: FACE_AUTH_CONSENT_VERSION,
+			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: "text"
+		});
+		({ app, deps } = buildApp({ service: fixture.service }));
+		await register(app, deps);
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		const handle = cookie.slice(FACE_SETUP_COOKIE.length + 1);
+		const request = { method: "POST" as const, url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } };
+		for (let repeat = 0; repeat < 2; repeat++) {
+			const response = await app.inject(request);
+			expect(response.statusCode).toBe(303);
+			expect(response.headers.location).toBe("/face-setup/continue");
+			expect(response.headers["set-cookie"]).toBeUndefined();
+			expect((await deps.interactions.find(handle))?.phase).toBe("ENROLLING");
+		}
+		const stalePage = await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie } });
+		expect(stalePage.statusCode).toBe(303);
+		expect(stalePage.headers.location).toBe("/face-setup/continue");
+		expect(stalePage.headers["set-cookie"]).toBeUndefined();
+		const continuation = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } });
+		expect(continuation.headers.location).toBe("https://privateid.example.test/launch");
+		expect(fixture.repository.acceptConsent).not.toHaveBeenCalled();
+		expect(fixture.repository.reserve).toHaveBeenCalledTimes(1);
+		expect(fixture.repository.bind).toHaveBeenCalledTimes(1);
+		expect(fixture.provider).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.consumeResult).toHaveBeenCalledTimes(1);
+	});
+
+	it("preserves STARTING when an OTP POST repeats while consent reuse is creating a session", async () => {
+		const fixture = enrollmentFixture();
+		fixture.repository.capabilityStatus.mockResolvedValue({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired: false,
+			enrollmentState: "FAILED", consentVersion: FACE_AUTH_CONSENT_VERSION,
+			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: "text"
+		});
+		let release = () => {};
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		const createSession = fixture.provider.getMockImplementation()!;
+		fixture.provider.mockImplementation(async transactionId => {
+			await gate;
+			return createSession(transactionId);
+		});
+		({ app, deps } = buildApp({ service: fixture.service }));
+		await register(app, deps);
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		const request = { method: "POST" as const, url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } };
+		const first = app.inject(request);
+		try {
+			await vi.waitFor(() => expect(fixture.provider).toHaveBeenCalledTimes(1));
+			const repeat = await app.inject(request);
+			expect(repeat.statusCode).toBe(303);
+			expect(repeat.headers.location).toBe("/face-setup/continue");
+			expect(repeat.headers["set-cookie"]).toBeUndefined();
+			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("STARTING");
+		} finally { release(); }
+		expect((await first).statusCode).toBe(302);
+		expect(fixture.repository.reserve).toHaveBeenCalledTimes(1);
+		expect(fixture.provider).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns repeated OTP submissions to existing consent without accepting it", async () => {
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		const repeat = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		expect(repeat.statusCode).toBe(303);
+		expect(repeat.headers.location).toBe("/face-setup/consent");
+		expect(repeat.headers["set-cookie"]).toBeUndefined();
+		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("CONSENT");
+		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
+		expect(deps.service.start).not.toHaveBeenCalled();
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["csrf", "pilot", "client", "return", "freshness"] as const)("rejects an OTP replay with invalid %s without consuming enrollment", async field => {
+		const pilot = vi.fn(() => true);
+		({ app, deps } = buildApp({ isPilotSubject: pilot }));
+		await register(app, deps);
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValue({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired: false,
+			enrollmentState: "FAILED", consentVersion: FACE_AUTH_CONSENT_VERSION,
+			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: "text"
+		});
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		const handle = cookie.slice(FACE_SETUP_COOKIE.length + 1);
+		if (field === "pilot") pilot.mockReturnValue(false);
+		if (field === "client" || field === "return" || field === "freshness") {
+			const interaction = (await deps.interactions.find(handle))!;
+			if (field === "client") interaction.authority!.clientId = "different-client";
+			if (field === "return") interaction.returnUri = "https://evil.example.test/";
+			if (field === "freshness") interaction.authority!.authenticatedAt = new Date(Date.now() - 700_000).toISOString();
+			expect(await deps.interactions.save(handle, interaction)).toBe(true);
+		}
+		const repeat = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf: field === "csrf" ? "tampered" : csrf, code: "123456" } });
+		expect(repeat.statusCode).toBe(field === "csrf" ? 400 : 403);
+		expect(repeat.headers.location).toBeUndefined();
+		expect(repeat.headers["set-cookie"]).toBeUndefined();
+		expect((await deps.interactions.find(handle))?.phase).toBe("ENROLLING");
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["cancelled", "completed"] as const)("never resumes OTP POSTs after a %s ceremony", async outcome => {
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: outcome === "cancelled" ? "not_now" : "agree" } });
+		if (outcome === "completed") {
+			vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 200, body: { status: "COMPLETED" } });
+			await app.inject({ method: "GET", url: "/face-setup/callback", headers: { cookie } });
+		}
+		const repeat = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		expect(repeat.statusCode).toBe(400);
+		expect(repeat.headers.location).toBeUndefined();
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+		expect(deps.service.start).toHaveBeenCalledTimes(outcome === "cancelled" ? 0 : 1);
 	});
 
 	it("never creates an IdentitySubject when the email is not an existing AUTHENTICATION-mode subject", async () => {
@@ -503,7 +631,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		await app.inject(request);
 		await app.inject(request);
 		await app.inject({ ...request, payload: { csrf: "invalid", decision: "agree" } });
-		await app.inject({ method: "GET", url: "/face-setup/cancel", headers: { cookie } });
+		await app.inject({ method: "GET", url: `/face-setup/cancel?csrf=${encodeURIComponent(csrf)}`, headers: { cookie } });
 		await app.inject(request);
 		const events = logs.flatMap(line => line.trim().split("\n").map(value => JSON.parse(value))).filter(entry => entry.event?.startsWith("FACE_SETUP_"));
 		expect(new Set(events.map(entry => entry.event))).toEqual(new Set([
@@ -595,9 +723,173 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 
 	it("cancel returns a safe cancelled outcome", async () => {
 		const cookie = await startCeremony(app);
-		const response = await app.inject({ method: "GET", url: "/face-setup/cancel", headers: { cookie } });
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		const response = await app.inject({ method: "GET", url: `/face-setup/cancel?csrf=${encodeURIComponent(csrf)}`, headers: { cookie } });
 		expect(response.statusCode).toBe(302);
 		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=cancelled`);
+	});
+
+	it.each(["START", "VERIFY", "RESEND"] as const)("single-claims concurrent email %s operations", async operation => {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		if (operation !== "START") {
+			await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		}
+		let release = () => {};
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		if (operation === "START") {
+			const start = vi.mocked(deps.interactive.start).getMockImplementation()!;
+			vi.mocked(deps.interactive.start).mockImplementation(async (...args) => { await gate; return start(...args); });
+		} else if (operation === "VERIFY") {
+			const verify = vi.mocked(deps.interactive.verify).getMockImplementation()!;
+			vi.mocked(deps.interactive.verify).mockImplementation(async (...args) => { await gate; return verify(...args); });
+		} else {
+			const resend = vi.mocked(deps.interactive.resend).getMockImplementation()!;
+			vi.mocked(deps.interactive.resend).mockImplementation(async (...args) => { await gate; return resend(...args); });
+		}
+		const request = {
+			method: "POST" as const, headers: { cookie },
+			url: operation === "START" ? "/face-setup/email" : operation === "VERIFY" ? "/face-setup/email/code" : "/face-setup/email/resend",
+			payload: { csrf, email: "identity@hapiinc.com", code: "123456" }
+		};
+		const first = app.inject(request);
+		try {
+			const mock = operation === "START" ? deps.interactive.start : operation === "VERIFY" ? deps.interactive.verify : deps.interactive.resend;
+			await vi.waitFor(() => expect(mock).toHaveBeenCalledTimes(1));
+			const repeat = await app.inject(request);
+			expect(repeat.statusCode).toBe(303);
+			expect(repeat.headers.location).toBe("/face-setup/email/code");
+			expect(repeat.headers["set-cookie"]).toBeUndefined();
+			expect(mock).toHaveBeenCalledTimes(1);
+			const polling = await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie } });
+			expect(polling.body).toContain("Finishing Face setup");
+		} finally { release(); }
+		expect((await first).statusCode).toBe(200);
+		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.emailOperation).toBeUndefined();
+	});
+
+	it("does not send a second challenge for a sequential email-submit replay", async () => {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		const request = { method: "POST" as const, url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } };
+		expect((await app.inject(request)).statusCode).toBe(200);
+		const repeat = await app.inject(request);
+		expect(repeat.statusCode).toBe(303);
+		expect(repeat.headers.location).toBe("/face-setup/email/code");
+		expect(repeat.headers["set-cookie"]).toBeUndefined();
+		expect(deps.interactive.start).toHaveBeenCalledTimes(1);
+	});
+
+	it.each(["INVALID_CODE", "CHALLENGE_EXPIRED"])("rejects %s without advancing authority or enrollment", async code => {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		vi.mocked(deps.interactive.verify).mockRejectedValueOnce(new VerificationError(code));
+		const response = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		expect(response.statusCode).toBe(401);
+		const current = await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1));
+		expect(current?.phase).toBe("EMAIL");
+		expect(current?.authority).toBeUndefined();
+		expect(current?.emailOperation).toBeUndefined();
+		expect(deps.interactive.consumeResult).not.toHaveBeenCalled();
+		expect(deps.service.start).not.toHaveBeenCalled();
+	});
+
+	it("fails closed without repeating an uncertain OTP verification", async () => {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		vi.mocked(deps.interactive.verify).mockRejectedValueOnce(new Error("unexpected storage failure"));
+		const request = { method: "POST" as const, url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } };
+		expect((await app.inject(request)).statusCode).toBe(500);
+		expect((await app.inject(request)).statusCode).toBe(303);
+		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.emailOperation).toBe("VERIFY");
+		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+		expect(deps.service.start).not.toHaveBeenCalled();
+	});
+
+	it("preserves advanced state on stale email, resend, and email-page requests", async () => {
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
+		for (const request of [
+			{ method: "GET" as const, url: "/face-setup/email" },
+			{ method: "POST" as const, url: "/face-setup/email", payload: { csrf, email: "identity@hapiinc.com" } },
+			{ method: "POST" as const, url: "/face-setup/email/resend", payload: { csrf } }
+		]) {
+			const response = await app.inject({ ...request, headers: { cookie } });
+			expect(response.statusCode).toBe(303);
+			expect(response.headers.location).toBe("/face-setup/continue");
+			expect(response.headers["set-cookie"]).toBeUndefined();
+			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("ENROLLING");
+		}
+		expect(deps.interactive.start).toHaveBeenCalledTimes(1);
+		expect(deps.interactive.resend).not.toHaveBeenCalled();
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects premature callback and consent GETs without consuming email state", async () => {
+		const cookie = await startCeremony(app);
+		for (const url of ["/face-setup/callback", "/face-setup/consent"]) {
+			const response = await app.inject({ method: "GET", url, headers: { cookie } });
+			expect(response.statusCode).toBe(400);
+			expect(response.headers["set-cookie"]).toBeUndefined();
+			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("EMAIL");
+		}
+		expect(deps.service.status).not.toHaveBeenCalled();
+	});
+
+	it("single-consumes concurrent successful callbacks and rejects subsequent replays", async () => {
+		const cookie = await startCeremony(app);
+		const csrf = await reachConsent(app, cookie);
+		await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
+		let release = () => {};
+		const gate = new Promise<void>(resolve => { release = resolve; });
+		vi.mocked(deps.service.status).mockImplementation(async () => { await gate; return { statusCode: 200, body: { status: "COMPLETED" } }; });
+		const request = { method: "GET" as const, url: "/face-setup/callback", headers: { cookie } };
+		const first = app.inject(request);
+		const second = app.inject(request);
+		try { await vi.waitFor(() => expect(deps.service.status).toHaveBeenCalledTimes(2)); }
+		finally { release(); }
+		const results = await Promise.all([first, second]);
+		expect(results.map(result => result.statusCode).sort()).toEqual([302, 409]);
+		expect(results.filter(result => result.headers["set-cookie"])).toHaveLength(1);
+		expect(results.find(result => result.statusCode === 302)?.headers.location).toBe(`${RETURN_URI}?face_setup=success`);
+		const replay = await app.inject(request);
+		expect(replay.statusCode).toBe(400);
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+	});
+
+	it("rejects cancellation without CSRF and does not resume after a valid cancellation", async () => {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		for (const url of ["/face-setup/cancel", "/face-setup/cancel?csrf=invalid"]) {
+			const response = await app.inject({ method: "GET", url, headers: { cookie } });
+			expect(response.statusCode).toBe(400);
+			expect(response.headers["set-cookie"]).toBeUndefined();
+			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("EMAIL");
+		}
+		const request = { method: "GET" as const, url: `/face-setup/cancel?csrf=${encodeURIComponent(csrf)}`, headers: { cookie } };
+		expect((await app.inject(request)).statusCode).toBe(302);
+		expect((await app.inject(request)).statusCode).toBe(200);
+		expect((await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie } })).statusCode).toBe(400);
+		expect(deps.service.start).not.toHaveBeenCalled();
+	});
+
+	it("never clears a newer interaction snapshot during a stale terminal consume", async () => {
+		const cookie = await startCeremony(app);
+		const handle = cookie.slice(FACE_SETUP_COOKIE.length + 1);
+		const stale = (await deps.interactions.find(handle))!;
+		const current = (await deps.interactions.find(handle))!;
+		expect(await deps.interactions.claimEmail(handle, current, "START")).toBe(true);
+		expect(await deps.interactions.consume(handle, stale)).toBe(false);
+		expect((await deps.interactions.find(handle))?.emailOperation).toBe("START");
 	});
 
 	it("another ceremony's CSRF cannot consume or destroy a different interaction", async () => {

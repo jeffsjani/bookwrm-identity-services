@@ -10,6 +10,7 @@ const interactionSchema = z.object({
 	clientId: z.string().min(1), returnUri: z.string().url(), csrf: z.string().min(1),
 	phase: z.enum(["EMAIL", "CONSENT", "STARTING", "ENROLLING", "CANCELLED"]),
 	createdAt: z.number().finite(), expiresAt: z.number().finite(),
+	emailOperation: z.enum(["START", "VERIFY", "RESEND"]).optional(),
 	email: z.object({ challengeId: z.string().min(1) }).optional(),
 	authority: z.object({
 		sub: z.string().min(1), clientId: z.string().min(1), authenticationMethod: z.literal("HAPI_EMAIL"),
@@ -21,6 +22,7 @@ const interactionSchema = z.object({
 	}).optional()
 }).refine(value => value.expiresAt > value.createdAt && value.expiresAt - value.createdAt <= FACE_SETUP_TTL_MS)
 	.refine(value => value.phase === "EMAIL" || Boolean(value.authority))
+	.refine(value => !value.emailOperation || value.phase === "EMAIL")
 	.refine(value => value.phase !== "ENROLLING" || Boolean(value.enrollment));
 
 // Compare the complete loaded snapshot atomically; stale writers cannot undo a claim or resurrect
@@ -35,6 +37,9 @@ const CLEAR_SCRIPT = `
 local ttl = redis.call('PTTL', KEYS[1])
 if ttl > 0 then redis.call('SET', KEYS[2], 'consumed', 'PX', ttl) end
 return redis.call('DEL', KEYS[1])`;
+const CONSUME_SCRIPT = `
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+${CLEAR_SCRIPT}`;
 
 export type NewFaceSetupInteraction = Pick<FaceSetupInteraction, "clientId" | "returnUri">;
 export type FaceSetupInspection = {
@@ -110,6 +115,19 @@ export class FaceSetupInteractionStore {
 		if (interaction.phase !== "CONSENT") return false;
 		interaction.phase = decision === "agree" ? "STARTING" : "CANCELLED";
 		return this.save(handle, interaction);
+	}
+
+	async claimEmail(handle: string, interaction: FaceSetupInteraction, operation: NonNullable<FaceSetupInteraction["emailOperation"]>): Promise<boolean> {
+		if (interaction.phase !== "EMAIL" || interaction.emailOperation) return false;
+		interaction.emailOperation = operation;
+		return this.save(handle, interaction);
+	}
+
+	async consume(handle: string | undefined, interaction: FaceSetupInteraction): Promise<boolean> {
+		const expected = this.snapshots.get(interaction);
+		if (!handle || !HANDLE_PATTERN.test(handle) || !expected || interaction.expiresAt <= this.clock()) return false;
+		return await this.storage(() => this.redis.eval(CONSUME_SCRIPT, 2,
+			this.key(handle), this.consumedKey(handle), expected)) === 1;
 	}
 
 	async clear(handle: string | undefined): Promise<void> {
