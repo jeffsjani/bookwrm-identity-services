@@ -7,9 +7,11 @@ import { markHapiFaceEnrollmentSession } from "../privateid/PrivateIDSessionStor
 import { registerHapiFaceEnrollmentRoutes } from "../routes/hapiFaceEnrollment.js";
 import { PostgresFaceEnrollmentRepository } from "./PostgresFaceEnrollmentRepository.js";
 import { HapiFaceEnrollmentService } from "./HapiFaceEnrollmentService.js";
-import type { FaceEnrollmentCallbacks } from "./FaceEnrollmentTypes.js";
 
-export async function configureFaceEnrollment(app: FastifyInstance, env = process.env): Promise<FaceEnrollmentCallbacks | undefined> {
+// H5.4: the richer HapiFaceEnrollmentService (not just the webhook/callback FaceEnrollmentCallbacks pick)
+// is returned so the Face Setup ceremony can call capabilityStatus/acceptConsent/start/status directly,
+// in-process, instead of making HTTP calls back into /v1 (see H5.4 #11). /v1 routes are unaffected.
+export async function configureFaceEnrollment(app: FastifyInstance, env = process.env): Promise<HapiFaceEnrollmentService | undefined> {
 	if (env.HAPI_FACE_ENROLLMENT_ENABLED !== undefined && !["true", "false"].includes(env.HAPI_FACE_ENROLLMENT_ENABLED)) {
 		throw new Error("HAPI_FACE_ENROLLMENT_ENABLED must be true or false");
 	}

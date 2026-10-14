@@ -1,0 +1,315 @@
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { z } from "zod";
+import { VerificationError } from "../email/VerificationChallenge.js";
+import { resolveH1ClientAuthority, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
+import type { IdentityRegistry } from "../identity/IdentityRegistry.js";
+import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "../authentication/InteractiveEmailAuthentication.js";
+import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
+import {
+	FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, FACE_ENROLLMENT_FRESHNESS_MS,
+	FaceEnrollmentError, type FaceEnrollmentAuthority
+} from "../authenticators/FaceEnrollmentTypes.js";
+import type { HapiFaceEnrollmentService } from "../authenticators/HapiFaceEnrollmentService.js";
+import { FaceSetupInteractionStore } from "../authenticators/FaceSetupInteractionStore.js";
+import {
+	FACE_SETUP_COOKIE, buildOutcomeRedirect, type FaceSetupInteraction
+} from "../authenticators/FaceSetupTypes.js";
+import {
+	faceSetupCodePage, faceSetupConsentPage, faceSetupEmailPage, faceSetupMessagePage, faceSetupProcessingPage
+} from "../authenticators/FaceSetupPages.js";
+
+export type FaceSetupDependencies = {
+	interactions: FaceSetupInteractionStore;
+	service: Pick<HapiFaceEnrollmentService, "acceptConsent" | "start" | "status" | "capabilityStatus">;
+	interactive: InteractiveEmailAuthentication;
+	identitySubjects: Pick<IdentityRegistry, "findByOidcSubject">;
+	clientAuthority: H1ClientAuthority;
+	// Certified pilot gate (H5.4 #10): checked against the canonical, server-resolved oidc subject only --
+	// never against a client-supplied email or user id. An empty/undefined predicate denies everyone.
+	isPilotSubject: (oidcSubject: string) => boolean;
+	isEnabled: () => boolean;
+};
+
+const expiredPage = () => faceSetupMessagePage({
+	title: "This sign-in request has expired",
+	message: "Return to Bookwrm and choose \"Set Up Face Login\" again to start over."
+});
+
+const notEligiblePage = (message: string) => faceSetupMessagePage({ title: "Face Login isn't available", message });
+
+function cookieHeader(handle: string | null): string {
+	return handle
+		? `${FACE_SETUP_COOKIE}=${handle}; Path=/face-setup; Max-Age=600; HttpOnly; Secure; SameSite=Lax`
+		: `${FACE_SETUP_COOKIE}=; Path=/face-setup; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+}
+
+function readHandle(request: FastifyRequest): string | undefined {
+	return request.headers.cookie?.split(";").map(value => value.trim())
+		.find(value => value.startsWith(`${FACE_SETUP_COOKIE}=`))?.slice(FACE_SETUP_COOKIE.length + 1);
+}
+
+function sendPage(reply: FastifyReply, status: number, rendered: { html: string; contentSecurityPolicy: string }) {
+	return reply.code(status).header("Cache-Control", "no-store").header("Pragma", "no-cache")
+		.header("Referrer-Policy", "no-referrer").header("X-Frame-Options", "DENY")
+		.header("Content-Security-Policy", rendered.contentSecurityPolicy)
+		.type("text/html; charset=utf-8").send(rendered.html);
+}
+
+export async function registerFaceSetupRoutes(app: FastifyInstance, deps: FaceSetupDependencies): Promise<void> {
+	const { interactions, service, interactive, identitySubjects, clientAuthority, isPilotSubject, isEnabled } = deps;
+
+	const guardEnabled = (reply: FastifyReply): boolean => {
+		if (isEnabled()) return true;
+		reply.code(404).send({ error: "not_found" });
+		return false;
+	};
+
+	// Terminates the ceremony: clears the interaction record and its cookie, then sends a safe redirect
+	// back to the registered Bookwrm return URI with only an outcome flag -- never a token, PUID, or identifier.
+	const finish = async (reply: FastifyReply, handle: string | undefined, interaction: FaceSetupInteraction,
+		outcome: "success" | "cancelled" | "failed") => {
+		await interactions.clear(handle);
+		reply.header("Set-Cookie", cookieHeader(null));
+		return reply.code(302).header("Location", buildOutcomeRedirect(interaction.returnUri, outcome)).send();
+	};
+
+	const load = async (request: FastifyRequest, reply: FastifyReply): Promise<{ handle: string; interaction: FaceSetupInteraction } | null> => {
+		if (!guardEnabled(reply)) return null;
+		const handle = readHandle(request);
+		const interaction = await interactions.find(handle);
+		if (!interaction || !handle) {
+			sendPage(reply, 400, expiredPage());
+			return null;
+		}
+		return { handle, interaction };
+	};
+
+	const csrfOk = (interaction: FaceSetupInteraction, candidate: unknown) => FaceSetupInteractionStore.csrfMatches(interaction, candidate);
+
+	// Resolves the same H1 client authority already bound at /face-setup/start; a client disabled or
+	// reconfigured mid-ceremony fails closed rather than silently trusting the stale binding.
+	const emailAuthority = async (interaction: FaceSetupInteraction): Promise<InteractiveEmailAuthority | null> => {
+		try {
+			const authority = await interactive.authority(interaction.clientId);
+			return authority.clientId === interaction.clientId ? authority : null;
+		} catch (error) {
+			if (error instanceof VerificationError) return null;
+			throw error;
+		}
+	};
+
+	app.get("/face-setup/start", async (request, reply) => {
+		if (!guardEnabled(reply)) return undefined;
+		const query = z.object({ client_id: z.string().min(1), return_uri: z.string().url() }).safeParse(request.query ?? {});
+		if (!query.success) return reply.code(400).send({ error: "invalid_request" });
+		let authority;
+		try {
+			authority = await resolveH1ClientAuthority(query.data.client_id, clientAuthority);
+		} catch (error) {
+			if (error instanceof VerificationError) return reply.code(400).send({ error: "INVALID_CLIENT" });
+			throw error;
+		}
+		const record = await clientAuthority.clients.findByClientId(query.data.client_id);
+		if (!record || !record.redirectUris.includes(query.data.return_uri)) {
+			return reply.code(400).send({ error: "INVALID_RETURN_URI" });
+		}
+		const { handle } = await interactions.create({ clientId: authority.clientId, returnUri: query.data.return_uri });
+		reply.header("Set-Cookie", cookieHeader(handle));
+		return reply.code(302).header("Location", "/face-setup/email").send();
+	});
+
+	app.get("/face-setup/email", async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		if (loaded.interaction.phase !== "EMAIL") return finish(reply, loaded.handle, loaded.interaction, "failed");
+		return sendPage(reply, 200, faceSetupEmailPage({ csrf: loaded.interaction.csrf }));
+	});
+
+	app.post("/face-setup/email", { bodyLimit: 4096 }, async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		const { handle, interaction } = loaded;
+		if (interaction.phase !== "EMAIL") return finish(reply, handle, interaction, "failed");
+		const body = z.object({ csrf: z.string(), email: z.string().email() }).safeParse(request.body ?? {});
+		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			return sendPage(reply, 400, faceSetupEmailPage({ csrf: interaction.csrf, error: "Please try again." }));
+		}
+		const authority = await emailAuthority(interaction);
+		if (!authority) return finish(reply, handle, interaction, "failed");
+		let started;
+		try {
+			started = await interactive.start(authority, body.data.email);
+		} catch (error) {
+			if (error instanceof VerificationError || error instanceof EmailAuthenticationError) {
+				return sendPage(reply, 429, faceSetupEmailPage({ csrf: interaction.csrf, error: "Too many attempts. Please wait and try again." }));
+			}
+			throw error;
+		}
+		// H5.4 #2: Face setup only ever reauthenticates an existing HAPI_EMAIL subject -- a brand-new or
+		// ineligible email never creates an IdentitySubject or enters the registration path here.
+		if (started.mode !== "AUTHENTICATION") {
+			return sendPage(reply, 200, faceSetupEmailPage({
+				csrf: interaction.csrf,
+				error: "We couldn't find an existing Bookwrm account with that email. Use the email you already sign in with."
+			}));
+		}
+		interaction.email = { challengeId: started.challengeId };
+		await interactions.save(handle, interaction);
+		return sendPage(reply, 200, faceSetupCodePage({ csrf: interaction.csrf }));
+	});
+
+	app.get("/face-setup/email/code", async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		if (loaded.interaction.phase !== "EMAIL" || !loaded.interaction.email) return finish(reply, loaded.handle, loaded.interaction, "failed");
+		return sendPage(reply, 200, faceSetupCodePage({ csrf: loaded.interaction.csrf }));
+	});
+
+	app.post("/face-setup/email/resend", { bodyLimit: 4096 }, async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		const { interaction } = loaded;
+		if (interaction.phase !== "EMAIL" || !interaction.email) return finish(reply, loaded.handle, interaction, "failed");
+		const body = z.object({ csrf: z.string() }).safeParse(request.body ?? {});
+		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			return sendPage(reply, 400, faceSetupCodePage({ csrf: interaction.csrf, error: "Please try again." }));
+		}
+		const authority = await emailAuthority(interaction);
+		if (!authority) return finish(reply, loaded.handle, interaction, "failed");
+		try {
+			await interactive.resend(authority, interaction.email.challengeId, "AUTHENTICATION");
+		} catch {
+			return sendPage(reply, 429, faceSetupCodePage({ csrf: interaction.csrf, error: "Too many attempts. Please wait and try again." }));
+		}
+		return sendPage(reply, 200, faceSetupCodePage({ csrf: interaction.csrf }));
+	});
+
+	app.post("/face-setup/email/code", { bodyLimit: 4096 }, async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		const { handle, interaction } = loaded;
+		if (interaction.phase !== "EMAIL" || !interaction.email) return finish(reply, handle, interaction, "failed");
+		const body = z.object({ csrf: z.string(), code: z.string().min(1) }).safeParse(request.body ?? {});
+		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			return sendPage(reply, 400, faceSetupCodePage({ csrf: interaction.csrf, error: "Please try again." }));
+		}
+		const authority = await emailAuthority(interaction);
+		if (!authority) return finish(reply, handle, interaction, "failed");
+		let verification;
+		try {
+			verification = await interactive.verify(authority, interaction.email.challengeId, body.data.code, "AUTHENTICATION");
+		} catch {
+			return sendPage(reply, 401, faceSetupCodePage({
+				csrf: interaction.csrf,
+				error: "We couldn't sign you in with that code. Check the code or request a new one."
+			}));
+		}
+		if (verification.mode !== "AUTHENTICATION") return finish(reply, handle, interaction, "failed");
+		const principal = await interactive.consumeResult(authority, verification.authenticationResult);
+
+		// H5.4 #5: the authenticated HAPI subject, not any Bookwrm/Base44-supplied email, is authoritative.
+		const subject = await identitySubjects.findByOidcSubject(principal.sub);
+		if (!subject || subject.primaryProvider !== "HAPI_EMAIL" || subject.status !== "ACTIVE" ||
+			subject.emailVerified !== true || subject.email !== subject.primaryProviderSubject) {
+			await interactions.clear(handle);
+			reply.header("Set-Cookie", cookieHeader(null));
+			return sendPage(reply, 403, notEligiblePage("This account isn't eligible for Face setup yet."));
+		}
+
+		// H5.4 #10: pilot gate decided only after fresh canonical authentication, keyed on the stable sub.
+		if (!isPilotSubject(principal.sub)) {
+			await interactions.clear(handle);
+			reply.header("Set-Cookie", cookieHeader(null));
+			return sendPage(reply, 403, notEligiblePage("Face Login isn't available for your account yet."));
+		}
+
+		const authenticatedAtMs = Date.parse(principal.authenticatedAt);
+		const faceAuthority: FaceEnrollmentAuthority = {
+			sub: principal.sub, clientId: interaction.clientId, authenticationMethod: "HAPI_EMAIL",
+			authenticatedAt: principal.authenticatedAt, scope: "openid",
+			expiresAt: authenticatedAtMs + FACE_ENROLLMENT_FRESHNESS_MS
+		};
+		interaction.authority = faceAuthority;
+		interaction.phase = "CONSENT";
+		await interactions.save(handle, interaction);
+		return sendPage(reply, 200, faceSetupConsentPage({ csrf: interaction.csrf }));
+	});
+
+	app.get("/face-setup/consent", async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		if (loaded.interaction.phase !== "CONSENT" || !loaded.interaction.authority) {
+			return finish(reply, loaded.handle, loaded.interaction, "failed");
+		}
+		return sendPage(reply, 200, faceSetupConsentPage({ csrf: loaded.interaction.csrf }));
+	});
+
+	app.post("/face-setup/consent", { bodyLimit: 4096 }, async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		const { handle, interaction } = loaded;
+		if (interaction.phase !== "CONSENT" || !interaction.authority) return finish(reply, handle, interaction, "failed");
+		const body = z.object({ csrf: z.string(), decision: z.enum(["agree", "not_now"]) }).safeParse(request.body ?? {});
+		if (!body.success || !csrfOk(interaction, body.data.csrf)) {
+			return sendPage(reply, 400, faceSetupConsentPage({ csrf: interaction.csrf }));
+		}
+		// "Not Now" creates no consent record and starts no enrollment -- it only clears the ceremony.
+		if (body.data.decision === "not_now") return finish(reply, handle, interaction, "cancelled");
+
+		try {
+			await service.acceptConsent(interaction.authority, FACE_AUTH_CONSENT_VERSION, FACE_AUTH_CONSENT_PURPOSE);
+			const started = await service.start(interaction.authority);
+			if (typeof started.enrollmentId !== "string" || typeof started.launchUrl !== "string" || typeof started.expiresAt !== "string") {
+				const status = await service.capabilityStatus(interaction.authority);
+				return finish(reply, handle, interaction, status.enrollmentState === "ACTIVE" && status.faceLoginEligible ? "success" : "failed");
+			}
+			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt };
+			interaction.phase = "ENROLLING";
+			await interactions.save(handle, interaction);
+			return reply.code(302).header("Location", started.launchUrl).send();
+		} catch (error) {
+			if (error instanceof FaceEnrollmentError) return finish(reply, handle, interaction, "failed");
+			throw error;
+		}
+	});
+
+	app.get("/face-setup/callback", async (request, reply) => {
+		const loaded = await load(request, reply);
+		if (!loaded) return undefined;
+		const { handle, interaction } = loaded;
+		if (interaction.phase !== "ENROLLING" || !interaction.enrollment || !interaction.authority) {
+			return finish(reply, handle, interaction, "failed");
+		}
+		let result;
+		try {
+			result = await service.status(interaction.enrollment.enrollmentId, interaction.authority);
+		} catch (error) {
+			if (error instanceof FaceEnrollmentError) return finish(reply, handle, interaction, "failed");
+			throw error;
+		}
+		const status = typeof result.body?.status === "string" ? result.body.status : undefined;
+		if (status === "COMPLETED") {
+			const capability = await service.capabilityStatus(interaction.authority);
+			return finish(reply, handle, interaction,
+				capability.enrollmentState === "ACTIVE" && capability.faceLoginEligible ? "success" : "failed");
+		}
+		if (status === "PENDING" && interaction.expiresAt > Date.now()) {
+			return sendPage(reply, 200, faceSetupProcessingPage("/face-setup/callback"));
+		}
+		return finish(reply, handle, interaction, "failed");
+	});
+
+	app.get("/face-setup/cancel", async (request, reply) => {
+		if (!guardEnabled(reply)) return undefined;
+		const handle = readHandle(request);
+		const interaction = await interactions.find(handle);
+		if (!interaction) {
+			reply.header("Set-Cookie", cookieHeader(null));
+			return sendPage(reply, 200, faceSetupMessagePage({
+				title: "Face setup cancelled",
+				message: "You can close this page and return to Bookwrm."
+			}));
+		}
+		return finish(reply, handle, interaction, "cancelled");
+	});
+}

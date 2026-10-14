@@ -21,6 +21,7 @@ import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
 import { configureEmailVerification } from "./adapters/email/EmailVerificationComposition.js";
 import { configureRegistration } from "./registration/RegistrationComposition.js";
 import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposition.js";
+import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
 
 const app = Fastify({
 		logger: {
@@ -75,6 +76,7 @@ const emailAuthentication = await configureEmailVerification(app);
 const registration = await configureRegistration(app);
 emailAuthentication?.configureRegistration(registration);
 if (emailAuthentication) oidcService.configureEmailAuthentication(emailAuthentication);
+await configureFaceSetupCeremony(app, faceEnrollment, emailAuthentication);
 await oidcService.registerEndpoints(app);
 
 app.get("/metrics", async (_request, reply) => {

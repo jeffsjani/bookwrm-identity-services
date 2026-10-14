@@ -19,6 +19,18 @@ It is disabled by default via `HAPI_FACE_ENROLLMENT_ENABLED=false`.
 See [H5 authority, API, migration, and validation guide](docs/H5-Face-Authenticator-Attachment.md).
 No production activation, deployment, or Base44 UI is included.
 
+## HAPI-owned Face Setup reauthorization ceremony
+
+H5.4 adds a HAPI-owned `/face-setup/*` entry point so Bookwrm's "Set Up Face Login"
+never relies on a Base44/Bookwrm-held SSO token as `/v1` bearer authority. HAPI mints
+fresh canonical authority itself via a brand-new H4 email OTP round trip immediately
+before FACE_AUTH_V1 consent and PrivateID enrollment, reusing the existing H4/H5/H6
+engines and `/v1` service layer in-process. It is disabled by default via
+`HAPI_FACE_SETUP_ENABLED=false`, and no subject is pilot-eligible until explicitly
+listed in `HAPI_FACE_SETUP_PILOT_SUBJECTS` (by canonical subject, never email).
+See [H5.4 Face Setup reauthorization ceremony](docs/H5.4-Face-Setup-Reauthorization-Ceremony.md).
+`/v1` security is unchanged; no production activation or Base44 mutation is included.
+
 ## HAPI Universal Login
 
 H6 makes interactive `GET /authorize` render a HAPI-hosted sign-in page ("Sign in to
