@@ -167,8 +167,10 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			const request = { method: "POST" as const, url: "/face-setup/consent",
 				headers: { cookie: `${FACE_SETUP_COOKIE}=${handle}` }, payload: { csrf: interaction.csrf, decision: "agree" } };
 			const responses = await Promise.all([app.inject(request), app.inject(request)]);
-			expect(responses.map(response => response.statusCode).sort()).toEqual([302, 303]);
-			expect((await app.inject(request)).statusCode).toBe(303);
+			for (const response of [...responses, await app.inject(request)]) {
+				expect(response.statusCode).toBe(200);
+				expect(response.body).toContain('content="0;url=/face-setup/continue"');
+			}
 			expect((await interactions.find(handle))?.phase).toBe("ENROLLING");
 			expect(createSession.mock.calls.length - sessionCount).toBe(1);
 			const counts = (await pool.query(`SELECT
@@ -229,22 +231,25 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			const responses = await Promise.all(attempts.map(({ cookie, csrf }) => app.inject({
 				method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "local-otp" }
 			})));
-			expect(responses.every(response => response.statusCode === 302)).toBe(true);
-			const winner = responses.findIndex(response => response.headers.location === "https://privateid.example.test/enroll");
+			expect(responses.every(response => response.statusCode === 200)).toBe(true);
+			const winner = responses.findIndex(response => response.body.includes('content="0;url=/face-setup/continue"'));
 			expect(winner).toBeGreaterThanOrEqual(0);
-			expect(responses.filter(response => response.headers.location === "https://privateid.example.test/enroll")).toHaveLength(1);
+			expect(responses.filter(response => response.body.includes('content="0;url=/face-setup/continue"'))).toHaveLength(1);
+			const continuation = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie: attempts[winner].cookie } });
+			expect(continuation.statusCode).toBe(302);
+			expect(continuation.headers.location).toBe("https://privateid.example.test/enroll");
 			for (let i = 0; i < 2; i++) {
 				const { cookie, csrf } = attempts[winner];
 				for (const url of ["/face-setup/email/code", "/face-setup/consent"]) {
 					const duplicate = await app.inject({ method: "POST", url, headers: { cookie }, payload: { csrf, code: "local-otp", decision: "agree" } });
-					expect(duplicate.statusCode).toBe(303);
-					expect(duplicate.headers.location).toBe("/face-setup/continue");
+					expect(duplicate.statusCode).toBe(200);
+					expect(duplicate.body).toContain('content="0;url=/face-setup/continue"');
 					expect(duplicate.headers["set-cookie"]).toBeUndefined();
 				}
 			}
 			const stalePage = await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie: attempts[winner].cookie } });
-			expect(stalePage.statusCode).toBe(303);
-			expect(stalePage.headers.location).toBe("/face-setup/continue");
+			expect(stalePage.statusCode).toBe(200);
+			expect(stalePage.body).toContain('content="0;url=/face-setup/continue"');
 			expect(stalePage.headers["set-cookie"]).toBeUndefined();
 			const rows = (await pool.query(`SELECT e.*, b.identity_subject_id, b.authenticator_id, b.session_id
 				FROM privateid_enrollment_transactions e JOIN hapi_face_enrollment_bindings b ON b.enrollment_id=e.id

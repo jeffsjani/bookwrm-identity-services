@@ -1,16 +1,25 @@
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createServer, type Server } from "node:https";
+import type { AddressInfo } from "node:net";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Writable } from "node:stream";
 import Fastify, { type FastifyInstance } from "fastify";
+import formbody from "@fastify/formbody";
 import RedisMock from "ioredis-mock";
 import { JSDOM } from "jsdom";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { chromium, type Browser } from "playwright";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerFaceSetupRoutes, type FaceSetupDependencies } from "../src/routes/faceSetup.js";
 import { FaceSetupInteractionStore } from "../src/authenticators/FaceSetupInteractionStore.js";
 import { FACE_SETUP_COOKIE, FaceSetupError } from "../src/authenticators/FaceSetupTypes.js";
-import { faceSetupConsentPage } from "../src/authenticators/FaceSetupPages.js";
+import { faceSetupCodePage, faceSetupConsentPage, faceSetupEmailPage } from "../src/authenticators/FaceSetupPages.js";
+import { chooserPage, codePage, emailPage } from "../src/oidc/UniversalLoginPages.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
 import { oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
-import { FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_VERSION, FaceEnrollmentError,
+import { FACE_AUTH_CONSENT_PURPOSE, FACE_AUTH_CONSENT_TEXT, FACE_AUTH_CONSENT_VERSION, FaceEnrollmentError,
 	type FaceEnrollmentAuthority, type FaceEnrollmentRepository } from "../src/authenticators/FaceEnrollmentTypes.js";
 import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "../src/authentication/InteractiveEmailAuthentication.js";
 import type { EmailPrincipal } from "../src/authentication/email/EmailAuthenticationTypes.js";
@@ -116,6 +125,16 @@ function csrfFromHtml(html: string): string {
 	return match[1];
 }
 
+function expectNavigation(response: { statusCode: number; headers: Record<string, unknown>; body: string }, destination: string) {
+	expect(response.statusCode).toBe(200);
+	expect(response.headers.location).toBeUndefined();
+	const dom = new JSDOM(response.body);
+	expect(dom.window.document.querySelector('meta[http-equiv="refresh"]')?.getAttribute("content")).toBe(`0;url=${destination}`);
+	expect(dom.window.document.querySelector("a")?.getAttribute("href")).toBe(destination);
+	expect(response.headers["content-security-policy"]).toContain("form-action 'self'");
+	dom.window.close();
+}
+
 describe("H5.4 Face Setup reauthorization ceremony", () => {
 	let app: FastifyInstance;
 	let deps: FaceSetupDependencies;
@@ -196,7 +215,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		expect(deps.interactive.consumeResult).toHaveBeenCalledTimes(1);
 		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("ENROLLING");
 		const repeat = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
-		expect(repeat.statusCode).toBe(303);
+		expectNavigation(repeat, "/face-setup/continue");
 		expect(deps.service.start).toHaveBeenCalledTimes(1);
 		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
 	});
@@ -216,14 +235,12 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const request = { method: "POST" as const, url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } };
 		for (let repeat = 0; repeat < 2; repeat++) {
 			const response = await app.inject(request);
-			expect(response.statusCode).toBe(303);
-			expect(response.headers.location).toBe("/face-setup/continue");
+			expectNavigation(response, "/face-setup/continue");
 			expect(response.headers["set-cookie"]).toBeUndefined();
 			expect((await deps.interactions.find(handle))?.phase).toBe("ENROLLING");
 		}
 		const stalePage = await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie } });
-		expect(stalePage.statusCode).toBe(303);
-		expect(stalePage.headers.location).toBe("/face-setup/continue");
+		expectNavigation(stalePage, "/face-setup/continue");
 		expect(stalePage.headers["set-cookie"]).toBeUndefined();
 		const continuation = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } });
 		expect(continuation.headers.location).toBe("https://privateid.example.test/launch");
@@ -260,12 +277,11 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		try {
 			await vi.waitFor(() => expect(fixture.provider).toHaveBeenCalledTimes(1));
 			const repeat = await app.inject(request);
-			expect(repeat.statusCode).toBe(303);
-			expect(repeat.headers.location).toBe("/face-setup/continue");
+			expectNavigation(repeat, "/face-setup/continue");
 			expect(repeat.headers["set-cookie"]).toBeUndefined();
 			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("STARTING");
 		} finally { release(); }
-		expect((await first).statusCode).toBe(302);
+		expectNavigation(await first, "/face-setup/continue");
 		expect(fixture.repository.reserve).toHaveBeenCalledTimes(1);
 		expect(fixture.provider).toHaveBeenCalledTimes(1);
 		expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
@@ -275,8 +291,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const cookie = await startCeremony(app);
 		const csrf = await reachConsent(app, cookie);
 		const repeat = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
-		expect(repeat.statusCode).toBe(303);
-		expect(repeat.headers.location).toBe("/face-setup/consent");
+		expectNavigation(repeat, "/face-setup/consent");
 		expect(repeat.headers["set-cookie"]).toBeUndefined();
 		expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("CONSENT");
 		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
@@ -369,8 +384,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const cookie = await startCeremony(app);
 		const csrf = await reachConsent(app, cookie);
 		const response = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "not_now" } });
-		expect(response.statusCode).toBe(302);
-		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=cancelled`);
+		expectNavigation(response, `${RETURN_URI}?face_setup=cancelled`);
 		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
 		expect(deps.service.start).not.toHaveBeenCalled();
 	});
@@ -379,8 +393,10 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const cookie = await startCeremony(app);
 		const csrf = await reachConsent(app, cookie);
 		const response = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
-		expect(response.statusCode).toBe(302);
-		expect(response.headers.location).toBe("https://privateid.example.test/launch");
+		expectNavigation(response, "/face-setup/continue");
+		const continuation = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } });
+		expect(continuation.statusCode).toBe(302);
+		expect(continuation.headers.location).toBe("https://privateid.example.test/launch");
 		expect(deps.service.acceptConsent).toHaveBeenCalledTimes(1);
 		expect(deps.service.acceptConsent).toHaveBeenCalledWith(
 			expect.objectContaining({ sub: SUBJECT, authenticationMethod: "HAPI_EMAIL" }),
@@ -417,19 +433,17 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const request = { method: "POST" as const, url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } };
 		const handle = cookie.slice(FACE_SETUP_COOKIE.length + 1);
 		const first = await app.inject(request);
-		expect(first.statusCode).toBe(302);
-		expect(first.headers.location).toBe("https://privateid.example.test/launch");
+		expectNavigation(first, "/face-setup/continue");
 		expect((await deps.interactions.find(handle))?.phase).toBe("ENROLLING");
 		for (let repeat = 0; repeat < 2; repeat++) {
 			const response = await app.inject(request);
-			expect(response.statusCode).toBe(303);
-			expect(response.headers.location).toBe("/face-setup/continue");
+			expectNavigation(response, "/face-setup/continue");
 			expect(response.headers["set-cookie"]).toBeUndefined();
 			expect((await deps.interactions.find(handle))?.phase).toBe("ENROLLING");
 		}
 		const continuation = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } });
 		expect(continuation.statusCode).toBe(302);
-		expect(continuation.headers.location).toBe(first.headers.location);
+		expect(continuation.headers.location).toBe("https://privateid.example.test/launch");
 		expect(fixture.repository.acceptConsent).toHaveBeenCalledTimes(1);
 		expect(fixture.repository.reserve).toHaveBeenCalledTimes(1);
 		expect(fixture.provider).toHaveBeenCalledTimes(1);
@@ -451,12 +465,12 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const second = app.inject(request);
 		await vi.waitFor(() => expect(fixture.repository.acceptConsent).toHaveBeenCalledTimes(1));
 		const duplicate = await Promise.race([first, second]);
-		expect(duplicate.statusCode).toBe(303);
+		expectNavigation(duplicate, "/face-setup/continue");
 		const pending = await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } });
 		expect(pending.statusCode).toBe(200);
 		expect(pending.body).toContain("Finishing Face setup");
 		release();
-		expect((await Promise.all([first, second])).map(response => response.statusCode).sort()).toEqual([302, 303]);
+		for (const response of await Promise.all([first, second])) expectNavigation(response, "/face-setup/continue");
 		expect(fixture.repository.acceptConsent).toHaveBeenCalledTimes(1);
 		expect(fixture.repository.reserve).toHaveBeenCalledTimes(1);
 		expect(fixture.provider).toHaveBeenCalledTimes(1);
@@ -615,7 +629,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		expect(response.headers.location).toBeUndefined();
 		if (phase === "ENROLLING") {
 			const repeat = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
-			expect(repeat.statusCode).toBe(303);
+			expectNavigation(repeat, "/face-setup/continue");
 			expect(deps.service.start).toHaveBeenCalledTimes(1);
 			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("STARTING");
 		}
@@ -684,8 +698,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const cookie = await startCeremony(app);
 		const csrf = await reachConsent(app, cookie);
 		const response = await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
-		expect(response.statusCode).toBe(302);
-		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=failed`);
+		expectNavigation(response, `${RETURN_URI}?face_setup=failed`);
 	});
 
 	it("is idempotent across duplicate callback polls while the provider is still pending", async () => {
@@ -726,8 +739,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
 		const csrf = csrfFromHtml(page.body);
 		const response = await app.inject({ method: "GET", url: `/face-setup/cancel?csrf=${encodeURIComponent(csrf)}`, headers: { cookie } });
-		expect(response.statusCode).toBe(302);
-		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=cancelled`);
+		expectNavigation(response, `${RETURN_URI}?face_setup=cancelled`);
 	});
 
 	it.each(["START", "VERIFY", "RESEND"] as const)("single-claims concurrent email %s operations", async operation => {
@@ -823,8 +835,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 			{ method: "POST" as const, url: "/face-setup/email/resend", payload: { csrf } }
 		]) {
 			const response = await app.inject({ ...request, headers: { cookie } });
-			expect(response.statusCode).toBe(303);
-			expect(response.headers.location).toBe("/face-setup/continue");
+			expectNavigation(response, "/face-setup/continue");
 			expect(response.headers["set-cookie"]).toBeUndefined();
 			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("ENROLLING");
 		}
@@ -876,7 +887,7 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 			expect((await deps.interactions.find(cookie.slice(FACE_SETUP_COOKIE.length + 1)))?.phase).toBe("EMAIL");
 		}
 		const request = { method: "GET" as const, url: `/face-setup/cancel?csrf=${encodeURIComponent(csrf)}`, headers: { cookie } };
-		expect((await app.inject(request)).statusCode).toBe(302);
+		expectNavigation(await app.inject(request), `${RETURN_URI}?face_setup=cancelled`);
 		expect((await app.inject(request)).statusCode).toBe(200);
 		expect((await app.inject({ method: "GET", url: "/face-setup/email/code", headers: { cookie } })).statusCode).toBe(400);
 		expect(deps.service.start).not.toHaveBeenCalled();
@@ -916,6 +927,202 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 		await register(app, deps);
 		const response = await app.inject({ method: "GET", url: `/face-setup/start?client_id=${CLIENT_ID}&return_uri=${encodeURIComponent(RETURN_URI)}` });
 		expect(response.statusCode).toBe(404);
+	});
+});
+
+describe("H5.4 real Chromium form/CSP navigation contract", () => {
+	let browser: Browser;
+	let destination: Server;
+	let destinationOrigin: string;
+	const origin = "https://identity.bookwrm.com";
+
+	beforeAll(async () => {
+		const directory = mkdtempSync(join(tmpdir(), "hapi-browser-tls-"));
+		const keyPath = join(directory, "key.pem");
+		const certPath = join(directory, "cert.pem");
+		try {
+			execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes",
+				"-keyout", keyPath, "-out", certPath, "-subj", "/CN=localhost", "-days", "1"],
+			{ stdio: ["ignore", "pipe", "pipe"] });
+			destination = createServer({ key: readFileSync(keyPath), cert: readFileSync(certPath) }, (_request, response) => {
+				response.setHeader("Content-Type", "text/html");
+				response.end("<h1>Mock destination</h1>");
+			});
+		} finally {
+			rmSync(keyPath, { force: true });
+			rmSync(certPath, { force: true });
+			rmSync(directory, { recursive: true });
+		}
+		await new Promise<void>(resolve => destination.listen(0, "127.0.0.1", resolve));
+		destinationOrigin = `https://127.0.0.1:${(destination.address() as AddressInfo).port}`;
+		browser = await chromium.launch();
+	});
+	afterAll(async () => {
+		await browser?.close();
+		if (destination) await new Promise<void>((resolve, reject) => destination.close(error => error ? reject(error) : resolve()));
+	});
+
+	it("reproduces the original same-origin OTP POST succeeding before Chrome blocks its external 302", async () => {
+		const context = await browser.newContext();
+		try {
+			const page = await context.newPage();
+			const rendered = faceSetupCodePage({ csrf: "local-fixture" });
+			const requests: string[] = [];
+			await context.route("**/*", async route => {
+				const request = route.request();
+				requests.push(`${request.method()} ${new URL(request.url()).origin}`);
+				if (request.method() === "POST") {
+					return route.fulfill({ status: 302, headers: { location: "https://privateid.example.test/launch" } });
+				}
+				return route.fulfill({ contentType: "text/html", body: rendered.html,
+					headers: { "content-security-policy": rendered.contentSecurityPolicy } });
+			});
+			await page.goto(`${origin}/face-setup/email/code`);
+			expect(await page.evaluate(() => location.origin)).toBe(origin);
+			expect(await page.locator("form").getAttribute("action")).toBe("/face-setup/email/code");
+			expect(await page.locator("form").evaluate(form => (form as HTMLFormElement).action)).toBe(`${origin}/face-setup/email/code`);
+			expect(await page.locator('meta[http-equiv="Content-Security-Policy"]').count()).toBe(0);
+			await page.locator("#code").fill("123456");
+			const violation = page.waitForEvent("console", { predicate: message =>
+				message.type() === "error" && message.text().includes("form-action 'self'") });
+			await page.getByRole("button", { name: "Verify", exact: true }).click();
+			expect((await violation).text()).toContain(`Sending form data to '${origin}/face-setup/email/code'`);
+			expect(requests).toEqual([`GET ${origin}`, `POST ${origin}`]);
+			expect(page.url()).toBe(`${origin}/face-setup/email/code`);
+		} finally { await context.close(); }
+	});
+
+	const formPages = [
+		["Face email/cancel", () => faceSetupEmailPage({ csrf: "local-fixture" })],
+		["Face OTP", () => faceSetupCodePage({ csrf: "local-fixture" })],
+		["Face consent", () => faceSetupConsentPage({ csrf: "local-fixture" })],
+		...["generic-client", "bookwrm-base44-production"].flatMap(clientId => [
+			[`${clientId} chooser`, () => chooserPage({ clientId, csrf: "local-fixture", emailAvailable: true, faceAvailable: true })],
+			[`${clientId} email`, () => emailPage({ clientId, csrf: "local-fixture" })],
+			[`${clientId} OTP/resend`, () => codePage({ clientId, csrf: "local-fixture" })]
+		] as const)
+	] as const;
+
+	it.each(formPages)("submits every %s form under form-action self using the actual document origin", async (_label, render) => {
+		const context = await browser.newContext();
+		try {
+			const page = await context.newPage();
+			const rendered = render();
+			const errors: string[] = [];
+			page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+			const policy = rendered.contentSecurityPolicy.includes("form-action")
+				? rendered.contentSecurityPolicy : `${rendered.contentSecurityPolicy}; form-action 'self'`;
+			await context.route("**/*", route => route.fulfill({ contentType: "text/html",
+				body: new URL(route.request().url()).pathname === "/fixture" ? rendered.html : "<h1>Form received</h1>",
+				headers: { "content-security-policy": policy } }));
+			// A non-default external port makes any hardcoded canonical-origin action fail.
+			const actualOrigin = `${origin}:8443`;
+			await page.goto(`${actualOrigin}/fixture`);
+			const actions = await page.locator("form").evaluateAll(forms => forms.map(form => form.getAttribute("action")));
+			expect(actions.length).toBeGreaterThan(0);
+			for (let index = 0; index < actions.length; index++) {
+				const action = actions[index];
+				expect(action).toMatch(/^\/(?!\/)/);
+				expect(new URL(action!, actualOrigin).origin).toBe(actualOrigin);
+				if (index) await page.goto(`${actualOrigin}/fixture`);
+				const form = page.locator("form").nth(index);
+				for (const input of await form.locator("input[required]").all()) {
+					await input.fill(await input.getAttribute("type") === "email" ? "local@example.test" : "123456");
+				}
+				await Promise.all([
+					page.waitForURL(url => url.pathname === action),
+					form.locator("button").click()
+				]);
+				expect(await page.getByRole("heading").textContent()).toBe("Form received");
+			}
+			expect(errors).toEqual([]);
+		} finally { await context.close(); }
+	});
+
+	async function ceremony(consentRequired: boolean) {
+		const { app, deps } = buildApp();
+		await app.register(formbody);
+		const returnUri = `${destinationOrigin}/return`;
+		const launchUrl = `${destinationOrigin}/launch`;
+		const findClient = vi.mocked(deps.clientAuthority.clients.findByClientId).getMockImplementation()!;
+		vi.mocked(deps.clientAuthority.clients.findByClientId).mockImplementation(async clientId => {
+			const client = await findClient(clientId);
+			return client ? { ...client, redirectUris: [returnUri] } : undefined;
+		});
+		vi.mocked(deps.service.start).mockResolvedValue({
+			enrolled: false, enrollmentId: "enrollment-1", launchUrl, expiresAt: new Date(Date.now() + 300_000).toISOString()
+		});
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValue({
+			faceEnrollmentEligible: true, faceLoginEligible: false, consentRequired,
+			enrollmentState: "FAILED", consentVersion: FACE_AUTH_CONSENT_VERSION,
+			consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: FACE_AUTH_CONSENT_TEXT
+		});
+		let otpHtml = "";
+		let otpCsp = "";
+		app.addHook("onSend", async (request, reply, payload) => {
+			if (request.method === "POST" && request.url === "/face-setup/email" && typeof payload === "string") {
+				otpHtml = payload;
+				otpCsp = String(reply.getHeader("Content-Security-Policy"));
+			}
+			return payload;
+		});
+		app.get("/fixture/stale-otp", async (_request, reply) =>
+			reply.header("Content-Security-Policy", otpCsp).type("text/html").send(otpHtml));
+		await registerFaceSetupRoutes(app, deps);
+		const localOrigin = await app.listen({ host: "127.0.0.1", port: 0 });
+		const context = await browser.newContext({ ignoreHTTPSErrors: true });
+		const page = await context.newPage();
+		page.setDefaultTimeout(3000);
+		const errors: string[] = [];
+		page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+		return { app, deps, page, context, errors, origin: localOrigin, returnUri, launchUrl,
+			close: async () => { await context.close(); await app.close(); } };
+	}
+
+	it.each([false, true])("verifies the first OTP exactly once and reaches a mocked provider without CSP errors (consentRequired=%s)", async consentRequired => {
+		const flow = await ceremony(consentRequired);
+		try {
+			const { page, deps, context } = flow;
+			await page.goto(`${flow.origin}/face-setup/start?client_id=${CLIENT_ID}&return_uri=${encodeURIComponent(flow.returnUri)}`);
+			await page.locator("#email").fill("local@example.test");
+			await page.getByRole("button", { name: "Continue", exact: true }).click();
+			await page.locator("#code").fill("123456");
+			await page.getByRole("button", { name: "Verify", exact: true }).click();
+			if (consentRequired) await page.getByRole("button", { name: "Agree & Continue", exact: true }).click();
+			await page.waitForURL(flow.launchUrl);
+			const cookie = (await context.cookies(`${flow.origin}/face-setup/email`)).find(cookie => cookie.name === FACE_SETUP_COOKIE)!;
+			expect((await deps.interactions.find(cookie.value))?.phase).toBe("ENROLLING");
+			for (let repeat = 0; repeat < 2; repeat++) {
+				await page.goto(`${flow.origin}/fixture/stale-otp`);
+				await page.locator("#code").fill("123456");
+				await page.getByRole("button", { name: "Verify", exact: true }).click();
+				await page.waitForURL(flow.launchUrl);
+			}
+			expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
+			expect(deps.interactive.consumeResult).toHaveBeenCalledTimes(1);
+			expect(deps.service.start).toHaveBeenCalledTimes(1);
+			expect(deps.service.acceptConsent).toHaveBeenCalledTimes(consentRequired ? 1 : 0);
+			expect(flow.errors).toEqual([]);
+		} finally { await flow.close(); }
+	});
+
+	it.each(["email", "consent"])("cancels from the %s form without a blocked return or enrollment mutation", async phase => {
+		const flow = await ceremony(true);
+		try {
+			await flow.page.goto(`${flow.origin}/face-setup/start?client_id=${CLIENT_ID}&return_uri=${encodeURIComponent(flow.returnUri)}`);
+			if (phase === "consent") {
+				await flow.page.locator("#email").fill("local@example.test");
+				await flow.page.getByRole("button", { name: "Continue", exact: true }).click();
+				await flow.page.locator("#code").fill("123456");
+				await flow.page.getByRole("button", { name: "Verify", exact: true }).click();
+			}
+			await flow.page.getByRole("button", { name: "Not Now", exact: true }).click();
+			await flow.page.waitForURL(`${flow.returnUri}?face_setup=cancelled`);
+			expect(flow.deps.service.acceptConsent).not.toHaveBeenCalled();
+			expect(flow.deps.service.start).not.toHaveBeenCalled();
+			expect((await flow.context.cookies(`${flow.origin}/face-setup/email`)).some(cookie => cookie.name === FACE_SETUP_COOKIE)).toBe(false);
+			expect(flow.errors).toEqual([]);
+		} finally { await flow.close(); }
 	});
 });
 

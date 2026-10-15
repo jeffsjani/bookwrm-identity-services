@@ -36,6 +36,17 @@ export function faceSetupMessagePage(input: { title: string; message: string }):
 	return page(nonce, input.title, `<h1>${escapeHtml(input.title)}</h1><p>${escapeHtml(input.message)}</p>`);
 }
 
+export function faceSetupNavigationPage(destination: string): RenderedFaceSetupPage {
+	const nonce = randomBytes(16).toString("base64");
+	const rendered = page(nonce, "Continue Face setup", `<h1>Continue Face setup</h1>
+<p>Continuing Face Login setup. If you are not redirected, <a href="${escapeHtml(destination)}">continue here</a>.</p>`);
+	// End the form navigation before a separate document navigation can leave this origin.
+	return {
+		...rendered,
+		html: rendered.html.replace("<head>", `<head><meta http-equiv="refresh" content="0;url=${escapeHtml(destination)}">`)
+	};
+}
+
 export function faceSetupProcessingPage(refreshUrl: string): RenderedFaceSetupPage {
 	const nonce = randomBytes(16).toString("base64");
 	const rendered = page(nonce, "Finishing Face setup",

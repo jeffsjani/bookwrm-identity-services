@@ -16,7 +16,7 @@ import {
 } from "../authenticators/FaceSetupTypes.js";
 import { logFaceSetup, type FaceSetupReason } from "../authenticators/FaceSetupDiagnostics.js";
 import {
-	faceSetupCodePage, faceSetupConsentPage, faceSetupEmailPage, faceSetupMessagePage, faceSetupProcessingPage
+	faceSetupCodePage, faceSetupConsentPage, faceSetupEmailPage, faceSetupMessagePage, faceSetupNavigationPage, faceSetupProcessingPage
 } from "../authenticators/FaceSetupPages.js";
 
 export type FaceSetupDependencies = {
@@ -91,9 +91,12 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 			logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_FAILED", 409, interaction, "INTERACTION_SAVE_FAILED");
 			return sendPage(reply, 409, continuationFailedPage());
 		}
-		logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_CONSUMED", 302, interaction);
+		const formNavigation = reply.request.method === "POST" || reply.request.routeOptions.url === "/face-setup/cancel";
+		logFaceSetup(reply.request, "FACE_SETUP_INTERACTION_CONSUMED", formNavigation ? 200 : 302, interaction);
 		reply.header("Set-Cookie", cookieHeader(null));
-		return reply.code(302).header("Location", buildOutcomeRedirect(interaction.returnUri, outcome)).send();
+		const destination = buildOutcomeRedirect(interaction.returnUri, outcome);
+		return formNavigation ? sendPage(reply, 200, faceSetupNavigationPage(destination))
+			: reply.code(302).header("Location", destination).send();
 	};
 
 	const load = async (request: FastifyRequest, reply: FastifyReply): Promise<{ handle: string; interaction: FaceSetupInteraction } | null> => {
@@ -181,9 +184,9 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 			return reject(reply, interaction, "PHASE_INVALID");
 		}
 		if (!await consentAuthorityValid(reply, interaction)) return undefined;
-		logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, interaction);
-		return reply.code(303).header("Cache-Control", "no-store")
-			.header("Location", interaction.phase === "CONSENT" ? "/face-setup/consent" : "/face-setup/continue").send();
+		logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 200, interaction);
+		return sendPage(reply, 200, faceSetupNavigationPage(
+			interaction.phase === "CONSENT" ? "/face-setup/consent" : "/face-setup/continue"));
 	};
 
 	const repeatEmail = async (request: FastifyRequest, reply: FastifyReply, handle: string) => {
@@ -206,8 +209,8 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		if (!authority) return reject(reply, interaction, "AUTHORITY_INVALID", 403);
 		const duplicate = (current: FaceSetupInteraction) => {
 			if (current.phase !== "STARTING" && current.phase !== "ENROLLING") return reject(reply, current, "PHASE_INVALID");
-			logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 303, current);
-			return reply.code(303).header("Cache-Control", "no-store").header("Location", "/face-setup/continue").send();
+			logFaceSetup(request, "FACE_SETUP_DUPLICATE_SUBMISSION", 200, current);
+			return sendPage(reply, 200, faceSetupNavigationPage("/face-setup/continue"));
 		};
 		if (interaction.phase !== "CONSENT") return duplicate(interaction);
 		if (!await interactions.claimConsent(handle, interaction, decision)) {
@@ -235,11 +238,11 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 			interaction.enrollment = { enrollmentId: started.enrollmentId, expiresAt: started.expiresAt, launchUrl: started.launchUrl };
 			interaction.phase = "ENROLLING";
 			if (!await persist(reply, handle, interaction)) return undefined;
-			logFaceSetup(request, "FACE_SETUP_ENROLLMENT_STARTED", 302, interaction);
-			return reply.code(302).header("Location", started.launchUrl).send();
+			logFaceSetup(request, "FACE_SETUP_ENROLLMENT_STARTED", 200, interaction);
+			return sendPage(reply, 200, faceSetupNavigationPage("/face-setup/continue"));
 		} catch (error) {
 			if (error instanceof FaceEnrollmentError) {
-				logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 302, interaction, "ENROLLMENT_FAILED");
+				logFaceSetup(request, "FACE_SETUP_INTERACTION_FAILED", 200, interaction, "ENROLLMENT_FAILED");
 				return finish(reply, handle, interaction, "failed");
 			}
 			throw error;
