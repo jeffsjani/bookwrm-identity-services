@@ -22,11 +22,15 @@ export class PrivateIDClient {
 			return this.createSession(correlationId);
 		}
 
-		async createEnrollmentSession(providerTransactionId: string, signal?: AbortSignal): Promise<PrivateIDSession> {
-			return this.createSession(undefined, providerTransactionId, signal);
+		// `redirectPath` re-targets only the browser return to another path on the configured
+		// PRIVATEID_REDIRECT_URL origin (H5.4 Face Setup); the webhook callback is never affected.
+		async createEnrollmentSession(providerTransactionId: string, signal?: AbortSignal,
+			options?: { redirectPath?: string }): Promise<PrivateIDSession> {
+			return this.createSession(undefined, providerTransactionId, signal, options?.redirectPath);
 		}
 
-		private async createSession(correlationId?: string, providedTransactionId?: string, signal?: AbortSignal): Promise<PrivateIDSession> {
+		private async createSession(correlationId?: string, providedTransactionId?: string, signal?: AbortSignal,
+			redirectPath?: string): Promise<PrivateIDSession> {
 				const now = Date.now();
 				const transactionId = providedTransactionId ?? randomUUID();
 				const authBaseUrl = configuration.require("PRIVATEID_AUTH_BASE_URL");
@@ -58,7 +62,7 @@ export class PrivateIDClient {
 
 				const normalizedAuthBaseUrl = authBaseUrl.endsWith("/") ? authBaseUrl.slice(0, -1) : authBaseUrl;
 				const endpoint = `${normalizedAuthBaseUrl}/v2/verification-session`;
-				const redirectUrl = this.resolveRedirectUrl();
+				const redirectUrl = this.resolveRedirectUrl(redirectPath);
 				const callbackUrl = this.resolveCallbackUrl();
 				const callbackHeaders = this.resolveCallbackHeaders();
 				// Release Patch 7.0: Send transactionID to PrivateID API (preferred contract field).
@@ -323,13 +327,15 @@ export class PrivateIDClient {
 				};
 		}
 
-		private resolveRedirectUrl(): string {
+		private resolveRedirectUrl(redirectPath?: string): string {
 				const redirectUrl = configuration.get("PRIVATEID_REDIRECT_URL")?.trim();
 				if (!redirectUrl) {
 						throw new Error("Missing required configuration: PRIVATEID_REDIRECT_URL");
 				}
-
-				return redirectUrl;
+				if (redirectPath === undefined) return redirectUrl;
+				if (!/^\/[a-z0-9/-]+$/.test(redirectPath)) throw new Error("Invalid PrivateID redirect path");
+				const base = new URL(redirectUrl);
+				return new URL(redirectPath, base.origin).toString();
 		}
 
 		private resolveCallbackUrl(): string {

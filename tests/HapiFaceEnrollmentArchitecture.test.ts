@@ -34,6 +34,12 @@ describe("H5 architecture isolation", () => {
 		}
 		const composition = readFileSync(resolve("src/authenticators/FaceEnrollmentComposition.ts"), "utf8");
 		expect(composition).toContain("provider.createEnrollmentSession");
+		// H5.4D-2: only the Face Setup return target is re-pointed, to the dedicated Face Setup callback.
+		expect(composition).toContain('options?.returnTo === "face-setup" ? { redirectPath: FACE_SETUP_CALLBACK_PATH } : undefined');
+		expect(readFileSync(resolve("src/authenticators/FaceSetupTypes.ts"), "utf8"))
+			.toContain('export const FACE_SETUP_CALLBACK_PATH = "/face-setup/callback";');
+		expect(readFileSync(resolve("src/routes/hapiFaceEnrollment.ts"), "utf8")).toContain("service.start(token);");
+		expect(readFileSync(resolve("src/routes/faceSetup.ts"), "utf8")).toContain('service.start(authority, { returnTo: "face-setup" })');
 		expect(composition).toContain('env.HAPI_FACE_ENROLLMENT_ENABLED === "true"');
 	});
 });

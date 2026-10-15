@@ -452,4 +452,42 @@ describe("PrivateID callback", () => {
 			configuration.reload();
 		}
 	});
+	it("H5.4D-2: only an explicit Face Setup enrollment returns to /face-setup/callback; all others keep PRIVATEID_REDIRECT_URL", async () => {
+		const originalFetch = global.fetch;
+		const originalMockMode = process.env.PRIVATEID_MOCK_MODE;
+		const originalRedirect = process.env.PRIVATEID_REDIRECT_URL;
+		const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+			sessionId: `api-session-${randomUUID()}`, status: "created", launchUrl: "https://privateid.example.com/launch/abc123",
+			expires: Date.now() + 300000, created: Date.now()
+		}), { status: 200, headers: { "content-type": "application/json" } }));
+		global.fetch = fetchMock as typeof fetch;
+		process.env.PRIVATEID_MOCK_MODE = "false";
+		process.env.PRIVATEID_REDIRECT_URL = "https://identity.bookwrm.com/privateid/callback";
+		const { configuration } = await import("../src/config/ConfigurationService.js");
+		try {
+			configuration.reload();
+			const client = new PrivateIDClient();
+			const bodies = () => fetchMock.mock.calls.map(call => JSON.parse(String((call as unknown[])[1] && ((call as unknown[])[1] as RequestInit).body)));
+			await client.createAuthenticationSession();
+			await client.createEnrollmentSession(randomUUID());
+			await client.createEnrollmentSession(randomUUID(), undefined, { redirectPath: "/face-setup/callback" });
+			const sent = bodies();
+			expect(sent.map(body => body.redirectURL)).toEqual([
+				"https://identity.bookwrm.com/privateid/callback",
+				"https://identity.bookwrm.com/privateid/callback",
+				"https://identity.bookwrm.com/face-setup/callback"
+			]);
+			// The server-to-server webhook is never re-targeted by the browser return path.
+			expect(new Set(sent.map(body => body.callback.url))).toEqual(new Set(["https://identity.bookwrm.com/privateid/webhook"]));
+			await expect(client.createEnrollmentSession(randomUUID(), undefined, { redirectPath: "//evil.example/x" })).rejects.toThrow();
+			await expect(client.createEnrollmentSession(randomUUID(), undefined, { redirectPath: "https://evil.example/x" })).rejects.toThrow();
+			expect(fetchMock).toHaveBeenCalledTimes(3);
+		} finally {
+			global.fetch = originalFetch;
+			process.env.PRIVATEID_MOCK_MODE = originalMockMode;
+			if (originalRedirect === undefined) delete process.env.PRIVATEID_REDIRECT_URL;
+			else process.env.PRIVATEID_REDIRECT_URL = originalRedirect;
+			configuration.reload();
+		}
+	});
 });

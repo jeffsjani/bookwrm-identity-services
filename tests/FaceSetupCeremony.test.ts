@@ -11,7 +11,7 @@ import formbody from "@fastify/formbody";
 import RedisMock from "ioredis-mock";
 import { JSDOM } from "jsdom";
 import { chromium, type Browser } from "playwright";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { registerFaceSetupRoutes, type FaceSetupDependencies } from "../src/routes/faceSetup.js";
 import { FaceSetupInteractionStore } from "../src/authenticators/FaceSetupInteractionStore.js";
 import { FACE_SETUP_COOKIE, FaceSetupError } from "../src/authenticators/FaceSetupTypes.js";
@@ -930,6 +930,275 @@ describe("H5.4 Face Setup reauthorization ceremony", () => {
 	});
 });
 
+describe("H5.4D-2 dedicated Face Setup callback", () => {
+	let app: FastifyInstance;
+	let deps: FaceSetupDependencies;
+
+	beforeEach(async () => {
+		({ app, deps } = buildApp());
+		await register(app, deps);
+	});
+	afterEach(async () => {
+		vi.useRealTimers();
+		await app.close();
+	});
+
+	async function enroll() {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		await app.inject({ method: "POST", url: "/face-setup/consent", headers: { cookie }, payload: { csrf, decision: "agree" } });
+		expect((await deps.interactions.find(cookie.split("=")[1]))?.phase).toBe("ENROLLING");
+		return cookie;
+	}
+	const capability = (enrollmentState: "ACTIVE" | "NOT_ENROLLED" | "FAILED", faceLoginEligible = enrollmentState === "ACTIVE") => ({
+		faceEnrollmentEligible: true, faceLoginEligible, consentRequired: false, enrollmentState,
+		consentVersion: FACE_AUTH_CONSENT_VERSION, consentPurpose: FACE_AUTH_CONSENT_PURPOSE, consentText: FACE_AUTH_CONSENT_TEXT
+	} as const);
+	const callback = (cookie?: string, query = "") =>
+		app.inject({ method: "GET", url: `/face-setup/callback${query}`, headers: cookie ? { cookie } : {} });
+
+	it("starts the Face Setup provider session with the dedicated Face Setup return target only", async () => {
+		await enroll();
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(deps.service.start).mock.calls[0][1]).toEqual({ returnTo: "face-setup" });
+	});
+
+	it("success: resolves from durable enrollment + authenticator state and ignores provider query parameters", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 200, body: { status: "COMPLETED" } });
+		const response = await callback(cookie, "?reason=failed&status=FAILED&sub=attacker&puid=x");
+		expect(response.statusCode).toBe(302);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=success`);
+		expect(vi.mocked(deps.service.status).mock.calls[0][0]).toBe("enrollment-1");
+		expect(vi.mocked(deps.service.status).mock.calls[0][1].sub).toBe(SUBJECT);
+		expect(String(response.headers["set-cookie"])).toContain("Max-Age=0");
+		expect(response.body).not.toContain("Unable to resume enrollment");
+	});
+
+	it("success claimed by the browser is not trusted while the durable enrollment is still pending", async () => {
+		const cookie = await enroll();
+		const response = await callback(cookie, "?reason=success&status=COMPLETED");
+		expect(response.statusCode).toBe(200);
+		expect(response.body).toContain("Finishing Face setup");
+		expect(response.headers.location).toBeUndefined();
+	});
+
+	it.each(["CONFLICT", "FAILED"])("%s: preserves identity and returns a safe failed outcome without consulting authenticator state", async status => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.capabilityStatus).mockClear();
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 200, body: { status } });
+		const response = await callback(cookie);
+		expect(response.statusCode).toBe(302);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=failed`);
+		expect(deps.service.capabilityStatus).not.toHaveBeenCalled();
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+	});
+
+	it("cancelled/abandoned provider ceremony (expired enrollment, no authenticator) returns a safe failed outcome", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 410, body: { status: "EXPIRED" } });
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValueOnce(capability("NOT_ENROLLED"));
+		const response = await callback(cookie, "?reason=cancelled");
+		expect(response.statusCode).toBe(302);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=failed`);
+	});
+
+	it("late return after the enrollment window resolves success from the finalized authenticator", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 410, body: { status: "EXPIRED" } });
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValueOnce(capability("ACTIVE"));
+		const response = await callback(cookie);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=success`);
+	});
+
+	it("an unresolvable enrollment (not found / not authorized) fails safe without becoming success", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockRejectedValueOnce(new FaceEnrollmentError("ENROLLMENT_NOT_FOUND", 404));
+		vi.mocked(deps.service.capabilityStatus).mockResolvedValueOnce(capability("FAILED"));
+		const response = await callback(cookie);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=failed`);
+	});
+
+	it("a legitimate return after the 5-minute email freshness window still resolves while the interaction lives", async () => {
+		const cookie = await enroll();
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(Date.now() + 6 * 60_000);
+		// Launching enrollment still requires fresh email authority.
+		expect((await app.inject({ method: "GET", url: "/face-setup/continue", headers: { cookie } })).statusCode).toBe(403);
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 200, body: { status: "COMPLETED" } });
+		const response = await callback(cookie);
+		expect(response.headers.location).toBe(`${RETURN_URI}?face_setup=success`);
+		const statusAuthority = vi.mocked(deps.service.status).mock.calls.at(-1)![1];
+		expect(statusAuthority.sub).toBe(SUBJECT);
+		expect(statusAuthority.clientId).toBe(CLIENT_ID);
+		expect(statusAuthority.expiresAt).toBeGreaterThan(Date.now());
+		expect(statusAuthority.expiresAt).toBeLessThanOrEqual(Date.now() + 4 * 60_000);
+	});
+
+	it("still rejects a callback whose subject is no longer eligible (subject binding is not weakened)", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.identitySubjects.findByOidcSubject).mockResolvedValue(identitySubjectFixture({ status: "SUSPENDED" as IdentitySubject["status"] }));
+		vi.mocked(deps.service.status).mockClear();
+		const response = await callback(cookie);
+		expect(response.statusCode).toBe(403);
+		expect(deps.service.status).not.toHaveBeenCalled();
+	});
+
+	it("duplicate callback after resolution cannot re-resolve or create anything", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockResolvedValueOnce({ statusCode: 200, body: { status: "COMPLETED" } });
+		expect((await callback(cookie)).headers.location).toBe(`${RETURN_URI}?face_setup=success`);
+		const calls = vi.mocked(deps.service.status).mock.calls.length;
+		const duplicate = await callback(cookie);
+		expect(duplicate.statusCode).toBe(400);
+		expect(duplicate.body).toContain("We couldn&#39;t continue Face Login setup.");
+		expect(vi.mocked(deps.service.status).mock.calls.length).toBe(calls);
+		expect(deps.service.start).toHaveBeenCalledTimes(1);
+	});
+
+	it("stale callback (interaction expired or cookie absent) shows a safe page and makes no enrollment call", async () => {
+		const cookie = await enroll();
+		vi.mocked(deps.service.status).mockClear();
+		const missing = await callback();
+		expect(missing.statusCode).toBe(400);
+		expect(missing.body).not.toContain("Unable to resume enrollment");
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime(Date.now() + 11 * 60_000);
+		const stale = await callback(cookie);
+		expect(stale.statusCode).toBe(400);
+		// Redis evicts at TTL, so the record is either reported expired or already gone -- both are safe.
+		expect(stale.body).toMatch(/This sign-in request has expired|We couldn&#39;t continue Face Login setup\./);
+		expect(stale.body).not.toContain("Unable to resume enrollment");
+		expect(deps.service.status).not.toHaveBeenCalled();
+	});
+});
+
+describe("H5.4D-2 Face Setup OTP presentation and resend", () => {
+	let app: FastifyInstance;
+	let deps: FaceSetupDependencies;
+
+	beforeEach(async () => {
+		({ app, deps } = buildApp());
+		await register(app, deps);
+	});
+	afterEach(async () => { await app.close(); });
+
+	async function reachCode() {
+		const cookie = await startCeremony(app);
+		const page = await app.inject({ method: "GET", url: "/face-setup/email", headers: { cookie } });
+		const csrf = csrfFromHtml(page.body);
+		const code = await app.inject({ method: "POST", url: "/face-setup/email", headers: { cookie }, payload: { csrf, email: "identity@hapiinc.com" } });
+		return { cookie, csrf, code, handle: cookie.split("=")[1] };
+	}
+	const styleOf = (html: string) => new JSDOM(html).window.document.querySelector("style")?.textContent;
+
+	it("uses the Universal Login OTP presentation with Face context, masked email and six-digit entry", async () => {
+		const { code } = await reachCode();
+		expect(code.statusCode).toBe(200);
+		const document = new JSDOM(code.body).window.document;
+		expect(document.querySelector(".progress")?.textContent).toBe("STEP 2 OF 2");
+		expect(document.querySelector("h1")?.textContent).toBe("Check your inbox");
+		expect(document.body.textContent).toContain("Continue setting up Face Login.");
+		expect(document.body.textContent).toContain("Enter the 6-digit code we sent to");
+		expect(document.querySelector(".email-hint")?.textContent).toBe("i***@hapiinc.com");
+		expect(code.body).not.toContain("identity@hapiinc.com");
+		const input = document.querySelector<HTMLInputElement>("input#code.otp-code")!;
+		expect(input.getAttribute("inputmode")).toBe("numeric");
+		expect(input.getAttribute("autocomplete")).toBe("one-time-code");
+		expect(input.getAttribute("pattern")).toBe("[0-9]{6,9}");
+		expect(input.getAttribute("aria-label")).toBe("Six-digit verification code");
+		expect(document.querySelector("#otp-submit")?.textContent).toBe("Verify & Continue");
+		expect(document.body.textContent).toContain("Didn't get it?");
+		expect(document.querySelector("#resend-form")?.getAttribute("action")).toBe("/face-setup/email/resend");
+		expect(document.querySelector("#resend-submit")?.textContent).toBe("Resend code");
+		expect(document.querySelector("#otp-status")?.getAttribute("aria-live")).toBe("polite");
+		expect(document.querySelector("footer")?.textContent).toBe("Secure identity powered by HAPI ID");
+		const csp = String(code.headers["content-security-policy"]);
+		expect(csp).toMatch(/script-src 'nonce-[^']+'/);
+		expect(csp).toContain("form-action 'self'");
+		expect(csp).not.toContain("unsafe-inline");
+		expect(document.querySelector("script")?.getAttribute("nonce")).toBeTruthy();
+	});
+
+	it("shares the identical Universal Login visual system (styles, branding, OTP control) for the Bookwrm client", () => {
+		const clientId = "bookwrm-base44-production";
+		const face = faceSetupCodePage({ csrf: "fixture", clientId, emailHint: "i***@hapiinc.com" });
+		const login = codePage({ csrf: "fixture", clientId });
+		expect(styleOf(face.html)).toBe(styleOf(login.html));
+		const faceDocument = new JSDOM(face.html).window.document;
+		const loginDocument = new JSDOM(login.html).window.document;
+		expect(faceDocument.querySelector("main")?.className).toBe(loginDocument.querySelector("main")?.className);
+		expect(faceDocument.querySelector("main > :first-child")?.outerHTML).toBe(loginDocument.querySelector("main > :first-child")?.outerHTML);
+		expect(faceDocument.querySelector("input.otp-code")?.outerHTML).toBe(loginDocument.querySelector("input.otp-code")?.outerHTML);
+		expect(faceDocument.querySelector("#otp-submit")?.textContent).toBe(loginDocument.querySelector("#otp-submit")?.textContent);
+		expect(faceDocument.querySelector("footer")?.textContent).toBe("Secure identity powered by HAPI ID");
+		expect(faceDocument.querySelector("#otp-form")?.getAttribute("action")).toBe("/face-setup/email/code");
+	});
+
+	it("resend reuses the same H4 challenge inside the same ceremony without resetting it or starting enrollment", async () => {
+		const { cookie, csrf, handle } = await reachCode();
+		const before = (await deps.interactions.find(handle))!;
+		const response = await app.inject({ method: "POST", url: "/face-setup/email/resend", headers: { cookie }, payload: { csrf } });
+		expect(response.statusCode).toBe(200);
+		expect(response.body).toContain("We sent a new code. Earlier codes no longer work.");
+		expect(deps.interactive.resend).toHaveBeenCalledWith(expect.anything(), "challenge-1", "AUTHENTICATION");
+		const after = (await deps.interactions.find(handle))!;
+		expect(after.phase).toBe("EMAIL");
+		expect(after.email).toEqual(before.email);
+		expect(after.expiresAt).toBe(before.expiresAt);
+		expect(after.csrf).toBe(before.csrf);
+		expect(deps.interactive.start).toHaveBeenCalledTimes(1);
+		expect(deps.service.start).not.toHaveBeenCalled();
+		const verified = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		expect(verified.statusCode).toBe(200);
+		expect(deps.interactive.verify).toHaveBeenCalledWith(expect.anything(), "challenge-1", "123456", "AUTHENTICATION");
+	});
+
+	it("resend cooldown is enforced by H4 and surfaced without losing the ceremony", async () => {
+		const { cookie, csrf, handle } = await reachCode();
+		vi.mocked(deps.interactive.resend).mockRejectedValueOnce(new VerificationError("RESEND_TOO_SOON", 429));
+		const response = await app.inject({ method: "POST", url: "/face-setup/email/resend", headers: { cookie }, payload: { csrf } });
+		expect(response.statusCode).toBe(429);
+		expect(response.body).toContain("Please wait before requesting another code.");
+		expect(response.body).toContain("Resend code");
+		expect((await deps.interactions.find(handle))?.phase).toBe("EMAIL");
+		expect((await deps.interactions.find(handle))?.emailOperation).toBeUndefined();
+		const verified = await app.inject({ method: "POST", url: "/face-setup/email/code", headers: { cookie }, payload: { csrf, code: "123456" } });
+		expect(verified.statusCode).toBe(200);
+	});
+
+	it("a non-throttle resend rejection is a safe 400 that never retries or restarts the challenge", async () => {
+		const { cookie, csrf } = await reachCode();
+		vi.mocked(deps.interactive.resend).mockRejectedValueOnce(new VerificationError("CHALLENGE_EXPIRED", 410));
+		const response = await app.inject({ method: "POST", url: "/face-setup/email/resend", headers: { cookie }, payload: { csrf } });
+		expect(response.statusCode).toBe(400);
+		expect(response.body).toContain("A new code can&#39;t be sent for this request.");
+		expect(deps.interactive.start).toHaveBeenCalledTimes(1);
+	});
+
+	it("repeated resend is safe: same challenge, no identity or enrollment side effects, CSRF still required", async () => {
+		const { cookie, csrf, handle } = await reachCode();
+		const before = (await deps.interactions.find(handle))!;
+		for (let index = 0; index < 3; index++) {
+			const response = await app.inject({ method: "POST", url: "/face-setup/email/resend", headers: { cookie }, payload: { csrf } });
+			expect(response.statusCode).toBe(200);
+		}
+		const forged = await app.inject({ method: "POST", url: "/face-setup/email/resend", headers: { cookie }, payload: { csrf: "forged" } });
+		expect(forged.statusCode).toBe(400);
+		expect(deps.interactive.resend).toHaveBeenCalledTimes(3);
+		expect(vi.mocked(deps.interactive.resend).mock.calls.every(call => call[1] === "challenge-1")).toBe(true);
+		expect(deps.interactive.start).toHaveBeenCalledTimes(1);
+		expect(deps.service.start).not.toHaveBeenCalled();
+		expect(deps.service.acceptConsent).not.toHaveBeenCalled();
+		const after = (await deps.interactions.find(handle))!;
+		expect(after.expiresAt).toBe(before.expiresAt);
+		expect(after.email).toEqual(before.email);
+	});
+});
+
 describe("H5.4 real Chromium form/CSP navigation contract", () => {
 	let browser: Browser;
 	let destination: Server;
@@ -979,13 +1248,13 @@ describe("H5.4 real Chromium form/CSP navigation contract", () => {
 			});
 			await page.goto(`${origin}/face-setup/email/code`);
 			expect(await page.evaluate(() => location.origin)).toBe(origin);
-			expect(await page.locator("form").getAttribute("action")).toBe("/face-setup/email/code");
-			expect(await page.locator("form").evaluate(form => (form as HTMLFormElement).action)).toBe(`${origin}/face-setup/email/code`);
+			expect(await page.locator("#otp-form").getAttribute("action")).toBe("/face-setup/email/code");
+			expect(await page.locator("#otp-form").evaluate(form => (form as HTMLFormElement).action)).toBe(`${origin}/face-setup/email/code`);
 			expect(await page.locator('meta[http-equiv="Content-Security-Policy"]').count()).toBe(0);
 			await page.locator("#code").fill("123456");
 			const violation = page.waitForEvent("console", { predicate: message =>
 				message.type() === "error" && message.text().includes("form-action 'self'") });
-			await page.getByRole("button", { name: "Verify", exact: true }).click();
+			await page.getByRole("button", { name: "Verify & Continue", exact: true }).click();
 			expect((await violation).text()).toContain(`Sending form data to '${origin}/face-setup/email/code'`);
 			expect(requests).toEqual([`GET ${origin}`, `POST ${origin}`]);
 			expect(page.url()).toBe(`${origin}/face-setup/email/code`);
@@ -1087,7 +1356,7 @@ describe("H5.4 real Chromium form/CSP navigation contract", () => {
 			await page.locator("#email").fill("local@example.test");
 			await page.getByRole("button", { name: "Continue", exact: true }).click();
 			await page.locator("#code").fill("123456");
-			await page.getByRole("button", { name: "Verify", exact: true }).click();
+			await page.getByRole("button", { name: "Verify & Continue", exact: true }).click();
 			if (consentRequired) await page.getByRole("button", { name: "Agree & Continue", exact: true }).click();
 			await page.waitForURL(flow.launchUrl);
 			const cookie = (await context.cookies(`${flow.origin}/face-setup/email`)).find(cookie => cookie.name === FACE_SETUP_COOKIE)!;
@@ -1095,7 +1364,7 @@ describe("H5.4 real Chromium form/CSP navigation contract", () => {
 			for (let repeat = 0; repeat < 2; repeat++) {
 				await page.goto(`${flow.origin}/fixture/stale-otp`);
 				await page.locator("#code").fill("123456");
-				await page.getByRole("button", { name: "Verify", exact: true }).click();
+				await page.getByRole("button", { name: "Verify & Continue", exact: true }).click();
 				await page.waitForURL(flow.launchUrl);
 			}
 			expect(deps.interactive.verify).toHaveBeenCalledTimes(1);
@@ -1114,7 +1383,7 @@ describe("H5.4 real Chromium form/CSP navigation contract", () => {
 				await flow.page.locator("#email").fill("local@example.test");
 				await flow.page.getByRole("button", { name: "Continue", exact: true }).click();
 				await flow.page.locator("#code").fill("123456");
-				await flow.page.getByRole("button", { name: "Verify", exact: true }).click();
+				await flow.page.getByRole("button", { name: "Verify & Continue", exact: true }).click();
 			}
 			await flow.page.getByRole("button", { name: "Not Now", exact: true }).click();
 			await flow.page.waitForURL(`${flow.returnUri}?face_setup=cancelled`);

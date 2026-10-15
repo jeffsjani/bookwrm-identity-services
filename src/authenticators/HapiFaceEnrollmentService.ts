@@ -5,9 +5,14 @@ import {
 	type FaceEnrollmentAuthority, type FaceEnrollmentCallbacks, type FaceEnrollmentRepository
 } from "./FaceEnrollmentTypes.js";
 
+// Where the provider returns the browser after enrollment. Only the H5.4 full-page Face Setup ceremony
+// opts in to its own callback; the /v1 popup flow keeps the shared PRIVATEID_REDIRECT_URL.
+export type FaceEnrollmentReturnTarget = "face-setup";
+export type FaceEnrollmentSessionOptions = { returnTo?: FaceEnrollmentReturnTarget };
+
 export class HapiFaceEnrollmentService implements FaceEnrollmentCallbacks {
 	constructor(private readonly repository: FaceEnrollmentRepository,
-		private readonly createSession: (transactionId: string) => Promise<PrivateIDSession>,
+		private readonly createSession: (transactionId: string, options?: FaceEnrollmentSessionOptions) => Promise<PrivateIDSession>,
 		private readonly enabled = true) {}
 
 	async acceptConsent(authority: FaceEnrollmentAuthority, consentVersion: string, purpose: string): Promise<void> {
@@ -23,14 +28,14 @@ export class HapiFaceEnrollmentService implements FaceEnrollmentCallbacks {
 		return this.repository.capabilityStatus(authority, this.enabled);
 	}
 
-	async start(authority: FaceEnrollmentAuthority) {
+	async start(authority: FaceEnrollmentAuthority, options?: FaceEnrollmentSessionOptions) {
 		if (!this.enabled) throw new FaceEnrollmentError("FACE_ENROLLMENT_DISABLED", 404);
 		requireRecentEmailAuthority(authority);
 		const reservation = await this.repository.reserve(authority);
 		if (reservation.alreadyEnrolled) return { enrolled: true, alreadyEnrolled: true };
 		let session: PrivateIDSession;
 		try {
-			session = await this.createSession(reservation.providerTransactionId);
+			session = await this.createSession(reservation.providerTransactionId, options);
 		} catch {
 			await this.repository.fail(reservation.providerTransactionId);
 			// Provider exceptions can include raw response bodies; never expose them in route logs.

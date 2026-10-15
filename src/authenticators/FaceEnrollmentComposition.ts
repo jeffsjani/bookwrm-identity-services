@@ -7,6 +7,7 @@ import { markHapiFaceEnrollmentSession } from "../privateid/PrivateIDSessionStor
 import { registerHapiFaceEnrollmentRoutes } from "../routes/hapiFaceEnrollment.js";
 import { PostgresFaceEnrollmentRepository } from "./PostgresFaceEnrollmentRepository.js";
 import { HapiFaceEnrollmentService } from "./HapiFaceEnrollmentService.js";
+import { FACE_SETUP_CALLBACK_PATH } from "./FaceSetupTypes.js";
 
 // H5.4: the richer HapiFaceEnrollmentService (not just the webhook/callback FaceEnrollmentCallbacks pick)
 // is returned so the Face Setup ceremony can call capabilityStatus/acceptConsent/start/status directly,
@@ -26,8 +27,9 @@ export async function configureFaceEnrollment(app: FastifyInstance, env = proces
 	const repository = new PostgresFaceEnrollmentRepository(getPostgresPool() as pg.Pool);
 	await repository.ensureSchema();
 	const provider = new PrivateIDClient();
-	const service = new HapiFaceEnrollmentService(repository, async transactionId => {
-		const session = await provider.createEnrollmentSession(transactionId, AbortSignal.timeout(10_000));
+	const service = new HapiFaceEnrollmentService(repository, async (transactionId, options) => {
+		const session = await provider.createEnrollmentSession(transactionId, AbortSignal.timeout(10_000),
+			options?.returnTo === "face-setup" ? { redirectPath: FACE_SETUP_CALLBACK_PATH } : undefined);
 		markHapiFaceEnrollmentSession(session.sessionId);
 		return session;
 	}, enabled);

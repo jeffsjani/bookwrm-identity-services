@@ -56,8 +56,13 @@ describe("H5 recent HAPI authority and provider orchestration", () => {
 		const result = await service.start(authority());
 		expect(Object.keys(result).sort()).toEqual(["enrolled", "enrollmentId", "expiresAt", "launchUrl"]);
 		expect(result.enrollmentId).toBe(reservation.providerTransactionId);
-		expect(createSession).toHaveBeenCalledWith(reservation.providerTransactionId);
+		expect(createSession).toHaveBeenCalledWith(reservation.providerTransactionId, undefined);
 		expect(repository.bind).toHaveBeenCalledOnce();
+	});
+	it("H5.4D-2: forwards only the explicit Face Setup return target to the provider session", async () => {
+		const { service, createSession, reservation } = fixture();
+		await service.start(authority(), { returnTo: "face-setup" });
+		expect(createSession).toHaveBeenCalledWith(reservation.providerTransactionId, { returnTo: "face-setup" });
 	});
 	it("does not call the provider for an already active authenticator", async () => {
 		const { repository, createSession } = fixture();
@@ -176,7 +181,7 @@ describe("H5 application-neutral route", () => {
 		} finally { await app.close(); }
 	});
 	it("derives authority only from the server-side OIDC token record without product headers", async () => {
-		const { service, repository } = fixture();
+		const { service, repository, createSession } = fixture();
 		const token = { ...authority(), nonce: "nonce" };
 		const app = Fastify();
 		await registerHapiFaceEnrollmentRoutes(app, service, { getAccessTokenRecord: async () => token });
@@ -185,6 +190,8 @@ describe("H5 application-neutral route", () => {
 				headers: { authorization: "Bearer fixture" }, payload: {} });
 			expect(response.statusCode).toBe(200);
 			expect(repository.reserve).toHaveBeenCalledWith(token);
+			// The /v1 popup enrollment keeps the shared /privateid/callback browser return.
+			expect(createSession).toHaveBeenCalledWith(expect.any(String), undefined);
 		} finally { await app.close(); }
 	});
 	it("validates configuration, requires PostgreSQL, and defaults disabled", async () => {

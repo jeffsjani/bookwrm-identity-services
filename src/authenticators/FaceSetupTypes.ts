@@ -17,8 +17,9 @@ export class FaceSetupError extends Error {
 	}
 }
 
-// Deliberately excludes email, PUID, provider credentials and any bearer token -- only the minimal
-// server-side authority HapiFaceEnrollmentService already requires, scoped to this one browser ceremony.
+// Deliberately excludes the email address, PUID, provider credentials and any bearer token -- only the
+// minimal server-side authority HapiFaceEnrollmentService already requires, scoped to this one browser
+// ceremony. `email.hint` is a display-only masked form (e.g. "i***@example.com") for the OTP page.
 export type FaceSetupInteraction = {
 	version: 1;
 	purpose: typeof FACE_SETUP_PURPOSE;
@@ -29,10 +30,19 @@ export type FaceSetupInteraction = {
 	createdAt: number;
 	expiresAt: number;
 	emailOperation?: "START" | "VERIFY" | "RESEND";
-	email?: { challengeId: string };
+	email?: { challengeId: string; hint?: string };
 	authority?: FaceEnrollmentAuthority;
 	enrollment?: { enrollmentId: string; expiresAt: string; launchUrl: string };
 };
+
+// H5.4D-2: dedicated provider browser-return path for Face Setup (never the shared /privateid/callback).
+export const FACE_SETUP_CALLBACK_PATH = "/face-setup/callback";
+
+export function maskEmailHint(email: string): string {
+	const at = email.lastIndexOf("@");
+	if (at < 1) return "your email";
+	return `${email[0]}***${email.slice(at)}`;
+}
 
 export function buildOutcomeRedirect(returnUri: string, outcome: FaceSetupOutcome): string {
 	const url = new URL(returnUri);

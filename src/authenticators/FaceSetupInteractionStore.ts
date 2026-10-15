@@ -11,7 +11,7 @@ const interactionSchema = z.object({
 	phase: z.enum(["EMAIL", "CONSENT", "STARTING", "ENROLLING", "CANCELLED"]),
 	createdAt: z.number().finite(), expiresAt: z.number().finite(),
 	emailOperation: z.enum(["START", "VERIFY", "RESEND"]).optional(),
-	email: z.object({ challengeId: z.string().min(1) }).optional(),
+	email: z.object({ challengeId: z.string().min(1), hint: z.string().min(1).max(320).optional() }).optional(),
 	authority: z.object({
 		sub: z.string().min(1), clientId: z.string().min(1), authenticationMethod: z.literal("HAPI_EMAIL"),
 		authenticatedAt: z.string().datetime(), expiresAt: z.number().finite(), scope: z.string()
