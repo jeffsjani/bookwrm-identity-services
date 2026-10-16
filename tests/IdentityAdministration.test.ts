@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+import { configuration } from "../src/config/ConfigurationService.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityClaimResolver } from "../src/identity/IdentityClaimResolver.js";
 import { identityAdministrationService } from "../src/identity/IdentityAdministrationService.js";
@@ -69,6 +70,22 @@ describe("IdentityAdministrationService (Phase 4)", () => {
 });
 
 describe("Identity Administration API routes", () => {
+		const ADMIN_KEY = "identity-admin-test-service-key";
+		const authorization = `Bearer ${ADMIN_KEY}`;
+		let previousKey: string | undefined;
+
+		beforeAll(() => {
+				previousKey = process.env.HAPI_PLATFORM_SERVICE_KEY;
+				process.env.HAPI_PLATFORM_SERVICE_KEY = ADMIN_KEY;
+				configuration.reload();
+		});
+
+		afterAll(() => {
+				if (previousKey === undefined) delete process.env.HAPI_PLATFORM_SERVICE_KEY;
+				else process.env.HAPI_PLATFORM_SERVICE_KEY = previousKey;
+				configuration.reload();
+		});
+
 		async function buildApp() {
 				const app = Fastify();
 				await registerIdentityAdminRoutes(app);
@@ -80,7 +97,7 @@ describe("Identity Administration API routes", () => {
 				const subject = await createTestSubject(`route-${randomUUID()}@example.com`);
 				const app = await buildApp();
 
-				const response = await app.inject({ method: "GET", url: `/identity/admin/subject/${subject.oidcSubject}` });
+				const response = await app.inject({ method: "GET", headers: { authorization }, url: `/identity/admin/subject/${subject.oidcSubject}` });
 				expect(response.statusCode).toBe(200);
 
 				const payload = response.json() as Record<string, unknown>;
@@ -95,7 +112,7 @@ describe("Identity Administration API routes", () => {
 		it("GET /identity/admin/subject/:id returns 404 for an unknown subject", async () => {
 				const app = await buildApp();
 
-				const response = await app.inject({ method: "GET", url: "/identity/admin/subject/does-not-exist" });
+				const response = await app.inject({ method: "GET", headers: { authorization }, url: "/identity/admin/subject/does-not-exist" });
 				expect(response.statusCode).toBe(404);
 
 				await app.close();
@@ -107,6 +124,7 @@ describe("Identity Administration API routes", () => {
 
 				const response = await app.inject({
 						method: "GET",
+						headers: { authorization },
 						url: `/identity/admin/provider/${subject.primaryProvider}/${subject.primaryProviderSubject}`
 				});
 				expect(response.statusCode).toBe(200);
@@ -120,7 +138,7 @@ describe("Identity Administration API routes", () => {
 				const subject = await createTestSubject(email);
 				const app = await buildApp();
 
-				const response = await app.inject({ method: "GET", url: `/identity/admin/email/${encodeURIComponent(email)}` });
+				const response = await app.inject({ method: "GET", headers: { authorization }, url: `/identity/admin/email/${encodeURIComponent(email)}` });
 				expect(response.statusCode).toBe(200);
 				const payload = response.json() as { subjects: Array<{ subject: { oidcSubject: string } }> };
 				expect(payload.subjects.some((entry) => entry.subject.oidcSubject === subject.oidcSubject)).toBe(true);
@@ -133,7 +151,7 @@ describe("Identity Administration API routes", () => {
 				await identityClaimResolver.resolve(subject.oidcSubject, "PRIVATE_ID", { displayName: "Route Audited Name" });
 				const app = await buildApp();
 
-				const response = await app.inject({ method: "GET", url: `/identity/admin/subject/${subject.oidcSubject}/audit` });
+				const response = await app.inject({ method: "GET", headers: { authorization }, url: `/identity/admin/subject/${subject.oidcSubject}/audit` });
 				expect(response.statusCode).toBe(200);
 				const payload = response.json() as { audit: { claims: Array<{ claim: string; newValue: string }>; identity: Array<{ type: string }> } };
 				expect(payload.audit.claims.some((entry) => entry.claim === "displayName" && entry.newValue === "Route Audited Name")).toBe(true);
@@ -145,7 +163,7 @@ describe("Identity Administration API routes", () => {
 		it("GET /identity/admin/health reports component status", async () => {
 				const app = await buildApp();
 
-				const response = await app.inject({ method: "GET", url: "/identity/admin/health" });
+				const response = await app.inject({ method: "GET", headers: { authorization }, url: "/identity/admin/health" });
 				const payload = response.json() as Record<string, { status: string }>;
 
 				expect(payload).toHaveProperty("registry");

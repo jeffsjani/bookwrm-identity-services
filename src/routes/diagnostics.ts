@@ -16,6 +16,28 @@ import {
 		privateIdWebhookDiagnosticsRepository,
 		PrivateIdWebhookDiagnosticsConnectionError
 } from "../identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
+import { createServiceAuthenticationHook } from "../security/ServiceAuthentication.js";
+
+const previouslyUnauthenticatedDiagnosticRoutes = new Set([
+		"/diagnostics/identityapi",
+		"/diagnostics/base44",
+		"/diagnostics/context",
+		"/diagnostics/policies",
+		"/diagnostics/security",
+		"/diagnostics/devices",
+		"/diagnostics/notifications",
+		"/diagnostics/timeline",
+		"/diagnostics/reverify",
+		"/diagnostics/resolve",
+		"/diagnostics/privateid",
+		"/diagnostics/oidc/dashboard",
+		"/diagnostics/routes"
+]);
+
+const requireDiagnosticServiceKey = createServiceAuthenticationHook(
+		() => configuration.getHapiPlatformServiceKey(),
+		"Administrative service credential required"
+);
 
 type ResolveBody = {
 		privateIdUserId?: string;
@@ -199,6 +221,11 @@ async function buildPrivateIdDiagnostics(): Promise<PrivateIdDiagnosticsResponse
 export async function registerDiagnosticsRoutes(
 		app: FastifyInstance
 ){
+		app.addHook("onRequest", async (request, reply) => {
+				if (previouslyUnauthenticatedDiagnosticRoutes.has(request.routeOptions.url ?? "")) {
+						await requireDiagnosticServiceKey(request, reply);
+				}
+		});
 
 		app.get(
 

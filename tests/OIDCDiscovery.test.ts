@@ -22,6 +22,7 @@ describe("OIDCDiscovery", () => {
 				expect(payload.token_endpoint).toBe("https://identity.bookwrm.com/token");
 				expect(payload.userinfo_endpoint).toBe("https://identity.bookwrm.com/userinfo");
 				expect(payload.jwks_uri).toBe("https://identity.bookwrm.com/jwks");
+				expect(payload.grant_types_supported).toEqual(["authorization_code"]);
 
 				await app.close();
 		});

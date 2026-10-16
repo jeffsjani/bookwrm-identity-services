@@ -43,6 +43,7 @@ import { OIDCRateLimiter } from "./infrastructure/OIDCRateLimiter.js";
 import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
 import type { OIDCLogEntry } from "./types.js";
+import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
 	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
@@ -350,13 +351,19 @@ export class OIDCService {
 										return { error: "invalid_client", error_description: "Unknown client" };
 								}
 
+								if (!this.hasValidClientAuthenticationConfiguration(client)) {
+										reply.code(400);
+										error = "Client authentication metadata is invalid";
+										return { error: "invalid_client", error_description: "Client authentication metadata is invalid" };
+								}
+
 								const allowedRedirectUris = this.extractRedirectUris(client);
 								// TEMPORARY RELEASE PATCH 6.5 - REMOVE AFTER PRODUCTION CERTIFICATION
 								app.log.info(
 										{ clientId, requestedRedirectUri: redirectUri, registeredRedirectUris: allowedRedirectUris },
 										"OIDC Redirect Validation"
 								);
-								if (allowedRedirectUris.length > 0 && !allowedRedirectUris.includes(redirectUri)) {
+								if (allowedRedirectUris.length === 0 || !allowedRedirectUris.includes(redirectUri)) {
 										app.log.warn(
 												{ clientId, requestedRedirectUri: redirectUri },
 												"OIDC_REDIRECT_URI_MISMATCH"
@@ -620,16 +627,18 @@ export class OIDCService {
 										return { error: "invalid_client", error_description: "Unknown client" };
 								}
 
+								const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
+								if (!this.hasValidClientAuthenticationConfiguration(client)) {
+										reply.code(400);
+										error = "Client authentication metadata is invalid";
+										return { error: "invalid_client", error_description: "Client authentication metadata is invalid" };
+								}
 								const configuredClientSecret =
-									typeof client.client_secret === "string" ? client.client_secret : undefined;
-								const tokenEndpointAuthMethod =
-									typeof client.token_endpoint_auth_method === "string"
-											? client.token_endpoint_auth_method
-											: "client_secret_post";
+									typeof client.client_secret === "string" ? client.client_secret : "";
 								if (
-										configuredClientSecret &&
 										tokenEndpointAuthMethod !== "none" &&
-										configuredClientSecret !== clientSecret
+										(!clientSecret || !configuredClientSecret.trim() ||
+											!constantTimeStringEqual(configuredClientSecret, clientSecret))
 								) {
 										reply.code(400);
 										error = "client_secret is invalid";
@@ -637,7 +646,7 @@ export class OIDCService {
 								}
 
 								const allowedRedirectUris = this.extractRedirectUris(client);
-								if (allowedRedirectUris.length > 0 && !allowedRedirectUris.includes(redirectUri)) {
+								if (allowedRedirectUris.length === 0 || !allowedRedirectUris.includes(redirectUri)) {
 										reply.code(400);
 										error = "redirect_uri is not registered for client";
 										return { error: "invalid_grant", error_description: "redirect_uri is not registered for client" };
@@ -790,7 +799,7 @@ export class OIDCService {
 								"client_secret_post",
 								"none"
 						],
-						grant_types_supported: ["authorization_code", "refresh_token"],
+						grant_types_supported: ["authorization_code"],
 						claims_supported: claimsSupported,
 						code_challenge_methods_supported: ["S256"]
 				};
@@ -1103,7 +1112,7 @@ export class OIDCService {
 				const client = await this.resolveClient(interaction.clientId);
 				if (!client || !this.clientAllowsAuthorizationCodeGrant(client)) return false;
 				const redirectUris = this.extractRedirectUris(client);
-				return redirectUris.length === 0 || redirectUris.includes(interaction.authorization.redirectUri);
+				return redirectUris.length > 0 && redirectUris.includes(interaction.authorization.redirectUri);
 		}
 
 		private async interactiveEmailAuthority(interaction: AuthorizationInteraction): Promise<InteractiveEmailAuthority | null> {
@@ -1500,6 +1509,28 @@ export class OIDCService {
 				return redirectUris.filter((value): value is string => typeof value === "string");
 		}
 
+		private clientTokenEndpointAuthMethod(
+				client: OIDCClient
+		): "client_secret_basic" | "client_secret_post" | "none" | undefined {
+				const method = client.token_endpoint_auth_method;
+				return method === "client_secret_basic" || method === "client_secret_post" || method === "none"
+						? method
+						: undefined;
+		}
+
+		private hasValidClientAuthenticationConfiguration(client: OIDCClient): boolean {
+				const method = this.clientTokenEndpointAuthMethod(client);
+				if (!method) {
+						return false;
+				}
+
+				if (method === "none") {
+						return true;
+				}
+
+				return typeof client.client_secret === "string" && client.client_secret.trim().length > 0;
+		}
+
 		private extractScopes(client: OIDCClient): string[] {
 				if (typeof client.scope !== "string") {
 						return [];
@@ -1522,6 +1553,10 @@ export class OIDCService {
 		}
 
 		private clientRequiresPkce(client: OIDCClient): boolean {
+				if (this.clientTokenEndpointAuthMethod(client) === "none") {
+						return true;
+				}
+
 				if (typeof client.require_pkce === "boolean") {
 						return client.require_pkce;
 				}
@@ -1716,10 +1751,7 @@ export class OIDCService {
 						const grantTypes = Array.isArray(client.grant_types)
 								? client.grant_types.filter((value): value is string => typeof value === "string")
 								: [];
-						const tokenEndpointAuthMethod =
-								typeof client.token_endpoint_auth_method === "string"
-										? client.token_endpoint_auth_method
-										: "client_secret_post";
+						const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client) ?? "invalid";
 
 						return {
 								clientId,

@@ -1,6 +1,5 @@
 import Fastify from "fastify";
 import helmet from "@fastify/helmet";
-import cors from "@fastify/cors";
 import formbody from "@fastify/formbody";
 
 import { configuration } from "./config/ConfigurationService.js";
@@ -22,6 +21,7 @@ import { configureEmailVerification } from "./adapters/email/EmailVerificationCo
 import { configureRegistration } from "./registration/RegistrationComposition.js";
 import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposition.js";
 import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
+import { registerCorsPolicy } from "./security/CorsPolicy.js";
 
 const app = Fastify({
 		logger: {
@@ -53,10 +53,7 @@ if (configuration.getIdentityRegistryDriver() === "postgres") {
 await app.register(helmet);
 
 // CORS
-await app.register(cors, {
-		origin: true,
-		credentials: true
-});
+await registerCorsPolicy(app);
 
 // OAuth token requests commonly use application/x-www-form-urlencoded bodies.
 await app.register(formbody);

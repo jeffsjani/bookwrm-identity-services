@@ -1,9 +1,11 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { configuration } from "../config/ConfigurationService.js";
 import { identityAdministrationService } from "../identity/IdentityAdministrationService.js";
 import { recoverIdentity } from "../identity/IdentityRecoveryService.js";
 import { mergeIdentities } from "../identity/IdentityMergeService.js";
 import type { IdentityProvider, IdentitySubject } from "../models/IdentitySubject.js";
+import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 
 const VALID_PROVIDERS: readonly IdentityProvider[] = ["PrivateID", "Google", "Apple", "Passkey", "Enterprise"];
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -11,6 +13,37 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 function isValidProvider(value: string): value is IdentityProvider {
 		return (VALID_PROVIDERS as readonly string[]).includes(value);
 }
+
+// Accepts only `Authorization: Bearer <HAPI_PLATFORM_SERVICE_KEY>` (never query/body); fails closed when the key is unset.
+function hasValidAdminCredential(request: FastifyRequest): boolean {
+		const expectedKey = configuration.getHapiPlatformServiceKey();
+		const authorization = request.headers.authorization;
+		if (!expectedKey || typeof authorization !== "string") {
+				return false;
+		}
+
+		const match = /^Bearer ([^\s]+)$/.exec(authorization);
+		if (!match) {
+				return false;
+		}
+
+		return constantTimeStringEqual(match[1], expectedKey);
+}
+
+// Runs at onRequest -- before body parsing, lookups, or mutations -- on every /identity/admin/* route.
+async function requireAdminServiceCredential(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+		if (hasValidAdminCredential(request)) {
+				return;
+		}
+
+		await reply
+				.code(401)
+				.header("www-authenticate", "Bearer")
+				.header("cache-control", "no-store")
+				.send({ error: "unauthorized", error_description: "Administrative service credential required" });
+}
+
+const adminRouteOptions = { onRequest: requireAdminServiceCredential };
 
 // Composes the read-only subject detail view: identity + history + authenticators + timeline (Tasks 2-4).
 function toSubjectDetail(subject: IdentitySubject) {
@@ -25,12 +58,12 @@ function toSubjectDetail(subject: IdentitySubject) {
 // Read-only Identity Administration API (Phase 4). Namespaced under /identity/admin to avoid
 // colliding with the existing Bookwrm-facing /identity/* routes in routes/identity.ts.
 export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise<void> {
-		app.get("/identity/admin/subjects", async () => {
+		app.get("/identity/admin/subjects", adminRouteOptions, async () => {
 				const subjects = await identityAdministrationService.listSubjects();
 				return { subjects: subjects.map((subject) => toSubjectDetail(subject)) };
 		});
 
-		app.get<{ Params: { id: string } }>("/identity/admin/subject/:id", async (request, reply) => {
+		app.get<{ Params: { id: string } }>("/identity/admin/subject/:id", adminRouteOptions, async (request, reply) => {
 				if (!UUID_PATTERN.test(request.params.id)) {
 						reply.code(404);
 						return { error: "not_found", error_description: "No IdentitySubject for this oidcSubject" };
@@ -45,7 +78,7 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 				return toSubjectDetail(subject);
 		});
 
-		app.get<{ Params: { id: string } }>("/identity/admin/subject/:id/audit", async (request, reply) => {
+		app.get<{ Params: { id: string } }>("/identity/admin/subject/:id/audit", adminRouteOptions, async (request, reply) => {
 				if (!UUID_PATTERN.test(request.params.id)) {
 						reply.code(404);
 						return { error: "not_found", error_description: "No IdentitySubject for this oidcSubject" };
@@ -60,7 +93,7 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 				return { oidcSubject: subject.oidcSubject, audit: identityAdministrationService.getAudit(subject.oidcSubject) };
 		});
 
-		app.get<{ Params: { provider: string; subject: string } }>("/identity/admin/provider/:provider/:subject", async (request, reply) => {
+		app.get<{ Params: { provider: string; subject: string } }>("/identity/admin/provider/:provider/:subject", adminRouteOptions, async (request, reply) => {
 				const { provider, subject: providerSubject } = request.params;
 				if (!isValidProvider(provider)) {
 						reply.code(400);
@@ -76,12 +109,12 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 				return toSubjectDetail(subject);
 		});
 
-		app.get<{ Params: { email: string } }>("/identity/admin/email/:email", async (request) => {
+		app.get<{ Params: { email: string } }>("/identity/admin/email/:email", adminRouteOptions, async (request) => {
 				const subjects = await identityAdministrationService.getByEmail(decodeURIComponent(request.params.email));
 				return { subjects: subjects.map((subject) => toSubjectDetail(subject)) };
 		});
 
-		app.get("/identity/admin/health", async (_request, reply) => {
+		app.get("/identity/admin/health", adminRouteOptions, async (_request, reply) => {
 				const health = await identityAdministrationService.getHealth();
 				const { schemaVersion, migrationStatus, ...componentHealthEntries } = health;
 				const unhealthy = Object.values(componentHealthEntries).some((component) => component.status === "unhealthy");
@@ -95,6 +128,7 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 		// Mutation endpoints (Phase 5 Tasks 8-9) -- both require explicit administrative intent, never automatic.
 		app.post<{ Params: { id: string }; Body: { newPrivateIdUserId?: string; adminApproved?: boolean; reason?: string } }>(
 				"/identity/admin/subject/:id/recover",
+				adminRouteOptions,
 				async (request, reply) => {
 						const { newPrivateIdUserId, adminApproved, reason } = request.body ?? {};
 						if (!newPrivateIdUserId || !reason) {
@@ -119,6 +153,7 @@ export async function registerIdentityAdminRoutes(app: FastifyInstance): Promise
 
 		app.post<{ Body: { survivorOidcSubject?: string; loserOidcSubject?: string; reason?: string } }>(
 				"/identity/admin/merge",
+				adminRouteOptions,
 				async (request, reply) => {
 						const { survivorOidcSubject, loserOidcSubject, reason } = request.body ?? {};
 						if (!survivorOidcSubject || !loserOidcSubject || !reason) {

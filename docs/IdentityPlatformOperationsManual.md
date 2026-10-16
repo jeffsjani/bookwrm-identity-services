@@ -12,7 +12,7 @@ Bookwrm Identity Services (Railway) — Identity Registry, OIDC Provider, Privat
   - `JWT_PRIVATE_KEY` / `JWT_PUBLIC_KEY` (or `OIDC_JWKS_JSON`) — OIDC signing keys.
   - `PRIVATEID_*` — PrivateID API credentials, redirect/callback URLs, webhook shared secret.
   - `BASE44_BASE_URL`, `IDENTITY_API_PATH`, `BOOKWRM_IDENTITY_API_KEY` — legacy Bookwrm-facing routes only (`routes/identity.ts`); not used by the OIDC login path since Phase 3.
-- On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` and `GET /identity/admin/health` gate readiness.
+- On boot, the process must be able to reach both Postgres and Redis; `GET /health/ready` (public) and `GET /identity/admin/health` (service-key protected) gate readiness.
 - `GET /health/ready` returns 503 only when a core HAPI dependency fails: configuration, Redis (when `REDIS_ENABLED`), Postgres (`SELECT 1`, 2s bound, when `IDENTITY_REGISTRY_DRIVER=postgres`), OIDC signing keys, or the OIDC provider. The Base44 identity platform is a relying-application adapter: its health is probed in the background (at most once per 30s, never awaited by the readiness request) and reported as `dependencies.base44` = `unknown` | `healthy` | `degraded` (timeout, circuit open, 5xx) | `unavailable` (rejected, e.g. 401/403/404). Status transitions are logged as `DEPENDENCY_HEALTH_CHANGED`.
 - The `identity_subjects` and `schema_migrations` schema (`src/identity/schema.sql`) is applied idempotently via `ensureIdentitySchema()` at process startup in `server.ts` — no separate migration step is required for this table today.
 
@@ -72,6 +72,8 @@ PrivateID supplies only:
 - **Known limitation**: the schema models one `primaryProvider`/`primaryProviderSubject` per subject, so the loser's authenticator identity is not re-attached to the survivor as a *second* authenticator — that requires a future multi-authenticator table.
 
 ## 8. Monitoring
+
+> **Authentication required.** Every `/identity/admin/*` route (including `health`, `merge` and `recover`) requires `Authorization: Bearer <HAPI_PLATFORM_SERVICE_KEY>`. Missing, wrong, query-string or custom-header credentials receive `401`; if `HAPI_PLATFORM_SERVICE_KEY` is unset every admin route fails closed with `401`. Unauthenticated uptime monitors must use `GET /health` / `GET /health/ready`.
 
 - `GET /identity/admin/health` — Registry, Redis, PostgreSQL, OIDC, JWKS, PrivateID, Correlation store size, PendingIdentity stats, with latency in ms for Registry/Redis/PostgreSQL. Returns `503` if any component is `unhealthy`.
 - `GET /metrics` (Prometheus format, shared registry across OIDC and Identity metrics) — see [IdentityMetrics.ts](../src/identity/infrastructure/IdentityMetrics.ts) for the full counter list: `identity_new_identities_total`, `identity_returning_logins_total`, `identity_failed_linking_total`, `identity_email_verification_failures_total`, `identity_claim_updates_total{claim,decision}`, `identity_authenticator_adds_total`, `identity_authenticator_failures_total`, `identity_oidc_logins_total`, `identity_oidc_failures_total`.

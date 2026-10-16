@@ -4,8 +4,12 @@ import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { identityService } from "../src/identity/IdentityService.js";
 import { privateIdWebhookDiagnosticsRepository } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
 import { PrivateIdWebhookDiagnosticsConnectionError } from "../src/identity/infrastructure/PrivateIdWebhookDiagnosticsRepository.js";
+import { PrivateIDClient } from "../src/privateid/PrivateIDClient.js";
 import { oidcService } from "../src/oidc/oidcServiceInstance.js";
 import { buildOidcTestApp } from "./oidcTestHarness.js";
+
+const PLATFORM_KEY = "hapi-platform-service-key";
+const PLATFORM_AUTHORIZATION = { authorization: `Bearer ${PLATFORM_KEY}` };
 
 describe("Diagnostics routes", () => {
 		it("returns recent PrivateID webhook diagnostic rows", async () => {
@@ -140,7 +144,8 @@ describe("Diagnostics routes", () => {
 			try {
 				const response = await app.inject({
 					method: "GET",
-					url: "/diagnostics/identityapi"
+					url: "/diagnostics/identityapi",
+					headers: PLATFORM_AUTHORIZATION
 				});
 
 				expect(response.statusCode).toBe(200);
@@ -182,7 +187,8 @@ describe("Diagnostics routes", () => {
 			try {
 				const response = await app.inject({
 					method: "GET",
-					url: "/diagnostics/identityapi"
+					url: "/diagnostics/identityapi",
+					headers: PLATFORM_AUTHORIZATION
 				});
 
 				expect(response.statusCode).toBe(200);
@@ -227,7 +233,8 @@ describe("Diagnostics routes", () => {
 			try {
 				const response = await app.inject({
 					method: "GET",
-					url: "/diagnostics/identityapi"
+					url: "/diagnostics/identityapi",
+					headers: PLATFORM_AUTHORIZATION
 				});
 
 				expect(response.statusCode).toBe(401);
@@ -252,7 +259,8 @@ describe("Diagnostics routes", () => {
 				try {
 						const response = await app.inject({
 								method: "GET",
-								url: "/diagnostics/routes"
+								url: "/diagnostics/routes",
+								headers: PLATFORM_AUTHORIZATION
 						});
 
 					expect(response.statusCode).toBe(200);
@@ -273,7 +281,8 @@ describe("Diagnostics routes", () => {
 				try {
 						const response = await app.inject({
 								method: "GET",
-								url: "/diagnostics/privateid"
+								url: "/diagnostics/privateid",
+								headers: PLATFORM_AUTHORIZATION
 						});
 
 						expect(response.statusCode).toBe(200);
@@ -294,9 +303,61 @@ describe("Diagnostics routes", () => {
 								launchUrlReturned: true,
 								launchUrl: "https://privateid.example.com/launch"
 						});
+
 				} finally {
 						await app.close();
 				}
+		});
+
+		it("requires service authentication for every previously public diagnostic route before handler work", async () => {
+			const privateIdProbe = vi.spyOn(PrivateIDClient.prototype, "createAuthenticationSession");
+			const resolveSpy = vi.spyOn(identityService, "resolveIdentity");
+			const reverifySpy = vi.spyOn(identityService, "reverify");
+			const { app } = await buildOidcTestApp();
+			const routes = [
+				["GET", "/diagnostics/identityapi"],
+				["GET", "/diagnostics/base44"],
+				["GET", "/diagnostics/context"],
+				["GET", "/diagnostics/policies"],
+				["GET", "/diagnostics/security"],
+				["GET", "/diagnostics/devices"],
+				["GET", "/diagnostics/notifications"],
+				["GET", "/diagnostics/timeline"],
+				["POST", "/diagnostics/reverify"],
+				["POST", "/diagnostics/resolve"],
+				["GET", "/diagnostics/privateid"],
+				["GET", "/diagnostics/oidc/dashboard"],
+				["GET", "/diagnostics/routes"]
+			] as const;
+			const unauthorizedCredentials = [
+				{},
+				{ headers: { authorization: "Bearer wrong-key" } },
+				{ urlSuffix: "?key=hapi-platform-service-key" },
+				{ headers: { "x-hapi-platform-service-key": PLATFORM_KEY } }
+			] as const;
+
+			try {
+				for (const [method, path] of routes) {
+					for (const credential of unauthorizedCredentials) {
+						const response = await app.inject({
+							method,
+							url: `${path}${"urlSuffix" in credential ? credential.urlSuffix : ""}`,
+							...("headers" in credential ? { headers: credential.headers } : {}),
+							...(method === "POST" ? { payload: { privateIdUserId: "must-not-be-read" } } : {})
+						});
+						expect(response.statusCode, `${method} ${path}`).toBe(401);
+					}
+				}
+
+				expect(privateIdProbe).not.toHaveBeenCalled();
+				expect(resolveSpy).not.toHaveBeenCalled();
+				expect(reverifySpy).not.toHaveBeenCalled();
+			} finally {
+				privateIdProbe.mockRestore();
+				resolveSpy.mockRestore();
+				reverifySpy.mockRestore();
+				await app.close();
+			}
 		});
 
 		it("resolves claims diagnostics by provider subject", async () => {

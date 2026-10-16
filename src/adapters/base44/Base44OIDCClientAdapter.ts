@@ -81,12 +81,12 @@ function resolveClientRedirectUris(clientId: string): string[] {
 
 export function registerBase44OIDCClient(): RegisteredOIDCClient[] {
 		const clientId = configuration.get("OIDC_BASE44_CLIENT_ID")?.trim();
-		const clientSecret = configuration.get("OIDC_BASE44_CLIENT_SECRET")?.trim();
 
-		if (!clientId || !clientSecret) {
+		if (!clientId) {
 				return [];
 		}
 
+		const configuredClientSecret = configuration.get("OIDC_BASE44_CLIENT_SECRET")?.trim();
 		const redirectUris = resolveClientRedirectUris(clientId);
 		if (redirectUris.length === 0) {
 				throw new Error(
@@ -103,11 +103,17 @@ export function registerBase44OIDCClient(): RegisteredOIDCClient[] {
 				tokenAuthMethodRaw === "none" || tokenAuthMethodRaw === "client_secret_basic"
 						? tokenAuthMethodRaw
 						: "client_secret_post";
+		if (tokenEndpointAuthMethod !== "none" && !configuredClientSecret) {
+				throw new Error("OIDC confidential client configuration missing: set OIDC_BASE44_CLIENT_SECRET");
+		}
+		if (tokenEndpointAuthMethod === "none" && !requirePkce) {
+				throw new Error("OIDC public clients must require PKCE");
+		}
 
 		return [
 				{
 						client_id: clientId,
-						client_secret: clientSecret,
+						client_secret: tokenEndpointAuthMethod === "none" ? "" : configuredClientSecret ?? "",
 						redirect_uris: redirectUris,
 						scope: scopes.join(" "),
 						grant_types: grantTypes,
