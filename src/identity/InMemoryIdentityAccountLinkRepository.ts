@@ -1,5 +1,6 @@
 import type { IdentityAccountLink, IdentityAccountLinkSource } from "../models/IdentityAccountLink.js";
 import type { CreateIdentityAccountLinkInput, IdentityAccountLinkRepository } from "./IdentityAccountLinkRepository.js";
+import { ApplicationAccountLinkConflict } from "./ApplicationAccountLinks.js";
 
 function key(source: IdentityAccountLinkSource, externalUserId: string): string {
 		return `${source}:${externalUserId}`;
@@ -16,8 +17,9 @@ export class InMemoryIdentityAccountLinkRepository implements IdentityAccountLin
 
 		async create(input: CreateIdentityAccountLinkInput): Promise<IdentityAccountLink> {
 				const linkKey = key(input.source, input.externalUserId);
-				if (this.linksByKey.has(linkKey)) {
-						throw new Error(`IdentityAccountLink already exists for ${linkKey}`);
+				if (this.linksByKey.has(linkKey) || [...this.linksByKey.values()].some(link =>
+						link.source === input.source && link.identitySubjectId === input.identitySubjectId)) {
+						throw new ApplicationAccountLinkConflict();
 				}
 
 				const now = new Date().toISOString();

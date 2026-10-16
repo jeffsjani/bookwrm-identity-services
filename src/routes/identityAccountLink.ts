@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 
 import { configuration } from "../config/ConfigurationService.js";
 import { identityAccountLinkService, IdentityAccountLinkError } from "../identity/IdentityAccountLinkService.js";
+import { BOOKWRM_APPLICATION_ID } from "../identity/WellKnownIdentities.js";
 
 type AccountLinkBody = {
 		source?: unknown;
@@ -90,6 +91,10 @@ export async function registerIdentityAccountLinkRoutes(app: FastifyInstance): P
 								email: body.email as string | undefined,
 								emailVerified: body.emailVerified as boolean | undefined
 						});
+						request.log.info({ event: "APPLICATION_ACCOUNT_LINK", applicationId: BOOKWRM_APPLICATION_ID,
+								clientId: configuration.get("OIDC_BASE44_CLIENT_ID"), identitySubjectId: result.subject.id,
+								requestId: request.id, authority: "BOOKWRM_SERVICE_CONTINUITY",
+								result: result.created ? "created" : "existing" }, "Application account continuity reconciled");
 
 						reply.code(result.created ? 201 : 200);
 						return {
@@ -99,6 +104,8 @@ export async function registerIdentityAccountLinkRoutes(app: FastifyInstance): P
 						};
 				} catch (error) {
 						if (error instanceof IdentityAccountLinkError) {
+								request.log.warn({ event: "APPLICATION_ACCOUNT_LINK", applicationId: BOOKWRM_APPLICATION_ID,
+										requestId: request.id, result: error.code }, "Application account continuity rejected");
 								reply.code(error.code === "ACCOUNT_LINK_CONFLICT" ? 409 : 404);
 								return { error: error.code.toLowerCase(), error_description: error.message };
 						}

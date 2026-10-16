@@ -31,10 +31,11 @@ const RETURN_URI = "https://bookwrm.example.test/bookwrm/settings/account";
 const SUBJECT = randomUUID();
 
 function clientAuthorityFixture(): FaceSetupDependencies["clientAuthority"] {
-	const application = { id: "app-1", tenantId: "tenant-1", status: "active" as const };
+	const application = { id: "app-1", tenantId: "tenant-1", name: "Bookwrm", status: "active" as const,
+		allowedAuthenticationMethods: ["HAPI_EMAIL"], allowedIdentityProviders: [], faceSetupEnabled: true };
 	const tenant = { id: "tenant-1", status: "active" as const, name: "Bookwrm" };
 	const client = {
-		clientId: CLIENT_ID, clientSecret: "secret", tokenEndpointAuthMethod: "client_secret_basic",
+		clientId: CLIENT_ID, clientSecret: "secret", tokenEndpointAuthMethod: "client_secret_basic", status: "active",
 		applicationId: application.id, redirectUris: [RETURN_URI]
 	};
 	return {

@@ -4,6 +4,7 @@ import type { ApplicationRepository } from "./ApplicationRepository.js";
 import type { OIDCClientRepository } from "./OIDCClientRepository.js";
 import type { TenantRepository } from "./TenantRepository.js";
 import { VerificationError, type VerificationContext } from "../email/VerificationChallenge.js";
+import type { AuthenticationMethod } from "../models/Application.js";
 
 export interface H1ClientAuthority {
 	clients: Pick<OIDCClientRepository, "findByClientId">;
@@ -14,6 +15,23 @@ export interface H1ClientAuthority {
 export interface AuthorizedH1Client {
 	context: VerificationContext;
 	clientId: string;
+}
+
+export async function resolveRegisteredClient(clientId: string, authority: H1ClientAuthority) {
+	const client = await authority.clients.findByClientId(clientId);
+	if (!client || client.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
+	const application = await authority.applications.findById(client.applicationId);
+	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;
+	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") {
+		throw new VerificationError("UNAUTHORIZED", 401);
+	}
+	return { client, application, tenant };
+}
+
+export async function requireApplicationMethod(clientId: string, authority: H1ClientAuthority, method: AuthenticationMethod) {
+	const registration = await resolveRegisteredClient(clientId, authority);
+	if (!registration.application.allowedAuthenticationMethods.includes(method)) throw new VerificationError("UNAUTHORIZED", 403);
+	return registration;
 }
 
 export async function authorizeH1Client(request: FastifyRequest, authority: H1ClientAuthority): Promise<AuthorizedH1Client> {
@@ -32,9 +50,7 @@ export async function authorizeH1Client(request: FastifyRequest, authority: H1Cl
 	const hash = (value: string) => createHash("sha256").update(value).digest();
 	const matches = timingSafeEqual(hash(secret), hash(client?.clientSecret ?? ""));
 	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none" || !matches) throw new VerificationError("UNAUTHORIZED", 401);
-	const application = await authority.applications.findById(client.applicationId);
-	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;
-	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
+	const { application, tenant } = await requireApplicationMethod(clientId, authority, "HAPI_EMAIL");
 	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId };
 }
 
@@ -43,9 +59,7 @@ export async function authorizeH1Client(request: FastifyRequest, authority: H1Cl
 export async function resolveH1ClientAuthority(clientId: string, authority: H1ClientAuthority):
 	Promise<AuthorizedH1Client & { tenantName: string }> {
 	const client = await authority.clients.findByClientId(clientId);
-	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none") throw new VerificationError("UNAUTHORIZED", 401);
-	const application = await authority.applications.findById(client.applicationId);
-	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;
-	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
-	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId, tenantName: tenant.name };
+	if (!client || (client.tokenEndpointAuthMethod !== "none" && !client.clientSecret)) throw new VerificationError("UNAUTHORIZED", 401);
+	const { application, tenant } = await requireApplicationMethod(clientId, authority, "HAPI_EMAIL");
+	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId, tenantName: application.name };
 }

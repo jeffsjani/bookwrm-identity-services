@@ -13,6 +13,7 @@ type OIDCClientRow = {
 		response_types: string[];
 		token_endpoint_auth_method: string;
 		require_pkce: boolean;
+		status: OIDCClientRecord["status"];
 		created_at: string | Date;
 		updated_at: string | Date;
 };
@@ -33,6 +34,7 @@ function toOIDCClientRecord(row: OIDCClientRow): OIDCClientRecord {
 				responseTypes: row.response_types,
 				tokenEndpointAuthMethod: row.token_endpoint_auth_method as OIDCClientTokenEndpointAuthMethod,
 				requirePkce: row.require_pkce,
+				status: row.status,
 				createdAt: toIsoString(row.created_at),
 				updatedAt: toIsoString(row.updated_at)
 		};
@@ -74,8 +76,8 @@ export class PostgresOIDCClientRepository implements OIDCClientRepository {
 				const now = new Date();
 				const result = await this.client.query<OIDCClientRow>(
 						`INSERT INTO oidc_clients
-							(id, application_id, client_id, client_secret, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, created_at, updated_at)
-						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
+							(id, application_id, client_id, client_secret, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, created_at, updated_at, status)
+						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, COALESCE($12,'active'))
 						 ON CONFLICT (client_id) DO UPDATE SET
 							application_id = $2,
 							client_secret = $4,
@@ -85,6 +87,7 @@ export class PostgresOIDCClientRepository implements OIDCClientRepository {
 							response_types = $8,
 							token_endpoint_auth_method = $9,
 							require_pkce = $10,
+							status = COALESCE($12,oidc_clients.status),
 							updated_at = $11
 						 RETURNING *`,
 						[
@@ -98,7 +101,8 @@ export class PostgresOIDCClientRepository implements OIDCClientRepository {
 								input.responseTypes,
 								input.tokenEndpointAuthMethod,
 								input.requirePkce,
-								now
+								now,
+								input.status ?? null
 						]
 				);
 

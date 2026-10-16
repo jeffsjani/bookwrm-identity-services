@@ -1,6 +1,7 @@
 import type { IdentityAccountLink, IdentityAccountLinkSource, IdentityAccountLinkStatus } from "../models/IdentityAccountLink.js";
 import type { CreateIdentityAccountLinkInput, IdentityAccountLinkRepository } from "./IdentityAccountLinkRepository.js";
 import { getPostgresPool, type PostgresClient } from "./infrastructure/PostgresInfrastructure.js";
+import { ApplicationAccountLinkConflict } from "./ApplicationAccountLinks.js";
 
 type IdentityAccountLinkRow = {
 		id: string;
@@ -49,7 +50,10 @@ export class PostgresIdentityAccountLinkRepository implements IdentityAccountLin
 
 		async findByExternalUserId(source: IdentityAccountLinkSource, externalUserId: string): Promise<IdentityAccountLink | undefined> {
 				const result = await this.client.query<IdentityAccountLinkRow>(
-						`SELECT * FROM identity_account_links WHERE source = $1 AND external_user_id = $2`,
+						`SELECT l.id,$1::text AS source,l.external_account_id AS external_user_id,
+						 l.identity_subject_id,l.status,l.created_at AS linked_at,l.updated_at
+						 FROM application_account_links l JOIN applications a ON a.id=l.application_id
+						 WHERE a.application_key='BOOKWRM' AND $1='bookwrm' AND l.external_account_id=$2`,
 						[source, externalUserId]
 				);
 
@@ -71,7 +75,7 @@ export class PostgresIdentityAccountLinkRepository implements IdentityAccountLin
 						return toAccountLink(result.rows[0]);
 				} catch (error) {
 						if (isUniqueViolation(error)) {
-								throw new Error(`IdentityAccountLink already exists for ${input.source}:${input.externalUserId}`);
+								throw new ApplicationAccountLinkConflict();
 						}
 
 						throw error;

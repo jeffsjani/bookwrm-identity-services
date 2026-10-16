@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { VerificationError } from "../email/VerificationChallenge.js";
-import { resolveH1ClientAuthority, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
+import { resolveH1ClientAuthority, resolveRegisteredClient, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
 import type { IdentityRegistry } from "../identity/IdentityRegistry.js";
 import type { InteractiveEmailAuthentication, InteractiveEmailAuthority } from "../authentication/InteractiveEmailAuthentication.js";
 import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
@@ -263,6 +263,8 @@ async function registerRoutes(app: FastifyInstance, deps: FaceSetupDependencies)
 		let authority;
 		try {
 			authority = await resolveH1ClientAuthority(query.data.client_id, clientAuthority);
+			const registration = await resolveRegisteredClient(query.data.client_id, clientAuthority);
+			if (!registration.application.faceSetupEnabled) return reply.code(403).send({ error: "FACE_SETUP_NOT_ALLOWED" });
 		} catch (error) {
 			if (error instanceof VerificationError) return reply.code(400).send({ error: "INVALID_CLIENT" });
 			throw error;

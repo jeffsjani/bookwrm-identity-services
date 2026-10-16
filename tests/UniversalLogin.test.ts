@@ -98,7 +98,8 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 	const applications = new InMemoryApplicationRepository();
 	const clients = new InMemoryOIDCClientRepository();
 	await tenants.upsert({ id: tenantId, name: "Bookwrm", slug: `bookwrm-${tenantId}`, status: "active" });
-	await applications.upsert({ id: applicationId, tenantId, name: "Bookwrm Web", slug: "web", status: "active" });
+	await applications.upsert({ id: applicationId, tenantId, name: "Bookwrm Web", slug: "web", status: "active",
+		allowedAuthenticationMethods: ["HAPI_EMAIL", "PRIVATEID_FACE"] });
 	await clients.upsert({ id: randomUUID(), applicationId, clientId, clientSecret: CLIENT_SECRET,
 		redirectUris: [REDIRECT], scopes: ["openid", "profile", "email"], grantTypes: ["authorization_code"],
 		responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
@@ -155,7 +156,7 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 			sessionId: `face-session-${correlationId}`, launchUrl: "https://privateid.example.com/launch?session=opaque"
 		}))
 	} as unknown as AuthenticationProvider;
-	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients });
+	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients, clientAuthority: h1 });
 	oidc.configureEmailAuthentication({
 		async consume(request, token, expectedClient) {
 			const client = await authorizeH1Client(request, h1);
@@ -862,6 +863,10 @@ describe("H6 Universal Login → existing PrivateID Face", () => {
 		setFlag(true);
 		const { ensureBookwrmApplicationSeed } = await import("../src/adapters/base44/Base44ApplicationSeed.js");
 		await ensureBookwrmApplicationSeed();
+		const { inMemoryApplicationRepository } = await import("../src/identity/InMemoryApplicationRepository.js");
+		const { BOOKWRM_APPLICATION_ID } = await import("../src/identity/WellKnownIdentities.js");
+		const application = (await inMemoryApplicationRepository.findById(BOOKWRM_APPLICATION_ID))!;
+		await inMemoryApplicationRepository.upsert({ ...application, allowedAuthenticationMethods: ["HAPI_EMAIL", "PRIVATEID_FACE"] });
 		const { oidcService } = await import("../src/oidc/oidcServiceInstance.js");
 		const { registerPrivateIdRoutes } = await import("../src/routes/privateid.js");
 		const logs: string[] = [];

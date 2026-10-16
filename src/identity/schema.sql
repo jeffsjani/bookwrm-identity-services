@@ -61,6 +61,18 @@ CREATE TABLE IF NOT EXISTS oidc_clients (
 -- until PlatformSeed.ts backfills them to the Bookwrm application (see ensureBookwrmApplicationSeed()).
 ALTER TABLE identity_subjects ADD COLUMN IF NOT EXISTS application_id UUID REFERENCES applications(id);
 
+-- application_id on identity_subjects is legacy creation provenance, never authentication authority.
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS application_key TEXT;
+UPDATE applications SET application_key = id::text WHERE application_key IS NULL;
+ALTER TABLE applications ALTER COLUMN application_key SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS applications_application_key_key ON applications(application_key);
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS allowed_authentication_methods TEXT[] NOT NULL DEFAULT ARRAY['HAPI_EMAIL'];
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS allowed_identity_providers TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS face_setup_enabled BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS presentation JSONB NOT NULL DEFAULT '{}';
+ALTER TABLE oidc_clients ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+	CHECK (status IN ('active','suspended'));
+
 -- Provider authenticator storage used by Face login and HAPI authenticator attachment.
 CREATE TABLE IF NOT EXISTS user_authenticators (
 		id UUID PRIMARY KEY,
@@ -153,3 +165,50 @@ CREATE TABLE IF NOT EXISTS identity_account_links (
 		updated_at TIMESTAMPTZ NOT NULL,
 		CONSTRAINT identity_account_links_source_external_user_id_key UNIQUE (source, external_user_id)
 );
+
+-- Canonical application participation; legacy Bookwrm rows remain intact.
+CREATE TABLE IF NOT EXISTS application_account_links (
+	id UUID PRIMARY KEY,
+	identity_subject_id UUID NOT NULL REFERENCES identity_subjects(id),
+	application_id UUID NOT NULL REFERENCES applications(id),
+	external_account_id TEXT NOT NULL CHECK (length(trim(external_account_id)) > 0),
+	status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','suspended')),
+	created_at TIMESTAMPTZ NOT NULL,
+	updated_at TIMESTAMPTZ NOT NULL,
+	UNIQUE(application_id, external_account_id),
+	UNIQUE(identity_subject_id, application_id)
+);
+CREATE TABLE IF NOT EXISTS application_account_link_audit (
+	id UUID PRIMARY KEY,
+	identity_subject_id UUID NOT NULL REFERENCES identity_subjects(id),
+	application_id UUID NOT NULL REFERENCES applications(id),
+	external_account_id TEXT NOT NULL,
+	authority TEXT NOT NULL,
+	client_id TEXT,
+	request_id TEXT NOT NULL,
+	authentication_method TEXT,
+	result TEXT NOT NULL,
+	occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Legacy writes retain their original API and atomically satisfy the new uniqueness rules.
+CREATE OR REPLACE FUNCTION mirror_bookwrm_account_link() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE app_id UUID;
+BEGIN
+	SELECT id INTO STRICT app_id FROM applications WHERE application_key='BOOKWRM';
+	INSERT INTO application_account_links
+		(id,identity_subject_id,application_id,external_account_id,status,created_at,updated_at)
+	VALUES (NEW.id,NEW.identity_subject_id,app_id,NEW.external_user_id,NEW.status,NEW.linked_at,NEW.updated_at);
+	INSERT INTO application_account_link_audit
+		(id,identity_subject_id,application_id,external_account_id,authority,request_id,result)
+	VALUES (NEW.id,NEW.identity_subject_id,app_id,NEW.external_user_id,'BOOKWRM_SERVICE_CONTINUITY',NEW.id::text,'created');
+	RETURN NEW;
+END;
+$$;
+DO $$ BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='mirror_bookwrm_account_link_insert'
+		AND tgrelid='identity_account_links'::regclass) THEN
+		CREATE TRIGGER mirror_bookwrm_account_link_insert AFTER INSERT ON identity_account_links
+			FOR EACH ROW EXECUTE FUNCTION mirror_bookwrm_account_link();
+	END IF;
+END $$;

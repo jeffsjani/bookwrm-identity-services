@@ -8,6 +8,7 @@ import { identityClaimResolver } from "./IdentityClaimResolver.js";
 import { inMemoryIdentityAccountLinkRepository } from "./InMemoryIdentityAccountLinkRepository.js";
 import { PostgresIdentityAccountLinkRepository } from "./PostgresIdentityAccountLinkRepository.js";
 import type { IdentityAccountLinkRepository } from "./IdentityAccountLinkRepository.js";
+import { ApplicationAccountLinkConflict } from "./ApplicationAccountLinks.js";
 
 export class IdentityAccountLinkError extends Error {
 		constructor(readonly code: "UNKNOWN_OIDC_SUBJECT" | "ACCOUNT_LINK_CONFLICT") {
@@ -60,14 +61,21 @@ export class IdentityAccountLinkService {
 
 						link = existing;
 				} else {
-						link = await this.links.create({
+						try {
+							link = await this.links.create({
 								id: randomUUID(),
 								source: "bookwrm",
 								externalUserId: request.externalUserId,
 								identitySubjectId: subject.id,
 								status: "active"
-						});
-						created = true;
+							});
+							created = true;
+						} catch (error) {
+							if (!(error instanceof ApplicationAccountLinkConflict)) throw error;
+							const concurrent = await this.links.findByExternalUserId("bookwrm", request.externalUserId);
+							if (!concurrent || concurrent.identitySubjectId !== subject.id) throw new IdentityAccountLinkError("ACCOUNT_LINK_CONFLICT");
+							link = concurrent;
+						}
 				}
 
 				// Reuses the existing governed claim mechanism -- never duplicates IdentityClaimResolver/IdentityRegistry logic.

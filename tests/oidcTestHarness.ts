@@ -6,6 +6,8 @@ import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { ensureBookwrmApplicationSeed } from "../src/adapters/base44/Base44ApplicationSeed.js";
+import { inMemoryApplicationRepository } from "../src/identity/InMemoryApplicationRepository.js";
+import { BOOKWRM_APPLICATION_ID } from "../src/identity/WellKnownIdentities.js";
 
 type AuthorizeOptions = {
 		clientId?: string;
@@ -63,6 +65,9 @@ export function ensureOidcTestEnvironment(): void {
 export async function buildOidcTestApp(): Promise<{ app: FastifyInstance }> {
 		ensureOidcTestEnvironment();
 		await ensureBookwrmApplicationSeed();
+		const application = await inMemoryApplicationRepository.findById(BOOKWRM_APPLICATION_ID);
+		if (!application) throw new Error("Missing test application");
+		await inMemoryApplicationRepository.upsert({ ...application, allowedAuthenticationMethods: ["HAPI_EMAIL", "PRIVATEID_FACE"] });
 		const { oidcService } = await import("../src/oidc/oidcServiceInstance.js");
 		const { registerDiagnosticsRoutes } = await import("../src/routes/diagnostics.js");
 		const { registerPrivateIdRoutes } = await import("../src/routes/privateid.js");

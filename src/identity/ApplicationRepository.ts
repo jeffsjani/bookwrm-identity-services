@@ -6,7 +6,7 @@ export type UpsertApplicationInput = {
 		name: string;
 		slug: string;
 		status: ApplicationStatus;
-};
+} & Partial<Pick<Application, "applicationKey" | "allowedAuthenticationMethods" | "allowedIdentityProviders" | "faceSetupEnabled" | "presentation">>;
 
 // Storage contract for Application. No OIDCClient/tenant logic belongs here.
 export interface ApplicationRepository {

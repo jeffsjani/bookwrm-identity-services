@@ -95,9 +95,9 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 		await repository.ensureSchema();
 		await pool.query("INSERT INTO tenants VALUES ($1,'H4 test',$2,'active',NOW(),NOW())", [tenantId, schema]);
 		await pool.query("INSERT INTO tenants VALUES ($1,'H4 other',$2,'active',NOW(),NOW())", [otherTenant, schema + "_other"]);
-		await pool.query("INSERT INTO applications VALUES ($1,$2,'H4 other','other','active',NOW(),NOW())", [otherTenantApplication, otherTenant]);
+		await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid,$2,'H4 other','other','active',NOW(),NOW(),$1::text)", [otherTenantApplication, otherTenant]);
 		for (const id of [applicationId, otherApplication]) {
-			await pool.query("INSERT INTO applications VALUES ($1,$2,'H4 test',$3,'active',NOW(),NOW())", [id, tenantId, id]);
+			await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid,$2,'H4 test',$3,'active',NOW(),NOW(),$1::text)", [id, tenantId, id]);
 		}
 		await h1.clients.upsert({ id: randomUUID(), applicationId, clientId,
 			clientSecret: "h4-test-secret", redirectUris: ["https://rp.example/callback"],
@@ -240,14 +240,13 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 		}
 		expect(await subjects.findByProviderSubject("HAPI_EMAIL", unknown)).toBeUndefined();
 	});
-	it.each(["unknown", "inactive", "unverified", "other-provider", "other-application"] as const)(
+	it.each(["unknown", "inactive", "unverified", "other-provider"] as const)(
 		"%s email proof receives the same generic failure and no result/identity creation", async kind => {
 			const email = `${randomUUID()}@example.com`;
 			const existing = kind !== "unknown" ? await seed(email, {
 				...(kind === "inactive" ? { status: "DISABLED" } : {}),
 				...(kind === "unverified" ? { emailVerified: false } : {}),
-				...(kind === "other-provider" ? { provider: "PrivateID" } : {}),
-				...(kind === "other-application" ? { applicationId: otherApplication } : {})
+				...(kind === "other-provider" ? { provider: "PrivateID" } : {})
 			}) : undefined;
 			const before = await count("identity_subjects");
 			const flow = await start(email);
@@ -262,6 +261,16 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 			const audit = (await pool.query("SELECT outcome FROM email_authentication_audit WHERE challenge_id=$1 AND type='EMAIL_AUTHENTICATION_FAILED'", [flow.challengeId])).rows;
 			expect(audit).toEqual([{ outcome: kind === "unknown" || kind === "other-provider" ? "NO_ELIGIBLE_IDENTITY" : "IDENTITY_NOT_ELIGIBLE" }]);
 		});
+	it("authenticates a canonical identity whose application_id is only other-application provenance", async () => {
+		const subject = await seed(`${randomUUID()}@example.com`, { applicationId: otherApplication });
+		const before = await count("identity_subjects");
+		const flow = await start(subject.email!);
+		const result = await service.verify(authority, flow.challengeId, flow.code);
+		const principal = await service.consumeResult(authority, result.authenticationResult);
+		expect(principal.sub).toBe(subject.oidcSubject);
+		expect(await count("identity_subjects")).toBe(before);
+		expect((await subjects.findById(subject.id))?.applicationId).toBe(otherApplication);
+	});
 	it("allows exactly one concurrent OTP verification and one single-use principal handoff", async () => {
 		const subject = await seed();
 		const flow = await start(subject.email!);
@@ -397,7 +406,7 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 				.split("-- Expand only")[0].replaceAll(", 'AUTHENTICATION'", ""));
 			const upgraded = new PostgresVerificationChallengeRepository(isolated);
 			await isolated.query("INSERT INTO tenants VALUES ($1,'Migration',$2,'active',NOW(),NOW())", [tenantId, migrationSchema]);
-			await isolated.query("INSERT INTO applications VALUES ($1,$2,'Migration','migration','active',NOW(),NOW())", [applicationId, tenantId]);
+			await isolated.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid,$2,'Migration','migration','active',NOW(),NOW(),$1::text)", [applicationId, tenantId]);
 			const legacyH2 = new EmailVerificationService(upgraded, provider,
 				new VerificationSecrets("h4-migration-test-secret".repeat(3)), defaultVerificationPolicy);
 			const flow = await legacyH2.start(context, `${randomUUID()}@example.com`, "REGISTRATION");
@@ -441,7 +450,7 @@ describe.skipIf(!databaseUrl)("H4 isolated PostgreSQL identity resolution and si
 			cancel: vi.fn(async () => {}), status: vi.fn(async () => ({ state: "idle" as const })),
 			logout: vi.fn(async () => {}), beginAsyncAuthentication: vi.fn(async () => { throw new Error("Must not launch face"); })
 		};
-		const oidc = new OIDCService({ authenticationProvider: providerMock, oidcClients: h1.clients });
+		const oidc = new OIDCService({ authenticationProvider: providerMock, oidcClients: h1.clients, clientAuthority: h1 });
 		const disabledApp = Fastify();
 		await oidc.registerEndpoints(disabledApp);
 		try {

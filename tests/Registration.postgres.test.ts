@@ -37,7 +37,7 @@ describe.skipIf(!databaseUrl)("H3 durable PostgreSQL atomicity/concurrency", () 
 		await challengeRepository.ensureSchema();
 		await registrationRepository.ensureSchema();
 		await pool.query("INSERT INTO tenants VALUES ($1, 'H3 test', $2, 'active', NOW(), NOW())", [tenantId, `h3-${tenantId}`]);
-		await pool.query("INSERT INTO applications VALUES ($1, $2, 'H3 test', 'h3', 'active', NOW(), NOW())", [applicationId, tenantId]);
+		await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid, $2, 'H3 test', 'h3', 'active', NOW(), NOW(),$1::text)", [applicationId, tenantId]);
 	});
 
 	afterAll(async () => {
@@ -151,7 +151,7 @@ describe.skipIf(!databaseUrl)("H3 durable PostgreSQL atomicity/concurrency", () 
 		const otherTenantId = randomUUID();
 		const otherApplicationId = randomUUID();
 		await pool.query("INSERT INTO tenants VALUES ($1, 'Other tenant', $2, 'active', NOW(), NOW())", [otherTenantId, `other-${otherTenantId}`]);
-		await pool.query("INSERT INTO applications VALUES ($1, $2, 'Other app', 'other', 'active', NOW(), NOW())", [otherApplicationId, otherTenantId]);
+		await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid, $2, 'Other app', 'other', 'active', NOW(), NOW(),$1::text)", [otherApplicationId, otherTenantId]);
 		try {
 			const verificationId = await verifiedChallenge(uniqueEmail());
 			await expect(registrationRepository.complete({ context: { tenantId: otherTenantId, applicationId }, verificationId })).rejects.toThrow("INVALID_EVIDENCE");

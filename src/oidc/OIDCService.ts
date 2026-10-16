@@ -20,7 +20,11 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
-import { BOOKWRM_APPLICATION_ID } from "../identity/WellKnownIdentities.js";
+import { resolveRegisteredClient, requireApplicationMethod, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
+import { inMemoryApplicationRepository } from "../identity/InMemoryApplicationRepository.js";
+import { inMemoryTenantRepository } from "../identity/InMemoryTenantRepository.js";
+import { PostgresApplicationRepository } from "../identity/PostgresApplicationRepository.js";
+import { PostgresTenantRepository } from "../identity/PostgresTenantRepository.js";
 import type { OIDCClientRepository } from "../identity/OIDCClientRepository.js";
 import { inMemoryOIDCClientRepository } from "../identity/InMemoryOIDCClientRepository.js";
 import { PostgresOIDCClientRepository } from "../identity/PostgresOIDCClientRepository.js";
@@ -74,6 +78,7 @@ export type OIDCServiceOptions = {
 		signingKeys?: OIDCSigningKey[];
 		authenticationProvider: AuthenticationProvider;
 		oidcClients?: OIDCClientRepository;
+		clientAuthority?: H1ClientAuthority;
 };
 
 type AuthorizationQuery = {
@@ -85,6 +90,8 @@ type AuthorizationQuery = {
 		nonce?: string;
 		code_challenge?: string;
 		code_challenge_method?: string;
+		login_hint?: string;
+		idp_hint?: string;
 };
 
 const emailAuthorizationSchema = z.object({
@@ -176,6 +183,7 @@ export class OIDCService {
 		private readonly authenticationProvider: AuthenticationProvider;
 		private emailAuthentication?: EmailOIDCHandoff;
 		private readonly oidcClients: OIDCClientRepository;
+		private readonly clientAuthority: H1ClientAuthority;
 		private readonly claimsService: ClaimsService;
 		private readonly redisStore: RedisOIDCStore;
 		private readonly lockService: RedisLockService;
@@ -198,6 +206,11 @@ export class OIDCService {
 								: new PostgresOIDCClientRepository()
 				);
 				this.claimsService = new ClaimsService();
+				this.clientAuthority = options.clientAuthority ?? {
+						clients: this.oidcClients,
+						applications: configuration.getIdentityRegistryDriver() === "memory" ? inMemoryApplicationRepository : new PostgresApplicationRepository(),
+						tenants: configuration.getIdentityRegistryDriver() === "memory" ? inMemoryTenantRepository : new PostgresTenantRepository()
+				};
 				this.redisStore = new RedisOIDCStore();
 				this.lockService = new RedisLockService();
 				this.rateLimiter = new OIDCRateLimiter();
@@ -357,6 +370,14 @@ export class OIDCService {
 										return { error: "invalid_client", error_description: "Client authentication metadata is invalid" };
 								}
 
+								const registration = await resolveRegisteredClient(clientId, this.clientAuthority);
+								if (query.idp_hint !== undefined) {
+										// Provider routing is not implemented; even an allowlisted provider cannot select a route yet.
+										return reply.code(400).send({ error: "invalid_request", error_description: "Provider selection is not enabled" });
+								}
+								app.log.info({ event: "APPLICATION_AUTHORIZATION", applicationId: registration.application.id,
+										clientId, requestId: request.id, result: "validated" }, "Application authority validated");
+
 								const allowedRedirectUris = this.extractRedirectUris(client);
 								// TEMPORARY RELEASE PATCH 6.5 - REMOVE AFTER PRODUCTION CERTIFICATION
 								app.log.info(
@@ -426,6 +447,7 @@ export class OIDCService {
 										state: query.state
 								};
 								if (emailResult && this.emailAuthentication) {
+										await requireApplicationMethod(clientId, this.clientAuthority, "HAPI_EMAIL");
 										const principal = await this.emailAuthentication.consume(request, emailResult, clientId);
 										userId = principal.id;
 										const redirect = await this.issueAuthorizationRedirect(principal, pendingContext);
@@ -450,6 +472,7 @@ export class OIDCService {
 										return reply.code(503).send({ error: "authentication_unavailable" });
 								}
 								error = err instanceof Error ? err.message : "unknown_error";
+								if (err instanceof VerificationError) return reply.code(err.statusCode).send({ error: "unauthorized_client" });
 								throw err;
 						} finally {
 								this.logOidcRequest(app, {
@@ -628,6 +651,8 @@ export class OIDCService {
 								}
 
 								const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
+								await requireApplicationMethod(clientId, this.clientAuthority,
+										codeRecord.authenticationMethod === "HAPI_EMAIL" ? "HAPI_EMAIL" : "PRIVATEID_FACE");
 								if (!this.hasValidClientAuthenticationConfiguration(client)) {
 										reply.code(400);
 										error = "Client authentication metadata is invalid";
@@ -762,6 +787,7 @@ export class OIDCService {
 								};
 						} catch (err) {
 								error = err instanceof Error ? err.message : "unknown_error";
+								if (err instanceof VerificationError) return reply.code(400).send({ error: "unauthorized_client" });
 								throw err;
 						} finally {
 								this.logOidcRequest(app, {
@@ -975,7 +1001,7 @@ export class OIDCService {
 						return this.options.clients;
 				}
 
-				const persistedClients = await this.oidcClients.listByApplication(BOOKWRM_APPLICATION_ID);
+				const persistedClients = await this.oidcClients.list();
 				if (persistedClients.length > 0) {
 						return persistedClients.map((record) => this.toOIDCClient(record));
 				}
@@ -1004,6 +1030,8 @@ export class OIDCService {
 		}
 
 		private async issueAuthorizationRedirect(user: AuthenticatedUser, context: PendingAuthorizationContext): Promise<string> {
+				await requireApplicationMethod(context.clientId, this.clientAuthority,
+						user.authenticationMethod === "HAPI_EMAIL" ? "HAPI_EMAIL" : "PRIVATEID_FACE");
 				const authorizationCode = this.createAuthorizationCode();
 
 				// Release Patch 6.1: the code carries only stable protocol fields (sub/client/nonce/scope/PKCE/expiration);
@@ -1035,6 +1063,7 @@ export class OIDCService {
 
 		// Existing interactive PrivateID Face path, shared by flag-off GET /authorize and Universal Login "Continue with Face".
 		private async beginFaceAuthorization(reply: FastifyReply, pendingContext: PendingAuthorizationContext): Promise<void> {
+				await requireApplicationMethod(pendingContext.clientId, this.clientAuthority, "PRIVATEID_FACE");
 				this.authenticationProvider.setPendingAuthorizationContext?.(pendingContext);
 
 				// correlationId ties this authorization request to its PrivateID session without depending on Bookwrm.
@@ -1071,7 +1100,10 @@ export class OIDCService {
 
 		private async createAuthorizationInteraction(app: FastifyInstance, clientId: string,
 				authorization: PendingAuthorizationContext, query: AuthorizationQuery): Promise<string> {
-				let binding: AuthorizationInteractionBinding | undefined;
+				const registered = await resolveRegisteredClient(clientId, this.clientAuthority);
+				let binding: AuthorizationInteractionBinding | undefined = {
+						tenantId: registered.tenant.id, applicationId: registered.application.id, tenantName: registered.application.name
+				};
 				const interactive = this.emailAuthentication?.interactive;
 				if (interactive) {
 						try {
@@ -1111,6 +1143,9 @@ export class OIDCService {
 		private async interactionClientStillValid(interaction: AuthorizationInteraction): Promise<boolean> {
 				const client = await this.resolveClient(interaction.clientId);
 				if (!client || !this.clientAllowsAuthorizationCodeGrant(client)) return false;
+				const registered = await resolveRegisteredClient(interaction.clientId, this.clientAuthority);
+				if (!interaction.binding || registered.application.id !== interaction.binding.applicationId ||
+						registered.tenant.id !== interaction.binding.tenantId) return false;
 				const redirectUris = this.extractRedirectUris(client);
 				return redirectUris.length > 0 && redirectUris.includes(interaction.authorization.redirectUri);
 		}
@@ -1120,6 +1155,7 @@ export class OIDCService {
 				if (!interactive || !interaction.binding) return null;
 				let authority: InteractiveEmailAuthority;
 				try {
+						await requireApplicationMethod(interaction.clientId, this.clientAuthority, "HAPI_EMAIL");
 						authority = await interactive.authority(interaction.clientId);
 				} catch (error) {
 						if (error instanceof VerificationError) return null;
@@ -1154,11 +1190,17 @@ export class OIDCService {
 				const statusOf = (error: unknown) => typeof (error as { statusCode?: unknown })?.statusCode === "number"
 						? (error as { statusCode: number }).statusCode : 500;
 				const logLogin = (request: FastifyRequest, flow: string, interaction: AuthorizationInteraction | null,
-						startedAt: number, success: boolean, error: string, user = "") => this.logOidcRequest(app, {
+						startedAt: number, success: boolean, error: string, user = "") => {
+						app.log.info({ event: "APPLICATION_AUTHENTICATION", applicationId: interaction?.binding?.applicationId,
+								clientId: interaction?.clientId, identitySubjectId: user || undefined, requestId: request.id,
+								authenticationMethod: flow === "universal_login_face" ? "PRIVATEID_FACE" : "HAPI_EMAIL",
+								result: success ? "success" : "rejected", reasonCode: error || undefined }, "Application authentication result");
+						this.logOidcRequest(app, {
 						requestId: request.id, clientId: interaction?.clientId ?? "", flow, latency: Date.now() - startedAt,
 						success, error, user, pkce: interaction?.authorization.codeChallenge ? "S256" : "missing",
 						correlationId: this.correlationIdFor(request)
 				});
+				};
 				// Loads the live interaction for the browser and enforces the flag, CSRF and rate limits.
 				const load = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean, routeLabel: string) => {
 						if (!this.isUniversalLoginEnabled()) {
@@ -1205,9 +1247,13 @@ export class OIDCService {
 						const loaded = await load(request, reply, false, "GET /login");
 						if (!loaded) return reply;
 						const { interaction } = loaded;
+						if (!await this.interactionClientStillValid(interaction)) return expired(reply);
+						const registration = await resolveRegisteredClient(interaction.clientId, this.clientAuthority);
 						return send(reply, 200, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
 								clientId: interaction.clientId,
-								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive) }));
+								faceAvailable: registration.application.allowedAuthenticationMethods.includes("PRIVATEID_FACE") ? undefined : false,
+								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive &&
+										registration.application.allowedAuthenticationMethods.includes("HAPI_EMAIL")) }));
 				});
 
 				app.get("/login/email", async (request, reply) => {
@@ -1387,6 +1433,7 @@ export class OIDCService {
 												clientId: interaction.clientId, correlationId, clientValid: false, reasonCode: "CLIENT_INVALID" });
 										return expired(reply);
 								}
+								await requireApplicationMethod(interaction.clientId, this.clientAuthority, "PRIVATEID_FACE");
 								const consumed = await this.interactions.consume(loaded.handle);
 								if (!consumed) {
 										logLogin(request, "universal_login_face", interaction, startedAt, false, "interaction_replayed");
@@ -1402,6 +1449,10 @@ export class OIDCService {
 								logLogin(request, "universal_login_face", consumed, startedAt, true, "");
 								return reply;
 						} catch (error) {
+								if (error instanceof VerificationError) {
+										logLogin(request, "universal_login_face", interaction, startedAt, false, "authentication_method_not_allowed");
+										return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								}
 								logLogin(request, "universal_login_face", interaction, startedAt, false, statusOf(error) === 429 ? "rate_limited" : "unavailable");
 								if (interaction && statusOf(error) === 429) {
 										return send(reply, 429, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
@@ -1487,9 +1538,15 @@ export class OIDCService {
 		}
 
 		private async resolveClient(clientId: string, emailAuthentication = false): Promise<OIDCClient | null> {
-				if (emailAuthentication && !this.options.clients) {
+				try {
+						await resolveRegisteredClient(clientId, this.clientAuthority);
+				} catch (error) {
+						if (error instanceof VerificationError) return null;
+						throw error;
+				}
+				if (!this.options.clients) {
 						const persisted = await this.oidcClients.findByClientId(clientId);
-						if (persisted) return this.toOIDCClient(persisted);
+						return persisted ? this.toOIDCClient(persisted) : null;
 				}
 				const clients = await this.configureClients();
 				const client = clients.find((candidate) => {

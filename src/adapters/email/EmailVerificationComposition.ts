@@ -106,7 +106,7 @@ export function interactiveEmailAuthentication(authentication: EmailAuthenticati
 					.map(subject => [subject.id, subject])).values()];
 				if (claimed.length === 0) {
 					mode = "REGISTRATION";
-				} else if (claimed.length !== 1 || !isEligibleEmailSubject(claimed[0], normalizedEmail, authorized.context.applicationId)) {
+				} else if (claimed.length !== 1 || !isEligibleEmailSubject(claimed[0], normalizedEmail)) {
 					mode = "INELIGIBLE";
 				}
 			}
@@ -135,11 +135,9 @@ export function interactiveEmailAuthentication(authentication: EmailAuthenticati
 	};
 }
 
-function isEligibleEmailSubject(subject: IdentitySubject | undefined,
-	email: string, applicationId: string | null): subject is IdentitySubject {
-	return Boolean(applicationId && subject && subject.primaryProvider === "HAPI_EMAIL" && subject.primaryProviderSubject === email &&
-		subject.email === email && subject.status === "ACTIVE" && subject.emailVerified === true &&
-		subject.applicationId === applicationId);
+function isEligibleEmailSubject(subject: IdentitySubject | undefined, email: string): subject is IdentitySubject {
+	return Boolean(subject && subject.primaryProvider === "HAPI_EMAIL" && subject.primaryProviderSubject === email &&
+		subject.email === email && subject.status === "ACTIVE" && subject.emailVerified === true);
 }
 
 async function verifyInteractiveEmail(authentication: EmailAuthenticationService,
@@ -153,7 +151,7 @@ async function verifyInteractiveEmail(authentication: EmailAuthenticationService
 			const outcome = await options.registration.complete({ context: authorized.context, verificationId: proof.verificationId });
 			if (outcome.idempotentReplay) throw new EmailAuthenticationError();
 			const subject = await options.subjects.findByOidcSubject(outcome.subject);
-			if (!isEligibleEmailSubject(subject, outcome.email, authorized.context.applicationId)) throw new EmailAuthenticationError();
+			if (!isEligibleEmailSubject(subject, outcome.email)) throw new EmailAuthenticationError();
 			return {
 				mode: "REGISTRATION" as const,
 				principal: {

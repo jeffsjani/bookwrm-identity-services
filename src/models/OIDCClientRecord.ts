@@ -12,6 +12,7 @@ export type OIDCClientRecord = {
 		responseTypes: string[];
 		tokenEndpointAuthMethod: OIDCClientTokenEndpointAuthMethod;
 		requirePkce: boolean;
+		status: "active" | "suspended";
 		createdAt: string;
 		updatedAt: string;
 };

@@ -30,7 +30,7 @@ describe.skipIf(!databaseUrl)("H2 durable PostgreSQL semantics", () => {
 		await repository.ensureSchema();
 		await repository.ensureSchema();
 		await pool.query("INSERT INTO tenants VALUES ($1, 'H2 test', $2, 'active', NOW(), NOW())", [tenantId, `h2-${tenantId}`]);
-		await pool.query("INSERT INTO applications VALUES ($1, $2, 'H2 test', 'h2', 'active', NOW(), NOW())", [applicationId, tenantId]);
+		await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key) VALUES ($1::uuid, $2, 'H2 test', 'h2', 'active', NOW(), NOW(),$1::text)", [applicationId, tenantId]);
 		await pool.query("INSERT INTO identity_subjects (id, oidc_subject, primary_provider, primary_provider_subject, email, email_verified, status, created_at, updated_at) VALUES ($1, $2, 'PrivateID', $3, 'existing@example.com', false, 'ACTIVE', NOW(), NOW())", [subjectId, randomUUID(), randomUUID()]);
 	});
 	afterAll(async () => {

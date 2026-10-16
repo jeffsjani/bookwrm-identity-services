@@ -42,11 +42,10 @@ export class PostgresEmailAuthenticationRepository implements EmailAuthenticatio
 			authority.clientId, challengeId, type, outcome]);
 	}
 
-	private eligible(subject: IdentitySubject | undefined, email: string, applicationId: string | null): subject is IdentitySubject {
+	private eligible(subject: IdentitySubject | undefined, email: string): subject is IdentitySubject {
 		return Boolean(subject && subject.primaryProvider === "HAPI_EMAIL" &&
 			subject.primaryProviderSubject === email && subject.email === email &&
-			subject.status === "ACTIVE" && subject.emailVerified === true &&
-			subject.applicationId === applicationId);
+			subject.status === "ACTIVE" && subject.emailVerified === true);
 	}
 
 	async establish(authority: EmailAuthenticationContext, verificationId: string) {
@@ -79,7 +78,7 @@ export class PostgresEmailAuthenticationRepository implements EmailAuthenticatio
 			}
 			await client.query(`UPDATE verification_challenges SET status='CONSUMED',
 				consumed_at=$2,updated_at=$2 WHERE id=$1`, [verificationId, now]);
-			if (!this.eligible(subject, challenge.destination_normalized, context.applicationId)) {
+			if (!this.eligible(subject, challenge.destination_normalized)) {
 				await this.writeAudit(client, authority, "EMAIL_AUTHENTICATION_FAILED", verificationId,
 					subject ? "IDENTITY_NOT_ELIGIBLE" : "NO_ELIGIBLE_IDENTITY");
 				await client.query("COMMIT");
@@ -131,7 +130,7 @@ export class PostgresEmailAuthenticationRepository implements EmailAuthenticatio
 				throw new EmailAuthenticationError();
 			}
 			await client.query("UPDATE email_authentication_results SET consumed_at=$2 WHERE token_hash=$1", [digest(token), now]);
-			if (!this.eligible(subject, result.destination_normalized, context.applicationId)) {
+			if (!this.eligible(subject, result.destination_normalized)) {
 				await this.writeAudit(client, authority, "EMAIL_AUTHENTICATION_FAILED",
 					result.verification_challenge_id, "IDENTITY_NOT_ELIGIBLE_AT_HANDOFF");
 				await client.query("COMMIT");

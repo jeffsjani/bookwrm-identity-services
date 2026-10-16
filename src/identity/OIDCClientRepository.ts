@@ -11,6 +11,7 @@ export type UpsertOIDCClientInput = {
 		responseTypes: string[];
 		tokenEndpointAuthMethod: OIDCClientTokenEndpointAuthMethod;
 		requirePkce: boolean;
+		status?: OIDCClientRecord["status"];
 };
 
 // Storage contract for OIDCClientRecord. Replaces the hardcoded Base44 client configuration

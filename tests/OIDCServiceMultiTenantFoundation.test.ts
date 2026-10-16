@@ -8,6 +8,7 @@ import { OIDCService } from "../src/oidc/OIDCService.js";
 import { InMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClientRepository.js";
 import { BOOKWRM_APPLICATION_ID } from "../src/identity/WellKnownIdentities.js";
 import { ensureBookwrmApplicationSeed } from "../src/adapters/base44/Base44ApplicationSeed.js";
+import { inMemoryApplicationRepository } from "../src/identity/InMemoryApplicationRepository.js";
 import type {
 		AuthenticationProvider,
 		AuthenticatedUser,
@@ -53,6 +54,8 @@ describe("HAPI ID H1 - OIDCService AuthenticationProvider DI", () => {
 				const mockProvider = new MockAuthenticationProvider();
 				const oidcClients = new InMemoryOIDCClientRepository();
 				await ensureBookwrmApplicationSeed({ oidcClients });
+				const application = (await inMemoryApplicationRepository.findById(BOOKWRM_APPLICATION_ID))!;
+				await inMemoryApplicationRepository.upsert({ ...application, allowedAuthenticationMethods: ["PRIVATEID_FACE"] });
 				const service = new OIDCService({ authenticationProvider: mockProvider, oidcClients });
 				const app = await buildAppWithService(service);
 

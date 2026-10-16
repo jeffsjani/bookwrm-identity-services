@@ -79,12 +79,17 @@ export async function ensureBookwrmApplicationSeed(
 				status: "active"
 		});
 
+		const currentApplication = await applications.findById(BOOKWRM_APPLICATION_ID);
 		const application = await applications.upsert({
 				id: BOOKWRM_APPLICATION_ID,
 				tenantId: tenant.id,
 				name: "Bookwrm Base44",
 				slug: "bookwrm-base44",
-				status: "active"
+				applicationKey: "BOOKWRM",
+				allowedAuthenticationMethods: ["HAPI_EMAIL"],
+				allowedIdentityProviders: [],
+				faceSetupEnabled: true,
+				status: currentApplication?.status ?? "active"
 		});
 
 		const [legacyClient] = registerBase44OIDCClient();
@@ -106,6 +111,17 @@ export async function ensureBookwrmApplicationSeed(
 		}
 
 		const backfilledIdentitySubjects = await backfillIdentitySubjects(application.id, deps.postgresClient);
+		if (configuration.getIdentityRegistryDriver() === "postgres") {
+				const client = deps.postgresClient ?? getPostgresPool();
+				await client.query(`WITH migrated AS (INSERT INTO application_account_links
+					(id,identity_subject_id,application_id,external_account_id,status,created_at,updated_at)
+					SELECT id,identity_subject_id,$1,external_user_id,status,linked_at,updated_at
+					FROM identity_account_links ON CONFLICT (id) DO NOTHING RETURNING *)
+					INSERT INTO application_account_link_audit
+						(id,identity_subject_id,application_id,external_account_id,authority,request_id,result)
+					SELECT id,identity_subject_id,application_id,external_account_id,'LEGACY_BOOKWRM_MIGRATION',id::text,'migrated'
+					FROM migrated`, [application.id]);
+		}
 
 		return {
 				tenantId: tenant.id,

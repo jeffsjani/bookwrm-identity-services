@@ -56,11 +56,13 @@ export class PostgresFaceEnrollmentRepository {
 	private async activeContext(client: pg.PoolClient, subjectId: string, clientId: string): Promise<Context | undefined> {
 		const result = await client.query<Context>(`SELECT i.id AS identity_subject_id,
 			t.id AS tenant_id,a.id AS application_id,c.client_id FROM identity_subjects i
-			JOIN applications a ON a.id=i.application_id JOIN tenants t ON t.id=a.tenant_id
-			JOIN oidc_clients c ON c.application_id=a.id
+			JOIN oidc_clients c ON c.client_id=$2
+			JOIN applications a ON a.id=c.application_id JOIN tenants t ON t.id=a.tenant_id
 			WHERE i.id=$1 AND c.client_id=$2 AND i.status='ACTIVE'
 			AND i.primary_provider='HAPI_EMAIL' AND i.email_verified=true
 			AND i.email=i.primary_provider_subject AND a.status='active' AND t.status='active'
+			AND c.status='active' AND a.face_setup_enabled=true
+			AND 'HAPI_EMAIL'=ANY(a.allowed_authentication_methods)
 			AND c.token_endpoint_auth_method<>'none' FOR SHARE OF a,t,c`, [subjectId, clientId]);
 		return result.rows[0];
 	}

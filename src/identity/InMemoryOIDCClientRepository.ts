@@ -37,6 +37,7 @@ export class InMemoryOIDCClientRepository implements OIDCClientRepository {
 						responseTypes: [...input.responseTypes],
 						tokenEndpointAuthMethod: input.tokenEndpointAuthMethod,
 						requirePkce: input.requirePkce,
+						status: input.status ?? existing?.status ?? "active",
 						createdAt: existing?.createdAt ?? now,
 						updatedAt: now
 				};

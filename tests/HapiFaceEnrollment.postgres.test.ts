@@ -127,8 +127,9 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		await repository.ensureSchema();
 		for (const id of [tenantId, otherTenant]) await pool.query("INSERT INTO tenants VALUES ($1,'H5',$2,'active',NOW(),NOW())", [id, id]);
 		for (const [id, tenant] of [[applicationId, tenantId], [otherApplication, otherTenant]]) {
-			await pool.query("INSERT INTO applications VALUES ($1,$2,'H5',$3,'active',NOW(),NOW())", [id, tenant, id]);
+			await pool.query("INSERT INTO applications (id,tenant_id,name,slug,status,created_at,updated_at,application_key,face_setup_enabled,allowed_authentication_methods) VALUES ($1::uuid,$2,'H5',$3,'active',NOW(),NOW(),$1::text,true,ARRAY['HAPI_EMAIL','PRIVATEID_FACE'])", [id, tenant, id]);
 		}
+		await pool.query("UPDATE applications SET face_setup_enabled=false WHERE id=$1", [otherApplication]);
 		for (const [id, application] of [[clientId, applicationId], [otherClientId, otherApplication]]) {
 			await h1.clients.upsert({ id: randomUUID(), applicationId: application, clientId: id,
 				clientSecret: "fixture-secret", redirectUris: ["https://rp.example/callback"], scopes: ["openid", "email"],
@@ -481,13 +482,19 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 		}
 		expect(createSession).not.toHaveBeenCalled();
 	});
-	it("revalidates identity and tenant/application binding at completion", async () => {
-		for (const mutation of ["status='DISABLED'", "email_verified=false", "application_id='" + otherApplication + "'"]) {
+	it("revalidates identity eligibility at completion", async () => {
+		for (const mutation of ["status='DISABLED'", "email_verified=false"]) {
 			const subject = await seed(), flow = await pending(subject.oidcSubject);
 			await pool.query(`UPDATE identity_subjects SET ${mutation} WHERE id=$1`, [subject.id]);
 			expect(await complete(flow)).toMatchObject({ statusCode: 409 });
 			expect(await authenticators.findByUser(subject.id)).toHaveLength(0);
 		}
+	});
+	it("does not use legacy application provenance as Face authenticator ownership", async () => {
+		const subject = await seed(), flow = await pending(subject.oidcSubject);
+		await pool.query("UPDATE identity_subjects SET application_id=$2 WHERE id=$1", [subject.id, otherApplication]);
+		expect(await complete(flow)).toMatchObject({ statusCode: 200 });
+		expect((await authenticators.findByUser(subject.id))[0]?.userId).toBe(subject.id);
 	});
 	it("rejects suspended tenant or application authority at completion without a Face attachment", async () => {
 		for (const [table, id] of [["tenants", tenantId], ["applications", applicationId]] as const) {
@@ -821,7 +828,9 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			grant_types: ["authorization_code"], response_types: ["code"], scope: "openid email",
 			token_endpoint_auth_method: "client_secret_basic", require_pkce: true
 		};
-		const oidc = new OIDCService({ authenticationProvider: new PrivateIDAuthenticationProvider(), clients: [client], oidcClients: h1.clients });
+		const oidc = new OIDCService({ authenticationProvider: new PrivateIDAuthenticationProvider(), clients: [client], oidcClients: h1.clients, clientAuthority: h1 });
+		const { oidcService } = await import("../src/oidc/oidcServiceInstance.js");
+		const resume = vi.spyOn(oidcService, "resumePendingAuthorization").mockImplementation(id => oidc.resumePendingAuthorization(id));
 		oidc.configureEmailAuthentication({ async consume(request, result, expectedClient) {
 			const authority = await authorizeH1Client(request, h1);
 			expect(authority.clientId).toBe(expectedClient);
@@ -917,7 +926,7 @@ describe.skipIf(!databaseUrl)("H5 isolated PostgreSQL attachment, concurrency an
 			expect((await authenticators.findByUser(subject.id))).toHaveLength(1);
 		} finally {
 			await app.close(); lookup.mockRestore(); resolveLogin.mockRestore(); base44.mockRestore();
-			createIdentity.mockRestore(); h3Calls.mockRestore(); diagnostics.mockRestore();
+			createIdentity.mockRestore(); h3Calls.mockRestore(); diagnostics.mockRestore(); resume.mockRestore();
 		}
 	});
 });

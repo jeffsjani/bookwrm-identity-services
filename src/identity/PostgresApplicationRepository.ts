@@ -10,6 +10,11 @@ type ApplicationRow = {
 		status: string;
 		created_at: string | Date;
 		updated_at: string | Date;
+		application_key: string;
+		allowed_authentication_methods: Application["allowedAuthenticationMethods"];
+		allowed_identity_providers: string[];
+		face_setup_enabled: boolean;
+		presentation: Application["presentation"];
 };
 
 function toIsoString(value: string | Date): string {
@@ -23,6 +28,11 @@ function toApplication(row: ApplicationRow): Application {
 				name: row.name,
 				slug: row.slug,
 				status: row.status as ApplicationStatus,
+				applicationKey: row.application_key,
+				allowedAuthenticationMethods: row.allowed_authentication_methods,
+				allowedIdentityProviders: row.allowed_identity_providers,
+				faceSetupEnabled: row.face_setup_enabled,
+				presentation: row.presentation,
 				createdAt: toIsoString(row.created_at),
 				updatedAt: toIsoString(row.updated_at)
 		};
@@ -63,11 +73,20 @@ export class PostgresApplicationRepository implements ApplicationRepository {
 		async upsert(input: UpsertApplicationInput): Promise<Application> {
 				const now = new Date();
 				const result = await this.client.query<ApplicationRow>(
-						`INSERT INTO applications (id, tenant_id, name, slug, status, created_at, updated_at)
-						 VALUES ($1, $2, $3, $4, $5, $6, $6)
-						 ON CONFLICT (id) DO UPDATE SET tenant_id = $2, name = $3, slug = $4, status = $5, updated_at = $6
+						`INSERT INTO applications (id, tenant_id, name, slug, status, created_at, updated_at,
+						 application_key, allowed_authentication_methods, allowed_identity_providers, face_setup_enabled, presentation)
+						 VALUES ($1::uuid, $2, $3, $4, $5, $6, $6, COALESCE($7,$1::text),
+						 COALESCE($8,ARRAY['HAPI_EMAIL']),COALESCE($9,ARRAY[]::text[]),COALESCE($10,false),COALESCE($11,'{}'::jsonb))
+						 ON CONFLICT (id) DO UPDATE SET tenant_id = $2, name = $3, slug = $4, status = $5, updated_at = $6,
+						 application_key=COALESCE($7,applications.application_key),
+						 allowed_authentication_methods=COALESCE($8,applications.allowed_authentication_methods),
+						 allowed_identity_providers=COALESCE($9,applications.allowed_identity_providers),
+						 face_setup_enabled=COALESCE($10,applications.face_setup_enabled),
+						 presentation=COALESCE($11,applications.presentation)
 						 RETURNING *`,
-						[input.id, input.tenantId, input.name, input.slug, input.status, now]
+						[input.id, input.tenantId, input.name, input.slug, input.status, now,
+						 input.applicationKey ?? null, input.allowedAuthenticationMethods ?? null,
+						 input.allowedIdentityProviders ?? null, input.faceSetupEnabled ?? null, input.presentation ?? null]
 				);
 
 				return toApplication(result.rows[0]);

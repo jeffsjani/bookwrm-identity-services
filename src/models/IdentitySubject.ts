@@ -15,6 +15,7 @@ export type IdentitySubject = {
 		id: string;
 		oidcSubject: string;
 		// HAPI ID H1: scopes this subject to an Application (undefined only for pre-H1 rows pending backfill).
+		// Legacy creation provenance; never application membership or authentication authority.
 		applicationId?: string;
 		primaryProvider: IdentityProvider;
 		primaryProviderSubject: string;
