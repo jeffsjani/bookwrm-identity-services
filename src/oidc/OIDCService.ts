@@ -46,6 +46,11 @@ import {
 import { OIDCRateLimiter } from "./infrastructure/OIDCRateLimiter.js";
 import { getRedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { registerOidcRoutes } from "./routes.js";
+import {
+		RefreshRotationError,
+		RefreshTokenRotationService,
+		type RefreshClientProfile
+} from "./refresh/RefreshTokenRotationService.js";
 import type { OIDCLogEntry } from "./types.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
@@ -79,6 +84,7 @@ export type OIDCServiceOptions = {
 		authenticationProvider: AuthenticationProvider;
 		oidcClients?: OIDCClientRepository;
 		clientAuthority?: H1ClientAuthority;
+		refreshTokenRotation?: RefreshTokenRotationService;
 };
 
 type AuthorizationQuery = {
@@ -113,6 +119,7 @@ type TokenRequestBody = {
 		client_id?: string;
 		client_secret?: string;
 		code_verifier?: string;
+		refresh_token?: string;
 };
 
 type OIDCMetrics = {
@@ -191,6 +198,8 @@ export class OIDCService {
 		private readonly interactions: AuthorizationInteractionStore;
 		private readonly keyRotationService: OIDCKeyRotationService;
 		private readonly providerAdapter = new RedisOIDCProviderAdapter();
+		// HAPI ID V2-C: constructed lazily and consulted only when HAPI_REFRESH_GRANT_ENABLED is on.
+		private refreshRotation?: RefreshTokenRotationService;
 		private readonly metrics: OIDCMetrics = {
 				authorizationRequests: 0,
 				tokensIssued: 0,
@@ -216,6 +225,7 @@ export class OIDCService {
 				this.rateLimiter = new OIDCRateLimiter();
 				this.keyRotationService = new OIDCKeyRotationService();
 				this.interactions = new AuthorizationInteractionStore();
+				this.refreshRotation = options.refreshTokenRotation;
 		}
 
 		configureEmailAuthentication(handoff: EmailOIDCHandoff): void {
@@ -609,12 +619,30 @@ export class OIDCService {
 										userId: ""
 								});
 
+								// HAPI ID V2-C: grant_type=refresh_token exists ONLY behind the default-off
+								// feature gate. With the gate off, the rejection below is byte-identical to V2-B.
+								const refreshGrantEnabled = featureFlags.isRefreshGrantEnabled();
+								if (grantType === "refresh_token" && refreshGrantEnabled) {
+										const result = await this.handleRefreshTokenGrant({
+												refreshToken: body.refresh_token?.trim(),
+												clientId,
+												clientSecret,
+												reply
+										});
+										error = result.error ?? "";
+										user = result.user ?? "";
+										return result.body;
+								}
+
 								if (grantType !== "authorization_code") {
+										const supported = refreshGrantEnabled
+												? "Only grant_type=authorization_code or refresh_token is supported"
+												: "Only grant_type=authorization_code is supported";
 										reply.code(400);
-										error = "Only grant_type=authorization_code is supported";
+										error = supported;
 										return {
 												error: "unsupported_grant_type",
-												error_description: "Only grant_type=authorization_code is supported"
+												error_description: supported
 										};
 								}
 
@@ -753,14 +781,42 @@ export class OIDCService {
 
 							const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
-							// V2-B interim refresh-token policy: no refresh grant is implemented yet, so a
-							// long-lived refresh token is only issued when the client's registration explicitly
-							// includes the refresh_token grant (preserving legacy Bookwrm behavior). Newly
-							// registered clients -- e.g. future native public clients -- receive none until the
-							// rotating refresh-token family design is implemented.
+							// V2-B interim refresh-token policy: a refresh token is only issued when the
+							// client's registration explicitly includes the refresh_token grant (preserving
+							// legacy Bookwrm behavior). V2-C: when the default-off refresh grant gate is ON,
+							// issuance moves to rotating refresh-token families (PostgreSQL, hashed, one-time
+							// use); with the gate OFF the legacy Redis-stored token behavior is unchanged.
 							const issueRefreshToken = this.clientAllowsRefreshTokenGrant(client);
 							const accessToken = this.createOpaqueToken();
-							const refreshToken = issueRefreshToken ? this.createOpaqueToken() : undefined;
+							let refreshToken: string | undefined;
+							let legacyRefreshToken: string | undefined;
+							if (issueRefreshToken) {
+									if (featureFlags.isRefreshGrantEnabled()) {
+											const subjectRecord = await identityRegistry.findByOidcSubject(codeRecord.userSub);
+											if (subjectRecord) {
+													const issued = await this.getRefreshRotation().issueFamily({
+															identitySubjectId: subjectRecord.id,
+															clientId,
+															scope: codeRecord.scope,
+															clientProfile: this.refreshClientProfile(client),
+															...(codeRecord.authenticationMethod ? {
+																	authenticationMethod: codeRecord.authenticationMethod,
+																	...(codeRecord.authenticatedAt
+																			? { authenticatedAt: codeRecord.authenticatedAt } : {})
+															} : {})
+													});
+													refreshToken = issued.refreshToken;
+											} else {
+													// No registry subject to anchor a family to: keep the legacy contract
+													// rather than silently dropping the client's refresh token.
+													legacyRefreshToken = this.createOpaqueToken();
+													refreshToken = legacyRefreshToken;
+											}
+									} else {
+											legacyRefreshToken = this.createOpaqueToken();
+											refreshToken = legacyRefreshToken;
+									}
+							}
 							await this.storeAccessToken(accessToken, {
 									sub: claims.sub,
 									clientId,
@@ -771,8 +827,8 @@ export class OIDCService {
 										authenticatedAt: codeRecord.authenticatedAt
 									} : {})
 							});
-							if (refreshToken) {
-									await this.storeRefreshToken(refreshToken, {
+							if (legacyRefreshToken) {
+									await this.storeRefreshToken(legacyRefreshToken, {
 											userId: codeRecord.userId,
 											clientId,
 											scope: codeRecord.scope
@@ -844,7 +900,10 @@ export class OIDCService {
 								"client_secret_post",
 								"none"
 						],
-						grant_types_supported: ["authorization_code"],
+						// HAPI ID V2-C: refresh_token is advertised only while the default-off gate is on.
+						grant_types_supported: featureFlags.isRefreshGrantEnabled()
+								? ["authorization_code", "refresh_token"]
+								: ["authorization_code"],
 						claims_supported: claimsSupported,
 						code_challenge_methods_supported: ["S256"]
 				};
@@ -1638,6 +1697,142 @@ export class OIDCService {
 				}
 
 				return grants.includes("refresh_token");
+		}
+
+		// HAPI ID V2-C: lifetime profile per the approved family design -- public (secretless)
+		// clients get native lifetimes, confidential clients the shorter web lifetimes.
+		private refreshClientProfile(client: OIDCClient): RefreshClientProfile {
+				return this.clientTokenEndpointAuthMethod(client) === "none"
+						? "native_public"
+						: "confidential_web";
+		}
+
+		private getRefreshRotation(): RefreshTokenRotationService {
+				if (!this.refreshRotation) {
+						this.refreshRotation = new RefreshTokenRotationService();
+				}
+				return this.refreshRotation;
+		}
+
+		// HAPI ID V2-C grant_type=refresh_token handler. Reached ONLY when the default-off
+		// HAPI_REFRESH_GRANT_ENABLED gate is on. Client authentication mirrors the
+		// authorization_code path exactly: confidential clients present their secret, public
+		// clients are bound by exact client_id match against the family.
+		private async handleRefreshTokenGrant(input: {
+				refreshToken?: string;
+				clientId?: string;
+				clientSecret?: string;
+				reply: FastifyReply;
+		}): Promise<{ body: Record<string, unknown>; error?: string; user?: string }> {
+				const { reply } = input;
+
+				if (!input.refreshToken) {
+						reply.code(400);
+						return {
+								body: { error: "invalid_request", error_description: "refresh_token is required" },
+								error: "refresh_token is required"
+						};
+				}
+				if (!input.clientId) {
+						reply.code(400);
+						return {
+								body: { error: "invalid_client", error_description: "Client authentication failed: no client_id supplied" },
+								error: "Client authentication failed: no client_id supplied"
+						};
+				}
+
+				const client = await this.resolveClient(input.clientId);
+				if (!client) {
+						reply.code(400);
+						return { body: { error: "invalid_client", error_description: "Unknown client" }, error: "Unknown client" };
+				}
+				// Client-specific refresh eligibility: the persisted registration must include the grant.
+				if (!this.clientAllowsRefreshTokenGrant(client)) {
+						reply.code(400);
+						return {
+								body: { error: "unauthorized_client", error_description: "Client is not authorized for grant_type=refresh_token" },
+								error: "Client is not authorized for grant_type=refresh_token"
+						};
+				}
+				if (!this.hasValidClientAuthenticationConfiguration(client)) {
+						reply.code(400);
+						return {
+								body: { error: "invalid_client", error_description: "Client authentication metadata is invalid" },
+								error: "Client authentication metadata is invalid"
+						};
+				}
+				const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
+				const configuredClientSecret =
+						typeof client.client_secret === "string" ? client.client_secret : "";
+				if (
+						tokenEndpointAuthMethod !== "none" &&
+						(!input.clientSecret || !configuredClientSecret.trim() ||
+								!constantTimeStringEqual(configuredClientSecret, input.clientSecret))
+				) {
+						reply.code(400);
+						return {
+								body: { error: "invalid_client", error_description: "client_secret is invalid" },
+								error: "client_secret is invalid"
+						};
+				}
+
+				let rotated;
+				try {
+						rotated = await this.getRefreshRotation().rotate({
+								refreshToken: input.refreshToken,
+								clientId: input.clientId,
+								clientProfile: this.refreshClientProfile(client)
+						});
+				} catch (err) {
+						if (err instanceof RefreshRotationError) {
+								// Every rotation failure maps to invalid_grant (RFC 6749 §5.2); the typed code is
+								// logged, never echoed with token material. Replay has already revoked the family.
+								reply.code(400);
+								return {
+										body: { error: "invalid_grant", error_description: "Refresh token is invalid, expired, or revoked" },
+										error: err.code
+								};
+						}
+						throw err;
+				}
+
+				// Subject lifecycle binding: a locked/disabled/retired subject terminates the family.
+				const subjectRecord = await identityRegistry.findById(rotated.family.identitySubjectId);
+				if (!subjectRecord || subjectRecord.status !== "ACTIVE") {
+						await this.getRefreshRotation().revokeFamily(rotated.family.id, "subject_locked");
+						reply.code(400);
+						return {
+								body: { error: "invalid_grant", error_description: "Refresh token is invalid, expired, or revoked" },
+								error: "subject_not_active"
+						};
+				}
+
+				const accessToken = this.createOpaqueToken();
+				await this.storeAccessToken(accessToken, {
+						sub: subjectRecord.oidcSubject,
+						clientId: input.clientId,
+						// Refresh exchanges carry no authentication-request nonce (OIDC Core §12).
+						nonce: "",
+						scope: rotated.family.scope,
+						...(rotated.family.authenticationMethod ? {
+								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE",
+								...(rotated.family.authenticatedAt
+										? { authenticatedAt: rotated.family.authenticatedAt } : {})
+						} : {})
+				});
+
+				reply.code(200);
+				this.metrics.tokensIssued += 1;
+				return {
+						body: {
+								token_type: "Bearer",
+								expires_in: 300,
+								access_token: accessToken,
+								refresh_token: rotated.refreshToken,
+								scope: rotated.family.scope
+						},
+						user: subjectRecord.id
+				};
 		}
 
 		private clientRequiresPkce(client: OIDCClient): boolean {

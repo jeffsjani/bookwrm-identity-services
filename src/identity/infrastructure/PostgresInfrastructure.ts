@@ -17,9 +17,11 @@ export interface PostgresClient {
 let pool: pg.Pool | undefined;
 let schemaEnsured = false;
 
-// Current Identity Registry schema version (Task 3, Sprint 5.1; bumped by HAPI ID V2-B).
-export const CURRENT_SCHEMA_VERSION = "1.1.0";
-export const CURRENT_SCHEMA_DESCRIPTION = "Universal identity federation foundation (V2-B)";
+// Current Identity Registry schema version (Task 3, Sprint 5.1; bumped by HAPI ID V2-B, V2-C).
+export const CURRENT_SCHEMA_VERSION = "1.2.0";
+export const CURRENT_SCHEMA_DESCRIPTION = "Persistent HAPI sessions and refresh-token families (V2-C)";
+const V2B_SCHEMA_VERSION = "1.1.0";
+const V2B_SCHEMA_DESCRIPTION = "Universal identity federation foundation (V2-B)";
 const INITIAL_SCHEMA_VERSION = "1.0.0";
 const INITIAL_SCHEMA_DESCRIPTION = "Initial Identity Registry";
 
@@ -49,7 +51,8 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 
 		const schemaDirectory = join(dirname(fileURLToPath(import.meta.url)), "..");
 		// Ordered, additive-only DDL files; each must remain individually idempotent.
-		for (const file of ["schema.sql", "schema-federation.sql"]) {
+		// schema-sessions.sql precedes schema-refresh.sql: refresh_token_families references hapi_sessions.
+		for (const file of ["schema.sql", "schema-federation.sql", "schema-sessions.sql", "schema-refresh.sql"]) {
 				const ddl = readFileSync(join(schemaDirectory, file), "utf8");
 				await client.query(ddl);
 		}
@@ -57,6 +60,7 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 		// Record each version exactly once; never duplicated on subsequent startups.
 		for (const [version, description] of [
 				[INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_DESCRIPTION],
+				[V2B_SCHEMA_VERSION, V2B_SCHEMA_DESCRIPTION],
 				[CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION]
 		]) {
 				await client.query(

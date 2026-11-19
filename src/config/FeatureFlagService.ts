@@ -24,6 +24,18 @@ export class FeatureFlagService {
 		isMetricsEnabled(): boolean {
 				return configuration.getFeatureFlag("METRICS_ENABLED", true);
 		}
+
+		// HAPI ID V2-C: persistent server-side HAPI sessions. Default OFF -- existing Bookwrm
+		// authentication behavior is unchanged until this is explicitly enabled.
+		isPersistentSessionsEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_PERSISTENT_SESSIONS_ENABLED", false);
+		}
+
+		// HAPI ID V2-C: rotating refresh-token families + grant_type=refresh_token. Default OFF --
+		// the refresh grant is never active in production without an explicit opt-in.
+		isRefreshGrantEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_REFRESH_GRANT_ENABLED", false);
+		}
 }
 
 export const featureFlags = new FeatureFlagService();
