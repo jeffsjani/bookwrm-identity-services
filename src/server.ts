@@ -11,6 +11,7 @@ import { registerIdentityAdminRoutes } from "./routes/identityAdmin.js";
 import { registerHapiIdentityBridgeRoutes } from "./routes/hapiIdentityBridge.js";
 import { registerPrivateIDEnrollmentRoutes } from "./routes/privateidEnrollment.js";
 import { registerIdentityAccountLinkRoutes } from "./routes/identityAccountLink.js";
+import { registerAccountAuthenticationMethodRoutes } from "./routes/accountAuthenticationMethods.js";
 import { registerAuthenticatorStatusRoutes } from "./routes/authenticatorStatus.js";
 import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
 import { ensureBookwrmApplicationSeed } from "./adapters/base44/Base44ApplicationSeed.js";
@@ -68,6 +69,8 @@ await registerIdentityAdminRoutes(app);
 await registerHapiIdentityBridgeRoutes(app);
 await registerPrivateIDEnrollmentRoutes(app);
 await registerIdentityAccountLinkRoutes(app);
+// HAPI ID V2-D: authenticated account-linking API (default-off HAPI_ACCOUNT_LINKING_API_ENABLED).
+await registerAccountAuthenticationMethodRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
 const emailAuthentication = await configureEmailVerification(app);
 const registration = await configureRegistration(app);

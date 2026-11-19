@@ -62,9 +62,30 @@ import {
 		type AuthorizationInteraction,
 		type AuthorizationInteractionBinding
 } from "./AuthorizationInteractionStore.js";
-import { chooserPage, codePage, emailPage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
+import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
 import type { InteractiveEmailAuthority, InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
+import {
+		APPLE_AUTHORIZATION_ENDPOINT,
+		APPLE_TOKEN_ENDPOINT,
+		FederatedAuthorizationError,
+		FederatedAuthorizationService,
+		GOOGLE_AUTHORIZATION_ENDPOINT,
+		GOOGLE_TOKEN_ENDPOINT
+} from "../identity/federation/FederatedAuthorizationService.js";
+import { FederationTransactionStore } from "../identity/federation/FederationTransactionStore.js";
+import {
+		federatedIdentityResolutionService,
+		type FederatedIdentityResolutionService
+} from "../identity/federation/FederatedIdentityResolutionService.js";
+import { AppleClientSecretService } from "../identity/federation/AppleClientSecretService.js";
+import { AppleIdentityTokenVerifier } from "../identity/federation/AppleIdentityTokenVerifier.js";
+import { GoogleIdentityTokenVerifier } from "../identity/federation/GoogleIdentityTokenVerifier.js";
+import type { VerifiedFederatedIdentity } from "../identity/federation/FederatedIdentityTypes.js";
+import { HAPI_SESSION_COOKIE, HapiSessionService } from "../identity/sessions/HapiSessionService.js";
+import type { HapiSession, HapiSessionAuthenticationMethod } from "../models/HapiSession.js";
+import type { IdentitySubject } from "../models/IdentitySubject.js";
+import type { AuthenticationMethod } from "../models/Application.js";
 
 // __Host- prefix: Secure, host-only, Path=/ — the interaction handle cannot be scoped to another domain.
 const UNIVERSAL_LOGIN_COOKIE = "__Host-hapi_login";
@@ -85,6 +106,16 @@ export type OIDCServiceOptions = {
 		oidcClients?: OIDCClientRepository;
 		clientAuthority?: H1ClientAuthority;
 		refreshTokenRotation?: RefreshTokenRotationService;
+		// HAPI ID V2-D: injectable federation collaborators (tests supply synthetic providers).
+		// Defaults are constructed lazily from configuration, and ONLY consulted when the
+		// corresponding default-off federation flags are enabled.
+		federation?: {
+				apple?: FederatedAuthorizationService;
+				google?: FederatedAuthorizationService;
+				transactions?: FederationTransactionStore;
+				resolution?: FederatedIdentityResolutionService;
+				sessions?: HapiSessionService;
+		};
 };
 
 type AuthorizationQuery = {
@@ -200,6 +231,12 @@ export class OIDCService {
 		private readonly providerAdapter = new RedisOIDCProviderAdapter();
 		// HAPI ID V2-C: constructed lazily and consulted only when HAPI_REFRESH_GRANT_ENABLED is on.
 		private refreshRotation?: RefreshTokenRotationService;
+		// HAPI ID V2-D: federation collaborators, consulted only behind their default-off flags.
+		private federationTransactions?: FederationTransactionStore;
+		private federationResolution?: FederatedIdentityResolutionService;
+		private sessionService?: HapiSessionService;
+		private appleFederation?: FederatedAuthorizationService;
+		private googleFederation?: FederatedAuthorizationService;
 		private readonly metrics: OIDCMetrics = {
 				authorizationRequests: 0,
 				tokensIssued: 0,
@@ -226,6 +263,11 @@ export class OIDCService {
 				this.keyRotationService = new OIDCKeyRotationService();
 				this.interactions = new AuthorizationInteractionStore();
 				this.refreshRotation = options.refreshTokenRotation;
+				this.federationTransactions = options.federation?.transactions;
+				this.federationResolution = options.federation?.resolution;
+				this.sessionService = options.federation?.sessions;
+				this.appleFederation = options.federation?.apple;
+				this.googleFederation = options.federation?.google;
 		}
 
 		configureEmailAuthentication(handoff: EmailOIDCHandoff): void {
@@ -691,7 +733,7 @@ export class OIDCService {
 
 								const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
 								await requireApplicationMethod(clientId, this.clientAuthority,
-										codeRecord.authenticationMethod === "HAPI_EMAIL" ? "HAPI_EMAIL" : "PRIVATEID_FACE");
+										this.applicationMethodFor(codeRecord.authenticationMethod));
 								if (!this.hasValidClientAuthenticationConfiguration(client)) {
 										reply.code(400);
 										error = "Client authentication metadata is invalid";
@@ -759,6 +801,17 @@ export class OIDCService {
 											subject.status !== "ACTIVE" || subject.emailVerified !== true ||
 											subject.email !== subject.primaryProviderSubject) {
 												error = "email_identity_not_eligible";
+												return reply.code(400).send({ error: "invalid_grant" });
+										}
+								}
+								// V2-D provider revocation handling: a federated code is redeemable only while the
+								// subject is ACTIVE and the provider identity is STILL actively linked -- an unlink
+								// or provider-side revocation between code issuance and redemption fails closed.
+								if (codeRecord.authenticationMethod === "APPLE" || codeRecord.authenticationMethod === "GOOGLE") {
+										const subject = await identityRegistry.findByOidcSubject(codeRecord.userSub);
+										if (!subject || subject.status !== "ACTIVE" ||
+											!(await this.getFederationResolution().isSubjectLinkActive(subject.id, codeRecord.authenticationMethod))) {
+												error = "federated_identity_not_eligible";
 												return reply.code(400).send({ error: "invalid_grant" });
 										}
 								}
@@ -1109,7 +1162,7 @@ export class OIDCService {
 
 		private async issueAuthorizationRedirect(user: AuthenticatedUser, context: PendingAuthorizationContext): Promise<string> {
 				await requireApplicationMethod(context.clientId, this.clientAuthority,
-						user.authenticationMethod === "HAPI_EMAIL" ? "HAPI_EMAIL" : "PRIVATEID_FACE");
+						this.applicationMethodFor(user.authenticationMethod));
 				const authorizationCode = this.createAuthorizationCode();
 
 				// Release Patch 6.1: the code carries only stable protocol fields (sub/client/nonce/scope/PKCE/expiration);
@@ -1137,6 +1190,14 @@ export class OIDCService {
 				}
 
 				return redirectTarget.toString();
+		}
+
+		// Maps a user authentication method onto the Application capability that must be enabled for
+		// it: HAPI email OTP, PrivateID face, or an external upstream provider (Apple/Google).
+		private applicationMethodFor(method?: AuthenticatedUser["authenticationMethod"]): AuthenticationMethod {
+				if (method === "HAPI_EMAIL") return "HAPI_EMAIL";
+				if (method === "APPLE" || method === "GOOGLE") return "EXTERNAL_OIDC";
+				return "PRIVATEID_FACE";
 		}
 
 		// Existing interactive PrivateID Face path, shared by flag-off GET /authorize and Universal Login "Continue with Face".
@@ -1269,9 +1330,13 @@ export class OIDCService {
 						? (error as { statusCode: number }).statusCode : 500;
 				const logLogin = (request: FastifyRequest, flow: string, interaction: AuthorizationInteraction | null,
 						startedAt: number, success: boolean, error: string, user = "") => {
+						const method = flow === "universal_login_face" ? "PRIVATEID_FACE"
+								: flow.includes("federated_apple") ? "APPLE"
+								: flow.includes("federated_google") ? "GOOGLE"
+								: "HAPI_EMAIL";
 						app.log.info({ event: "APPLICATION_AUTHENTICATION", applicationId: interaction?.binding?.applicationId,
 								clientId: interaction?.clientId, identitySubjectId: user || undefined, requestId: request.id,
-								authenticationMethod: flow === "universal_login_face" ? "PRIVATEID_FACE" : "HAPI_EMAIL",
+								authenticationMethod: method,
 								result: success ? "success" : "rejected", reasonCode: error || undefined }, "Application authentication result");
 						this.logOidcRequest(app, {
 						requestId: request.id, clientId: interaction?.clientId ?? "", flow, latency: Date.now() - startedAt,
@@ -1321,17 +1386,29 @@ export class OIDCService {
 						return { handle, interaction, body: (request.body ?? {}) as Record<string, unknown> };
 				};
 
+				// Chooser rendering shared by GET /login and federated-callback error recovery.
+				const renderChooser = async (request: FastifyRequest, reply: FastifyReply, interaction: AuthorizationInteraction,
+						status = 200, errorMessage?: string) => {
+						const registration = await resolveRegisteredClient(interaction.clientId, this.clientAuthority);
+						const externalAllowed = registration.application.allowedAuthenticationMethods.includes("EXTERNAL_OIDC");
+						const continuation = await this.detectSessionContinuation(request);
+						return send(reply, status, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
+								clientId: interaction.clientId,
+								faceAvailable: registration.application.allowedAuthenticationMethods.includes("PRIVATEID_FACE") ? undefined : false,
+								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive &&
+										registration.application.allowedAuthenticationMethods.includes("HAPI_EMAIL")),
+								appleAvailable: externalAllowed && Boolean(this.federatedService("APPLE")),
+								googleAvailable: externalAllowed && Boolean(this.federatedService("GOOGLE")),
+								...(continuation ? { continueAs: continuation.subject.email ?? continuation.subject.displayName ?? "your account" } : {}),
+								...(errorMessage !== undefined ? { error: errorMessage } : {}) }));
+				};
+
 				app.get("/login", async (request, reply) => {
 						const loaded = await load(request, reply, false, "GET /login");
 						if (!loaded) return reply;
 						const { interaction } = loaded;
 						if (!await this.interactionClientStillValid(interaction)) return expired(reply);
-						const registration = await resolveRegisteredClient(interaction.clientId, this.clientAuthority);
-						return send(reply, 200, chooserPage({ tenantName: interaction.binding?.tenantName, csrf: interaction.csrf,
-								clientId: interaction.clientId,
-								faceAvailable: registration.application.allowedAuthenticationMethods.includes("PRIVATEID_FACE") ? undefined : false,
-								emailAvailable: Boolean(interaction.binding && this.emailAuthentication?.interactive &&
-										registration.application.allowedAuthenticationMethods.includes("HAPI_EMAIL")) }));
+						return renderChooser(request, reply, interaction);
 				});
 
 				app.get("/login/email", async (request, reply) => {
@@ -1478,7 +1555,10 @@ export class OIDCService {
 								logLogin(request, "universal_login_email", consumed, startedAt, true, "", principal.id);
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_OIDC_REDIRECT_ISSUED", route: "POST /login/email/code",
 										clientId: interaction.clientId, correlationId, authenticationMethod: "email", httpStatus: 303 });
-								reply.header("Set-Cookie", this.interactionCookie(null));
+								const cookies = [this.interactionCookie(null)];
+								const sessionCookie = await this.maybeEstablishSession(request, principal, interaction.clientId);
+								if (sessionCookie) cookies.push(sessionCookie);
+								reply.header("Set-Cookie", cookies);
 								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
 						} catch (error) {
 								const failed = error instanceof VerificationError || error instanceof EmailAuthenticationError;
@@ -1539,6 +1619,274 @@ export class OIDCService {
 												error: "Too many attempts. Please wait a few minutes and try again." }));
 								}
 								app.log.error({ event: "UNIVERSAL_LOGIN_FACE_UNAVAILABLE" }, "Universal Login face start failed");
+								return unavailable(reply);
+						}
+				});
+
+				// ---- HAPI ID V2-D: HAPI-hosted Apple/Google federation (default-off flags) ----
+
+				// Launches the provider authorization request for a live interaction. state and nonce
+				// are server-generated inside the federation transaction; the browser only ever sees
+				// the final provider URL.
+				const startFederated = async (request: FastifyRequest, reply: FastifyReply,
+						provider: "APPLE" | "GOOGLE", routeLabel: string) => {
+						const startedAt = Date.now();
+						const flow = `universal_login_federated_${provider.toLowerCase()}_start`;
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true, routeLabel);
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								const service = this.federatedService(provider);
+								if (!service) {
+										logLogin(request, flow, interaction, startedAt, false, "federation_disabled");
+										return reply.code(404).send({ error: "not_found" });
+								}
+								if (!await this.interactionClientStillValid(interaction)) return expired(reply);
+								await requireApplicationMethod(interaction.clientId, this.clientAuthority, "EXTERNAL_OIDC");
+								const transaction = await this.getFederationTransactions().create({
+										purpose: "login", provider, interactionHandle: loaded.handle });
+								logLogin(request, flow, interaction, startedAt, true, "");
+								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer")
+										.redirect(service.buildAuthorizationUrl(transaction), 303);
+						} catch (error) {
+								if (error instanceof VerificationError) {
+										logLogin(request, flow, interaction, startedAt, false, "authentication_method_not_allowed");
+										return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								}
+								logLogin(request, flow, interaction, startedAt, false, statusOf(error) === 429 ? "rate_limited" : "unavailable");
+								if (interaction && statusOf(error) === 429) {
+										return renderChooser(request, reply, interaction, 429, "Too many attempts. Please wait a few minutes and try again.");
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_FEDERATED_UNAVAILABLE", provider }, "Federated login start failed");
+								return unavailable(reply);
+						}
+				};
+				app.post("/login/federated/apple", { bodyLimit: 4096 },
+						(request, reply) => startFederated(request, reply, "APPLE", "POST /login/federated/apple"));
+				app.post("/login/federated/google", { bodyLimit: 4096 },
+						(request, reply) => startFederated(request, reply, "GOOGLE", "POST /login/federated/google"));
+
+				// Provider callbacks. Identification happens EXCLUSIVELY by the single-use server-side
+				// state: the Apple callback is a cross-site form_post that carries no cookies, so no
+				// cookie or browser-supplied value ever participates in transaction resolution.
+				const handleFederatedCallback = async (request: FastifyRequest, reply: FastifyReply,
+						provider: "APPLE" | "GOOGLE",
+						params: { state?: string; code?: string; error?: string }) => {
+						const startedAt = Date.now();
+						const flow = `universal_login_federated_${provider.toLowerCase()}`;
+						if (!this.isUniversalLoginEnabled()) return reply.code(404).send({ error: "not_found" });
+						const service = this.federatedService(provider);
+						if (!service) return reply.code(404).send({ error: "not_found" });
+						try {
+								await this.rateLimiter.assertWithinLimits({ ip: request.ip, clientId: "", userId: "" });
+						} catch (error) {
+								if (statusOf(error) === 429) return send(reply, 429, messagePage({
+										title: "Too many attempts", message: "Please wait a few minutes and try again." }));
+								throw error;
+						}
+						let outcome;
+						try {
+								outcome = await service.handleCallback(params);
+						} catch (error) {
+								if (!(error instanceof FederatedAuthorizationError)) throw error;
+								logLogin(request, flow, null, startedAt, false, error.code);
+								// Recovery UX: when the failed transaction still maps to a live interaction, the
+								// user returns to their chooser with a friendly message instead of a dead end.
+								const handle = error.transaction?.interactionHandle;
+								const interaction = handle ? await this.interactions.find(handle) : null;
+								if (interaction && await this.interactionClientStillValid(interaction)) {
+										return renderChooser(request, reply, interaction, 400,
+												error.code === "provider_denied"
+														? "Sign-in was cancelled. Choose how you want to continue."
+														: "We couldn't complete that sign-in. Choose another way to continue.");
+								}
+								return expired(reply);
+						}
+						const { transaction, verified } = outcome;
+						if (transaction.purpose !== "login" || !transaction.interactionHandle) return expired(reply);
+						const interaction = await this.interactions.find(transaction.interactionHandle);
+						if (!interaction || !await this.interactionClientStillValid(interaction)) return expired(reply);
+						const resolution = await this.getFederationResolution().resolveForLogin(verified);
+						if (resolution.status === "subject_inactive") {
+								logLogin(request, flow, interaction, startedAt, false, "subject_inactive");
+								return send(reply, 403, messagePage({ title: "This account is unavailable",
+										message: "This sign-in is connected to an account that can't be used right now." }));
+						}
+						if (resolution.status === "unlinked") {
+								// Returning-user resolution found nothing: persist the SERVER-verified identity on
+								// the interaction and ask the user to choose explicitly. No account is created or
+								// linked yet, and matching emails never resolve this automatically.
+								const saved = await this.interactions.save(transaction.interactionHandle, { ...interaction, federation: {
+										provider,
+										providerIssuer: verified.providerIssuer,
+										providerSubject: verified.providerSubject,
+										audience: verified.audience,
+										...(verified.email !== undefined ? { email: verified.email } : {}),
+										...(verified.emailVerified !== undefined ? { emailVerified: verified.emailVerified } : {}),
+										isPrivateRelayEmail: verified.isPrivateRelayEmail,
+										evidenceReference: verified.evidenceReference,
+										verifiedAt: Date.now()
+								} });
+								if (!saved) return expired(reply);
+								logLogin(request, flow, interaction, startedAt, true, "account_choice_required");
+								return send(reply, 200, federatedAccountChoicePage({
+										tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+										csrf: interaction.csrf, provider,
+										...(verified.email !== undefined && !verified.isPrivateRelayEmail ? { email: verified.email } : {}) }));
+						}
+						try {
+								await requireApplicationMethod(interaction.clientId, this.clientAuthority, "EXTERNAL_OIDC");
+						} catch (error) {
+								if (error instanceof VerificationError) {
+										logLogin(request, flow, interaction, startedAt, false, "authentication_method_not_allowed");
+										return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								}
+								throw error;
+						}
+						const consumed = await this.interactions.consume(transaction.interactionHandle);
+						if (!consumed) {
+								logLogin(request, flow, interaction, startedAt, false, "interaction_replayed");
+								return expired(reply);
+						}
+						const principal = this.federatedPrincipal(resolution.subject, provider);
+						const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
+						const cookies = [this.interactionCookie(null)];
+						const sessionCookie = await this.maybeEstablishSession(request, principal, interaction.clientId);
+						if (sessionCookie) cookies.push(sessionCookie);
+						logLogin(request, flow, consumed, startedAt, true, "", principal.id);
+						reply.header("Set-Cookie", cookies);
+						return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
+				};
+				// Apple posts the result cross-site (response_mode=form_post, required with scopes).
+				app.post("/federation/apple/callback", { bodyLimit: 65536 }, async (request, reply) => {
+						const body = (request.body ?? {}) as Record<string, unknown>;
+						return handleFederatedCallback(request, reply, "APPLE", {
+								...(typeof body.state === "string" ? { state: body.state } : {}),
+								...(typeof body.code === "string" ? { code: body.code } : {}),
+								...(typeof body.error === "string" ? { error: body.error } : {})
+						});
+				});
+				app.get("/federation/google/callback", async (request, reply) => {
+						const query = (request.query ?? {}) as Record<string, unknown>;
+						return handleFederatedCallback(request, reply, "GOOGLE", {
+								...(typeof query.state === "string" ? { state: query.state } : {}),
+								...(typeof query.code === "string" ? { code: query.code } : {}),
+								...(typeof query.error === "string" ? { error: query.error } : {})
+						});
+				});
+
+				// Explicit account resolution for a verified-but-unlinked federated identity.
+				app.post("/login/federated/complete", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true, "POST /login/federated/complete");
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								const federation = interaction.federation;
+								if (!federation || !await this.interactionClientStillValid(interaction)) return expired(reply);
+								const flow = `universal_login_federated_${federation.provider.toLowerCase()}_register`;
+								const choice = loaded.body.choice;
+								if (choice === "email") {
+										// Explicit switch to the existing-account path: the pending federated
+										// identity is dropped; linking happens later via the authenticated API.
+										const { federation: _federation, ...rest } = interaction;
+										await this.interactions.save(loaded.handle, rest as AuthorizationInteraction);
+										return reply.header("Cache-Control", "no-store").redirect("/login/email", 303);
+								}
+								if (choice !== "create") {
+										return send(reply, 400, federatedAccountChoicePage({
+												tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+												csrf: interaction.csrf, provider: federation.provider,
+												error: "Choose whether to create a new account or sign in with email." }));
+								}
+								await requireApplicationMethod(interaction.clientId, this.clientAuthority, "EXTERNAL_OIDC");
+								const verified: VerifiedFederatedIdentity = {
+										provider: federation.provider,
+										providerIssuer: federation.providerIssuer,
+										providerSubject: federation.providerSubject,
+										audience: federation.audience,
+										...(federation.email !== undefined ? { email: federation.email } : {}),
+										...(federation.emailVerified !== undefined ? { emailVerified: federation.emailVerified } : {}),
+										isPrivateRelayEmail: federation.isPrivateRelayEmail,
+										expiresAt: 0,
+										evidenceReference: federation.evidenceReference
+								};
+								const registered = await this.getFederationResolution().registerFirstTime(verified);
+								if (registered.status === "conflict") {
+										logLogin(request, flow, interaction, startedAt, false, "registration_conflict");
+										return send(reply, 409, federatedAccountChoicePage({
+												tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
+												csrf: interaction.csrf, provider: federation.provider,
+												error: "That sign-in just became connected to another account. Sign in with email instead." }));
+								}
+								const consumed = await this.interactions.consume(loaded.handle);
+								if (!consumed) {
+										logLogin(request, flow, interaction, startedAt, false, "interaction_replayed");
+										return expired(reply);
+								}
+								const principal = this.federatedPrincipal(registered.subject, federation.provider);
+								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
+								const cookies = [this.interactionCookie(null)];
+								const sessionCookie = await this.maybeEstablishSession(request, principal, interaction.clientId);
+								if (sessionCookie) cookies.push(sessionCookie);
+								logLogin(request, flow, consumed, startedAt, true, "", principal.id);
+								reply.header("Set-Cookie", cookies);
+								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
+						} catch (error) {
+								if (error instanceof VerificationError) {
+										return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								}
+								if (interaction && statusOf(error) === 429) {
+										return renderChooser(request, reply, interaction, 429, "Too many attempts. Please wait a few minutes and try again.");
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_FEDERATED_UNAVAILABLE" }, "Federated registration failed");
+								return unavailable(reply);
+						}
+				});
+
+				// Returning-user continuation from an existing valid HAPI session (V2-D account selection).
+				app.post("/login/continue", { bodyLimit: 4096 }, async (request, reply) => {
+						const startedAt = Date.now();
+						let interaction: AuthorizationInteraction | null = null;
+						try {
+								const loaded = await load(request, reply, true, "POST /login/continue");
+								if (!loaded) return reply;
+								interaction = loaded.interaction;
+								if (!await this.interactionClientStillValid(interaction)) return expired(reply);
+								const continuation = await this.detectSessionContinuation(request);
+								if (!continuation || continuation.session.authenticationMethod === "PASSKEY") {
+										return renderChooser(request, reply, interaction, 401,
+												"Your saved session is no longer valid. Choose how you want to sign in.");
+								}
+								await requireApplicationMethod(interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(continuation.session.authenticationMethod));
+								const consumed = await this.interactions.consume(loaded.handle);
+								if (!consumed) return expired(reply);
+								const subject = continuation.subject;
+								const principal: AuthenticatedUser = {
+										id: subject.id,
+										sub: subject.oidcSubject,
+										...(subject.email !== undefined ? { email: subject.email } : {}),
+										...(subject.emailVerified !== undefined ? { emailVerified: subject.emailVerified } : {}),
+										...(subject.displayName !== undefined ? { name: subject.displayName } : {}),
+										authenticationMethod: continuation.session.authenticationMethod,
+										// Honest auth_time: the ORIGINAL authentication instant, not the continuation.
+										authenticatedAt: continuation.session.authenticatedAt
+								};
+								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
+								logLogin(request, "universal_login_continue", consumed, startedAt, true, "", principal.id);
+								reply.header("Set-Cookie", this.interactionCookie(null));
+								return reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
+						} catch (error) {
+								if (error instanceof VerificationError) {
+										return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								}
+								if (interaction && statusOf(error) === 429) {
+										return renderChooser(request, reply, interaction, 429, "Too many attempts. Please wait a few minutes and try again.");
+								}
+								app.log.error({ event: "UNIVERSAL_LOGIN_CONTINUE_UNAVAILABLE" }, "Session continuation failed");
 								return unavailable(reply);
 						}
 				});
@@ -1714,6 +2062,144 @@ export class OIDCService {
 				return this.refreshRotation;
 		}
 
+		// ---- HAPI ID V2-D federation collaborators (all behind default-off flags) ----
+
+		private getFederationTransactions(): FederationTransactionStore {
+				if (!this.federationTransactions) {
+						this.federationTransactions = new FederationTransactionStore();
+				}
+				return this.federationTransactions;
+		}
+
+		private getFederationResolution(): FederatedIdentityResolutionService {
+				if (!this.federationResolution) {
+						this.federationResolution = federatedIdentityResolutionService;
+				}
+				return this.federationResolution;
+		}
+
+		private getSessionService(): HapiSessionService {
+				if (!this.sessionService) {
+						this.sessionService = new HapiSessionService();
+				}
+				return this.sessionService;
+		}
+
+		// Resolves the provider integration, or null unless BOTH the provider's default-off flag is
+		// enabled AND an integration exists (injected, or fully configured credentials). A partially
+		// configured provider can never appear on the login surface.
+		private federatedService(provider: "APPLE" | "GOOGLE"): FederatedAuthorizationService | null {
+				if (provider === "APPLE") {
+						if (!featureFlags.isAppleFederationEnabled()) return null;
+						if (this.appleFederation) return this.appleFederation;
+						const config = configuration.getAppleFederationConfiguration();
+						if (!config) return null;
+						const secrets = new AppleClientSecretService({
+								teamId: config.teamId,
+								clientId: config.servicesId,
+								keyId: config.keyId,
+								privateKeyPem: config.privateKeyPem
+						});
+						this.appleFederation = new FederatedAuthorizationService(
+								{
+										provider: "APPLE",
+										clientId: config.servicesId,
+										redirectUri: config.redirectUri,
+										scope: "name email",
+										authorizationEndpoint: APPLE_AUTHORIZATION_ENDPOINT,
+										tokenEndpoint: APPLE_TOKEN_ENDPOINT,
+										// Apple requires form_post when scopes are requested.
+										responseMode: "form_post",
+										clientSecret: () => secrets.generate()
+								},
+								new AppleIdentityTokenVerifier({ expectedAudiences: [config.servicesId] }),
+								this.getFederationTransactions()
+						);
+						return this.appleFederation;
+				}
+				if (!featureFlags.isGoogleFederationEnabled()) return null;
+				if (this.googleFederation) return this.googleFederation;
+				const config = configuration.getGoogleFederationConfiguration();
+				if (!config) return null;
+				this.googleFederation = new FederatedAuthorizationService(
+						{
+								provider: "GOOGLE",
+								clientId: config.clientId,
+								redirectUri: config.redirectUri,
+								scope: "openid email profile",
+								authorizationEndpoint: GOOGLE_AUTHORIZATION_ENDPOINT,
+								tokenEndpoint: GOOGLE_TOKEN_ENDPOINT,
+								clientSecret: async () => config.clientSecret
+						},
+						new GoogleIdentityTokenVerifier({ expectedAudiences: [config.clientId] }),
+						this.getFederationTransactions()
+				);
+				return this.googleFederation;
+		}
+
+		// The ONLY construction path for a federated login principal: subject comes from the
+		// authoritative Identity Registry via an active external-identity link.
+		private federatedPrincipal(subject: IdentitySubject, provider: "APPLE" | "GOOGLE"): AuthenticatedUser {
+				return {
+						id: subject.id,
+						sub: subject.oidcSubject,
+						...(subject.email !== undefined ? { email: subject.email } : {}),
+						...(subject.emailVerified !== undefined ? { emailVerified: subject.emailVerified } : {}),
+						...(subject.displayName !== undefined ? { name: subject.displayName } : {}),
+						authenticationMethod: provider,
+						authenticatedAt: new Date().toISOString(),
+						assurance: "federated"
+				};
+		}
+
+		private readSessionCookie(request: FastifyRequest): string | undefined {
+				return request.headers.cookie?.split(";").map(value => value.trim())
+						.find(value => value.startsWith(`${HAPI_SESSION_COOKIE}=`))?.slice(HAPI_SESSION_COOKIE.length + 1) || undefined;
+		}
+
+		// V2-D session establishment at Universal Login completion. Gated on
+		// HAPI_PERSISTENT_SESSIONS_ENABLED (default OFF -- byte-identical behavior otherwise), and
+		// never allowed to break the login itself. Fixation-safe: any session token the browser
+		// already held is revoked by establishSession before the new one exists.
+		private async maybeEstablishSession(request: FastifyRequest, principal: AuthenticatedUser,
+				clientId: string): Promise<string | undefined> {
+				if (!featureFlags.isPersistentSessionsEnabled() || !principal.authenticationMethod) {
+						return undefined;
+				}
+				try {
+						const supersedes = this.readSessionCookie(request);
+						const userAgent = request.headers["user-agent"];
+						const established = await this.getSessionService().establishSession({
+								identitySubjectId: principal.id,
+								authenticationMethod: principal.authenticationMethod as HapiSessionAuthenticationMethod,
+								clientId,
+								...(typeof userAgent === "string" ? { userAgent } : {}),
+								...(principal.authenticatedAt !== undefined ? { authenticatedAt: principal.authenticatedAt } : {}),
+								...(supersedes !== undefined ? { supersedesSessionToken: supersedes } : {})
+						});
+						return established.setCookie;
+				} catch (error) {
+						request.log.error({ event: "HAPI_SESSION_ESTABLISH_FAILED" }, "Failed to establish HAPI session");
+						return undefined;
+				}
+		}
+
+		// Existing-session detection for the Universal Login chooser ("Continue as ..."). Read-only:
+		// never touches the session, never throws.
+		private async detectSessionContinuation(request: FastifyRequest): Promise<{ session: HapiSession; subject: IdentitySubject } | null> {
+				if (!featureFlags.isPersistentSessionsEnabled()) return null;
+				const token = this.readSessionCookie(request);
+				if (!token) return null;
+				try {
+						const session = await this.getSessionService().resolveSession(token, { touch: false });
+						const subject = await identityRegistry.findById(session.identitySubjectId);
+						if (!subject || subject.status !== "ACTIVE") return null;
+						return { session, subject };
+				} catch {
+						return null;
+				}
+		}
+
 		// HAPI ID V2-C grant_type=refresh_token handler. Reached ONLY when the default-off
 		// HAPI_REFRESH_GRANT_ENABLED gate is on. Client authentication mirrors the
 		// authorization_code path exactly: confidential clients present their secret, public
@@ -1815,7 +2301,7 @@ export class OIDCService {
 						nonce: "",
 						scope: rotated.family.scope,
 						...(rotated.family.authenticationMethod ? {
-								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE",
+								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE",
 								...(rotated.family.authenticatedAt
 										? { authenticatedAt: rotated.family.authenticatedAt } : {})
 						} : {})
@@ -1858,7 +2344,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
+			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
 			authenticatedAt?: string;
 		}): Record<string, unknown> {
 			return {
@@ -1873,10 +2359,21 @@ export class OIDCService {
 				iat: input.iat,
 				exp: input.exp,
 				...(input.authenticationMethod && input.authenticatedAt ? {
-					amr: input.authenticationMethod === "HAPI_EMAIL" ? ["email"] : ["face", "privateid"],
+					amr: this.amrFor(input.authenticationMethod),
 					auth_time: Math.floor(Date.parse(input.authenticatedAt) / 1000)
 				} : {})
 			};
+		}
+
+		// Honest amr values: the actual authentication the HAPI subject performed, including the
+		// upstream provider for federated sign-ins.
+		private amrFor(method: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE"): string[] {
+			switch (method) {
+				case "HAPI_EMAIL": return ["email"];
+				case "APPLE": return ["apple", "fed"];
+				case "GOOGLE": return ["google", "fed"];
+				default: return ["face", "privateid"];
+			}
 		}
 
 		private async createIdToken(input: {
@@ -1890,7 +2387,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
+			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
 			authenticatedAt?: string;
 		}): Promise<string> {
 			const signing = await this.getSigningMaterial();

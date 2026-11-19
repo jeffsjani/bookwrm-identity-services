@@ -11,6 +11,6 @@ export type OIDCAuthorizationCode = {
 		userSub: string;
 		expiresAt: number;
 		consumed: boolean;
-		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE";
+		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
 		authenticatedAt?: string;
 };

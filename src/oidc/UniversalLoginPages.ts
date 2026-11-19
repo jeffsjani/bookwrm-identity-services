@@ -12,17 +12,43 @@ function render(title: string, heading: string, body: string, script?: string, b
 
 const heading = (tenantName?: string) => tenantName ? `Sign in to ${tenantName}` : "Sign in";
 
-export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; faceAvailable?: boolean; error?: string }): RenderedLoginPage {
+export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; faceAvailable?: boolean; appleAvailable?: boolean; googleAvailable?: boolean; continueAs?: string; error?: string }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
 	// Bookwrm Face is not certified for this release. A future caller must establish
 	// client/release capability and returning-user enrollment before opting in.
 	const faceAvailable = input.faceAvailable ?? !brand;
+	// V2-D: an existing valid HAPI session lets the returning user continue without re-authenticating.
+	const continueAs = input.continueAs
+		? `<form method="post" action="/login/continue">${csrfField(input.csrf)}<button type="submit">Continue as ${escapeHtml(input.continueAs)}</button></form>` : "";
 	const email = input.emailAvailable
-		? `<form method="get" action="/login/email"><button type="submit">${brand && !faceAvailable ? "Continue" : "Continue with Email"}</button></form>` : "";
+		? `<form method="get" action="/login/email"><button type="submit"${continueAs ? ' class="secondary"' : ""}>${brand && !faceAvailable && !input.appleAvailable && !input.googleAvailable && !continueAs ? "Continue" : "Continue with Email"}</button></form>` : "";
+	// V2-D federated sign-in launches: server-side POSTs that mint the provider transaction; the
+	// browser never sees or chooses state/nonce values.
+	const apple = input.appleAvailable
+		? `<form method="post" action="/login/federated/apple">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Apple</button></form>` : "";
+	const google = input.googleAvailable
+		? `<form method="post" action="/login/federated/google">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Google</button></form>` : "";
 	const face = faceAvailable
 		? `<form method="post" action="/login/face">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Face</button></form>` : "";
 	return render(heading(input.tenantName), brand ? `Welcome to ${brand.brandName}` : heading(input.tenantName), `${alert(input.error)}
-<p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>${email}${face}`,
+<p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>${continueAs}${email}${apple}${google}${face}`,
+		undefined, brand);
+}
+
+// V2-D: explicit account resolution after a server-verified Apple/Google authentication whose
+// provider identity is not linked to any HAPI account. Creating a new account and signing in with
+// email are both explicit user choices -- there is no automatic email-based resolution.
+export function federatedAccountChoicePage(input: { tenantName?: string; clientId?: string; csrf: string; provider: "APPLE" | "GOOGLE"; email?: string; error?: string }): RenderedLoginPage {
+	const brand = brandForClient(input.clientId);
+	const providerName = input.provider === "APPLE" ? "Apple" : "Google";
+	const contact = input.email ? ` (${escapeHtml(input.email)})` : "";
+	return render(heading(input.tenantName), "Finish setting up your account", `${alert(input.error)}
+<p>Your ${providerName} sign-in${contact} isn't connected to an account here yet.</p>
+<form method="post" action="/login/federated/complete">${csrfField(input.csrf)}<input type="hidden" name="choice" value="create">
+<button type="submit">Create a new account</button></form>
+<form method="post" action="/login/federated/complete">${csrfField(input.csrf)}<input type="hidden" name="choice" value="email">
+<button type="submit" class="secondary">I already have an account — sign in with email</button></form>
+<p>After signing in with email you can connect ${providerName} from your account's sign-in settings.</p>`,
 		undefined, brand);
 }
 

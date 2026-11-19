@@ -36,6 +36,22 @@ export class FeatureFlagService {
 		isRefreshGrantEnabled(): boolean {
 				return configuration.getFeatureFlag("HAPI_REFRESH_GRANT_ENABLED", false);
 		}
+
+		// HAPI ID V2-D: HAPI-hosted "Continue with Apple" upstream federation. Default OFF -- no
+		// Apple authorization is ever launched in production without an explicit opt-in.
+		isAppleFederationEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_APPLE_FEDERATION_ENABLED", false);
+		}
+
+		// HAPI ID V2-D: HAPI-hosted "Continue with Google" upstream federation. Default OFF.
+		isGoogleFederationEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_GOOGLE_FEDERATION_ENABLED", false);
+		}
+
+		// HAPI ID V2-D: authenticated account-linking API (V2-C Phase 4 design). Default OFF.
+		isAccountLinkingApiEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_ACCOUNT_LINKING_API_ENABLED", false);
+		}
 }
 
 export const featureFlags = new FeatureFlagService();

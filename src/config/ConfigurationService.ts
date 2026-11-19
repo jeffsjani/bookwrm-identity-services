@@ -164,6 +164,42 @@ export class ConfigurationService {
 				return this.getBoolean(key, fallback);
 		}
 
+		// HAPI ID V2-D Apple federation credentials. Returns undefined until every value is present,
+		// so partially configured environments can never launch a live Apple authorization. The
+		// private key is held only in this in-memory snapshot -- never logged or persisted.
+		getAppleFederationConfiguration(): {
+				servicesId: string;
+				teamId: string;
+				keyId: string;
+				privateKeyPem: string;
+				redirectUri: string;
+		} | undefined {
+				const servicesId = this.get("APPLE_SERVICES_ID")?.trim();
+				const teamId = this.get("APPLE_TEAM_ID")?.trim();
+				const keyId = this.get("APPLE_KEY_ID")?.trim();
+				const privateKeyPem = this.get("APPLE_CLIENT_SECRET_KEY");
+				const redirectUri = this.get("APPLE_REDIRECT_URI")?.trim();
+				if (!servicesId || !teamId || !keyId || !privateKeyPem?.trim() || !redirectUri) {
+						return undefined;
+				}
+				return { servicesId, teamId, keyId, privateKeyPem: this.normalizeMultilineValue(privateKeyPem), redirectUri };
+		}
+
+		// HAPI ID V2-D Google federation credentials. Returns undefined until every value is present.
+		getGoogleFederationConfiguration(): {
+				clientId: string;
+				clientSecret: string;
+				redirectUri: string;
+		} | undefined {
+				const clientId = this.get("GOOGLE_CLIENT_ID")?.trim();
+				const clientSecret = this.get("GOOGLE_CLIENT_SECRET")?.trim();
+				const redirectUri = this.get("GOOGLE_REDIRECT_URI")?.trim();
+				if (!clientId || !clientSecret || !redirectUri) {
+						return undefined;
+				}
+				return { clientId, clientSecret, redirectUri };
+		}
+
 		// Production always uses Postgres; the in-memory driver exists only for tests (Task 7).
 		getIdentityRegistryDriver(): "postgres" | "memory" {
 				const override = this.get("IDENTITY_REGISTRY_DRIVER")?.trim().toLowerCase();

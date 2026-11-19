@@ -34,6 +34,20 @@ export type AuthorizationInteraction = {
 	createdAt: number;
 	expiresAt: number;
 	email?: { challengeId: string; mode: InteractiveEmailMode };
+	// V2-D: a SERVER-verified federated identity awaiting explicit account resolution (create new
+	// vs. sign in differently). Written only by the provider-callback handler after full JWKS,
+	// issuer, audience, nonce and expiry verification -- never from any browser-supplied value.
+	federation?: {
+		provider: "APPLE" | "GOOGLE";
+		providerIssuer: string;
+		providerSubject: string;
+		audience: string;
+		email?: string;
+		emailVerified?: boolean;
+		isPrivateRelayEmail: boolean;
+		evidenceReference: string;
+		verifiedAt: number;
+	};
 };
 
 export type NewAuthorizationInteraction = Pick<AuthorizationInteraction, "clientId" | "binding" | "authorization" | "request">;
