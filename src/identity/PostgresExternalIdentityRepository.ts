@@ -302,6 +302,19 @@ export class PostgresExternalIdentityRepository implements ExternalIdentityRepos
 				return result.rows.map(toExternalIdentity);
 		}
 
+		async markAuthenticated(externalIdentityId: string, at: string): Promise<void> {
+				await this.reader.query(
+						`UPDATE external_identities SET last_authenticated_at = $2, updated_at = $2
+						 WHERE id = $1 AND status = 'linked'`,
+						[externalIdentityId, at]
+				);
+				await this.reader.query(
+						`UPDATE identity_authentication_methods SET last_used_at = $2, updated_at = $2
+						 WHERE external_identity_id = $1 AND status <> 'revoked'`,
+						[externalIdentityId, at]
+				);
+		}
+
 		async listAuthenticationMethods(identitySubjectId: string): Promise<IdentityAuthenticationMethod[]> {
 				const [methods, subject] = await Promise.all([
 						this.reader.query<AuthenticationMethodRow>(

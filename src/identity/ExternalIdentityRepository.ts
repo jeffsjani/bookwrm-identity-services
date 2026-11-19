@@ -63,6 +63,9 @@ export interface ExternalIdentityRepository {
 				providerSubject: string
 		): Promise<ExternalIdentity | undefined>;
 		listBySubject(identitySubjectId: string): Promise<ExternalIdentity[]>;
+		// Records a successful federated authentication against an ACTIVE link (no-op when the
+		// identity is unknown or revoked). Never mutates linking state.
+		markAuthenticated(externalIdentityId: string, at: string): Promise<void>;
 		// Includes the derived HAPI_EMAIL method when the subject's primary provider is a verified email.
 		listAuthenticationMethods(identitySubjectId: string): Promise<IdentityAuthenticationMethod[]>;
 		listAudit(identitySubjectId: string): Promise<IdentityLinkAuditEntry[]>;

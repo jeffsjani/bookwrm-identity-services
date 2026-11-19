@@ -144,6 +144,17 @@ export class InMemoryExternalIdentityRepository implements ExternalIdentityRepos
 						.map((identity) => ({ ...identity }));
 		}
 
+		async markAuthenticated(externalIdentityId: string, at: string): Promise<void> {
+				const identity = this.identities.get(externalIdentityId);
+				if (!identity || identity.status !== "linked") return;
+				this.identities.set(externalIdentityId, { ...identity, lastAuthenticatedAt: at, updatedAt: at });
+				for (const [id, method] of this.methods) {
+						if (method.externalIdentityId === externalIdentityId && method.status !== "revoked") {
+								this.methods.set(id, { ...method, lastUsedAt: at, updatedAt: at });
+						}
+				}
+		}
+
 		async listAuthenticationMethods(identitySubjectId: string): Promise<IdentityAuthenticationMethod[]> {
 				const methods = [...this.methods.values()]
 						.filter((method) => method.identitySubjectId === identitySubjectId)

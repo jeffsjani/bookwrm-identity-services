@@ -102,6 +102,20 @@ export class IdentityFederationService {
 				});
 		}
 
+		// Exact-triple lookup used by federated login resolution; never an email lookup.
+		findActiveByProviderIdentity(
+				provider: ExternalIdentityProvider,
+				providerIssuer: string,
+				providerSubject: string
+		): Promise<ExternalIdentity | undefined> {
+				this.assertProvider(provider);
+				return this.repository.findActiveByProviderIdentity(provider, providerIssuer.trim(), providerSubject.trim());
+		}
+
+		markAuthenticated(externalIdentityId: string, at: string): Promise<void> {
+				return this.repository.markAuthenticated(externalIdentityId, at);
+		}
+
 		listExternalIdentities(identitySubjectId: string): Promise<ExternalIdentity[]> {
 				return this.repository.listBySubject(identitySubjectId);
 		}
