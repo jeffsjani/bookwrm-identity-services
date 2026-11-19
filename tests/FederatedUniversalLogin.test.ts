@@ -1,0 +1,527 @@
+import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet } from "jose";
+import { randomUUID } from "node:crypto";
+import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
+import formbody from "@fastify/formbody";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+
+import { configuration } from "../src/config/ConfigurationService.js";
+import { OIDCService, type OIDCClient } from "../src/oidc/OIDCService.js";
+import type { AuthenticationProvider, PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
+import { InMemoryTenantRepository } from "../src/identity/InMemoryTenantRepository.js";
+import { InMemoryApplicationRepository } from "../src/identity/InMemoryApplicationRepository.js";
+import { InMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClientRepository.js";
+import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
+import { InMemoryExternalIdentityRepository } from "../src/identity/InMemoryExternalIdentityRepository.js";
+import { IdentityFederationService } from "../src/identity/IdentityFederationService.js";
+import { identityRegistry, IdentityRegistry } from "../src/identity/IdentityRegistry.js";
+import { AppleIdentityTokenVerifier, APPLE_ISSUER } from "../src/identity/federation/AppleIdentityTokenVerifier.js";
+import { GoogleIdentityTokenVerifier, GOOGLE_ISSUER } from "../src/identity/federation/GoogleIdentityTokenVerifier.js";
+import {
+		APPLE_AUTHORIZATION_ENDPOINT,
+		APPLE_TOKEN_ENDPOINT,
+		FederatedAuthorizationService,
+		GOOGLE_AUTHORIZATION_ENDPOINT,
+		GOOGLE_TOKEN_ENDPOINT,
+		type AuthorizationCodeExchanger
+} from "../src/identity/federation/FederatedAuthorizationService.js";
+import { FederationTransactionStore } from "../src/identity/federation/FederationTransactionStore.js";
+import { FederatedIdentityResolutionService } from "../src/identity/federation/FederatedIdentityResolutionService.js";
+import { HapiSessionService, HAPI_SESSION_COOKIE, hashSessionToken } from "../src/identity/sessions/HapiSessionService.js";
+import { InMemoryHapiSessionRepository } from "../src/identity/sessions/InMemoryHapiSessionRepository.js";
+import type { AuthenticationMethod } from "../src/models/Application.js";
+import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
+
+// HAPI ID V2-D Phases 4/6: HAPI-hosted Apple/Google Universal Login certification. Every provider
+// artifact (keys, codes, tokens, endpoints) is synthetic; no live provider is ever contacted.
+
+const REDIRECT = "https://rp.example/callback";
+const CLIENT_ID = "fed-client";
+const CLIENT_SECRET = "fed-client-secret";
+const COOKIE = "__Host-hapi_login";
+const APPLE_CLIENT = "com.hapi.id.synthetic";
+const GOOGLE_CLIENT = "synthetic.apps.googleusercontent.com";
+const APPLE_CALLBACK = "https://id.example.test/federation/apple/callback";
+const GOOGLE_CALLBACK = "https://id.example.test/federation/google/callback";
+
+let appleKey: CryptoKey | import("node:crypto").KeyObject;
+let appleJwks: JSONWebKeySet;
+let googleKey: CryptoKey | import("node:crypto").KeyObject;
+let googleJwks: JSONWebKeySet;
+
+beforeAll(async () => {
+	const apple = await generateKeyPair("RS256");
+	appleKey = apple.privateKey;
+	appleJwks = { keys: [{ ...(await exportJWK(apple.publicKey)), kid: "a1", alg: "RS256", use: "sig" }] };
+	const google = await generateKeyPair("RS256");
+	googleKey = google.privateKey;
+	googleJwks = { keys: [{ ...(await exportJWK(google.publicKey)), kid: "g1", alg: "RS256", use: "sig" }] };
+});
+
+function setFlags(flags: Record<string, boolean | undefined>): void {
+	for (const [key, value] of Object.entries(flags)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = String(value);
+	}
+	configuration.reload();
+}
+
+const DEFAULT_FLAGS = {
+	HAPI_UNIVERSAL_LOGIN_ENABLED: true,
+	HAPI_APPLE_FEDERATION_ENABLED: true,
+	HAPI_GOOGLE_FEDERATION_ENABLED: true
+};
+
+function cookieFrom(response: LightMyRequestResponse, name = COOKIE): string | undefined {
+	const header = response.headers["set-cookie"];
+	const cookies = Array.isArray(header) ? header : header ? [header] : [];
+	return cookies.find(value => value.startsWith(`${name}=`))?.split(";")[0].slice(name.length + 1) || undefined;
+}
+
+function csrfFrom(html: string): string {
+	const match = /name="csrf" value="([^"]+)"/.exec(html);
+	if (!match) throw new Error("csrf field missing");
+	return match[1];
+}
+
+function form(payload: Record<string, string>, cookie?: string): { headers: Record<string, string>; payload: string } {
+	return {
+		headers: { "content-type": "application/x-www-form-urlencoded", ...(cookie ? { cookie } : {}) },
+		payload: new URLSearchParams(payload).toString()
+	};
+}
+
+type ProviderIdentity = { sub: string; email?: string; emailVerified?: unknown; isPrivateEmail?: unknown };
+
+async function federatedFixture(options: { allowExternal?: boolean; flags?: Record<string, boolean | undefined> } = {}) {
+	ensureOidcTestEnvironment();
+	setFlags({ ...DEFAULT_FLAGS, ...(options.flags ?? {}) });
+
+	const tenantId = randomUUID();
+	const applicationId = randomUUID();
+	const tenants = new InMemoryTenantRepository();
+	const applications = new InMemoryApplicationRepository();
+	const clients = new InMemoryOIDCClientRepository();
+	const allowed: AuthenticationMethod[] = options.allowExternal === false
+		? ["HAPI_EMAIL", "PRIVATEID_FACE"] : ["HAPI_EMAIL", "EXTERNAL_OIDC", "PRIVATEID_FACE"];
+	await tenants.upsert({ id: tenantId, name: "Bookwrm", slug: `bookwrm-${tenantId}`, status: "active" });
+	await applications.upsert({ id: applicationId, tenantId, name: "Bookwrm Web", slug: "web", status: "active",
+		allowedAuthenticationMethods: allowed });
+	await clients.upsert({ id: randomUUID(), applicationId, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET,
+		redirectUris: [REDIRECT], scopes: ["openid", "profile", "email"], grantTypes: ["authorization_code"],
+		responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
+	const h1 = { clients, applications, tenants };
+	const oidcClient: OIDCClient = { client_id: CLIENT_ID, client_secret: CLIENT_SECRET, redirect_uris: [REDIRECT],
+		scope: "openid profile email", grant_types: ["authorization_code"], response_types: ["code"],
+		token_endpoint_auth_method: "client_secret_basic", require_pkce: true };
+
+	// Authoritative in-memory identity registry shared by federation resolution and /token claims.
+	const subjects = new InMemoryIdentitySubjectRepository();
+	const registry = new IdentityRegistry(subjects);
+	const externalRepository = new InMemoryExternalIdentityRepository(async (id) => subjects.findById(id));
+	const federation = new IdentityFederationService(externalRepository);
+	const resolution = new FederatedIdentityResolutionService(federation, registry);
+	const transactions = new FederationTransactionStore();
+	const sessionRepository = new InMemoryHapiSessionRepository();
+	const sessions = new HapiSessionService(sessionRepository);
+
+	// Synthetic providers: authorization codes registered by the test, id_tokens minted on exchange.
+	const identities: Record<"APPLE" | "GOOGLE", ProviderIdentity> = {
+		APPLE: { sub: "001234.synthetic.5678", email: "apple-user@example.com", emailVerified: "true" },
+		GOOGLE: { sub: "110000000000000000001", email: "google-user@example.com", emailVerified: true }
+	};
+	const codes = new Map<string, { provider: "APPLE" | "GOOGLE"; nonce: string }>();
+	const mintProviderToken = async (provider: "APPLE" | "GOOGLE", nonce: string) => {
+		const identity = identities[provider];
+		const now = Math.floor(Date.now() / 1000);
+		return new SignJWT({ sub: identity.sub, nonce,
+			...(identity.email !== undefined ? { email: identity.email } : {}),
+			...(identity.emailVerified !== undefined ? { email_verified: identity.emailVerified } : {}),
+			...(identity.isPrivateEmail !== undefined ? { is_private_email: identity.isPrivateEmail } : {}) })
+			.setProtectedHeader({ alg: "RS256", kid: provider === "APPLE" ? "a1" : "g1" })
+			.setIssuer(provider === "APPLE" ? APPLE_ISSUER : GOOGLE_ISSUER)
+			.setAudience(provider === "APPLE" ? APPLE_CLIENT : GOOGLE_CLIENT)
+			.setIssuedAt(now).setExpirationTime(now + 600)
+			.sign(provider === "APPLE" ? appleKey : googleKey);
+	};
+	const exchanger = (provider: "APPLE" | "GOOGLE"): AuthorizationCodeExchanger => ({
+		async exchange(_endpoint, params) {
+			const redeemed = codes.get(params.get("code") ?? "");
+			if (!redeemed || redeemed.provider !== provider) throw new Error("invalid_grant");
+			codes.delete(params.get("code") ?? "");
+			return { idToken: await mintProviderToken(provider, redeemed.nonce) };
+		}
+	});
+	const apple = new FederatedAuthorizationService(
+		{ provider: "APPLE", clientId: APPLE_CLIENT, redirectUri: APPLE_CALLBACK, scope: "name email",
+			authorizationEndpoint: APPLE_AUTHORIZATION_ENDPOINT, tokenEndpoint: APPLE_TOKEN_ENDPOINT,
+			responseMode: "form_post", clientSecret: async () => "synthetic-apple-secret" },
+		new AppleIdentityTokenVerifier({ expectedAudiences: [APPLE_CLIENT], jwks: appleJwks }),
+		transactions, exchanger("APPLE"));
+	const google = new FederatedAuthorizationService(
+		{ provider: "GOOGLE", clientId: GOOGLE_CLIENT, redirectUri: GOOGLE_CALLBACK, scope: "openid email profile",
+			authorizationEndpoint: GOOGLE_AUTHORIZATION_ENDPOINT, tokenEndpoint: GOOGLE_TOKEN_ENDPOINT,
+			clientSecret: async () => "synthetic-google-secret" },
+		new GoogleIdentityTokenVerifier({ expectedAudiences: [GOOGLE_CLIENT], jwks: googleJwks }),
+		transactions, exchanger("GOOGLE"));
+
+	const provider: AuthenticationProvider = {
+		authenticate: vi.fn(async () => { throw new Error("must not authenticate synchronously"); }),
+		cancel: vi.fn(async () => {}), status: vi.fn(async () => ({ state: "idle" as const })), logout: vi.fn(async () => {}),
+		setPendingAuthorizationContext: vi.fn((_context: PendingAuthorizationContext) => {}),
+		beginAsyncAuthentication: vi.fn(async (correlationId: string) => ({
+			sessionId: `face-${correlationId}`, launchUrl: "https://privateid.example.com/launch" }))
+	} as unknown as AuthenticationProvider;
+	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients,
+		clientAuthority: h1, federation: { apple, google, transactions, resolution, sessions } });
+	const app = Fastify();
+	await app.register(formbody);
+	await oidc.registerEndpoints(app);
+	await app.ready();
+
+	// /token and session continuation consult the global registry singleton; route them to this
+	// fixture's subjects store.
+	vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(sub => subjects.findByOidcSubject(sub));
+	vi.spyOn(identityRegistry, "findById").mockImplementation(id => subjects.findById(id));
+
+	return { app, subjects, registry, federation, externalRepository, transactions, sessions, sessionRepository,
+		identities, codes, tenantId, applicationId };
+}
+
+type Fixture = Awaited<ReturnType<typeof federatedFixture>>;
+
+async function beginInteraction(f: Pick<Fixture, "app">, verifier: string, extraCookies = "") {
+	const query = new URLSearchParams({
+		response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT,
+		scope: "openid profile email", state: "rp-state", nonce: "rp-nonce",
+		code_challenge_method: "S256", code_challenge: pkceChallengeFromVerifier(verifier)
+	}).toString();
+	const authorize = await f.app.inject({ method: "GET", url: `/authorize?${query}` });
+	expect(authorize.statusCode, authorize.body).toBe(302);
+	const handle = cookieFrom(authorize)!;
+	const cookie = `${COOKIE}=${handle}${extraCookies}`;
+	const chooser = await f.app.inject({ method: "GET", url: "/login", headers: { cookie } });
+	expect(chooser.statusCode).toBe(200);
+	return { handle, cookie, chooser, csrf: csrfFrom(chooser.body) };
+}
+
+// Launches the provider flow and returns the redirect URL + a registered synthetic code.
+async function launchProvider(f: Fixture, interaction: Awaited<ReturnType<typeof beginInteraction>>,
+	provider: "APPLE" | "GOOGLE") {
+	const started = await f.app.inject({ method: "POST", url: `/login/federated/${provider.toLowerCase()}`,
+		...form({ csrf: interaction.csrf }, interaction.cookie) });
+	expect(started.statusCode, started.body).toBe(303);
+	const url = new URL(started.headers.location as string);
+	const state = url.searchParams.get("state")!;
+	const nonce = url.searchParams.get("nonce")!;
+	const code = `provider-code-${randomUUID()}`;
+	f.codes.set(code, { provider, nonce });
+	return { url, state, nonce, code };
+}
+
+async function appleCallback(f: Fixture, params: Record<string, string>) {
+	// Apple form_post arrives WITHOUT cookies (cross-site POST): no cookie header on purpose.
+	return f.app.inject({ method: "POST", url: "/federation/apple/callback", ...form(params) });
+}
+
+async function exchangeCode(f: Fixture, location: string, verifier: string) {
+	const code = new URL(location).searchParams.get("code")!;
+	return f.app.inject({ method: "POST", url: "/token",
+		headers: { "content-type": "application/x-www-form-urlencoded" },
+		payload: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: REDIRECT,
+			client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: verifier }).toString() });
+}
+
+function decodeJwt(token: string): Record<string, unknown> {
+	return JSON.parse(Buffer.from(token.split(".")[1], "base64url").toString("utf8")) as Record<string, unknown>;
+}
+
+afterEach(() => {
+	setFlags({ HAPI_UNIVERSAL_LOGIN_ENABLED: undefined, HAPI_APPLE_FEDERATION_ENABLED: undefined,
+		HAPI_GOOGLE_FEDERATION_ENABLED: undefined, HAPI_PERSISTENT_SESSIONS_ENABLED: undefined });
+	vi.restoreAllMocks();
+});
+
+describe("V2-D federated Universal Login (synthetic providers)", () => {
+	it("keeps federation invisible and inert while the default-off flags are off", async () => {
+		const f = await federatedFixture({ flags: {
+			HAPI_APPLE_FEDERATION_ENABLED: undefined, HAPI_GOOGLE_FEDERATION_ENABLED: undefined } });
+		const interaction = await beginInteraction(f, "verifier-flags-off");
+		expect(interaction.chooser.body).not.toContain("Continue with Apple");
+		expect(interaction.chooser.body).not.toContain("Continue with Google");
+		const started = await f.app.inject({ method: "POST", url: "/login/federated/apple",
+			...form({ csrf: interaction.csrf }, interaction.cookie) });
+		expect(started.statusCode).toBe(404);
+		const callback = await appleCallback(f, { state: "F".repeat(43), code: "x" });
+		expect(callback.statusCode).toBe(404);
+	});
+
+	it("offers Apple and Google only when the application allows EXTERNAL_OIDC", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-buttons");
+		expect(interaction.chooser.body).toContain("Continue with Apple");
+		expect(interaction.chooser.body).toContain("Continue with Google");
+
+		const restricted = await federatedFixture({ allowExternal: false });
+		const restrictedInteraction = await beginInteraction(restricted, "verifier-restricted");
+		expect(restrictedInteraction.chooser.body).not.toContain("Continue with Apple");
+		const started = await restricted.app.inject({ method: "POST", url: "/login/federated/apple",
+			...form({ csrf: restrictedInteraction.csrf }, restrictedInteraction.cookie) });
+		expect(started.statusCode).toBe(403);
+	});
+
+	it("launches Apple with exact registered values, form_post, and server-generated state/nonce", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-launch");
+		const { url, state, nonce } = await launchProvider(f, interaction, "APPLE");
+		expect(`${url.origin}${url.pathname}`).toBe(APPLE_AUTHORIZATION_ENDPOINT);
+		expect(url.searchParams.get("client_id")).toBe(APPLE_CLIENT);
+		expect(url.searchParams.get("redirect_uri")).toBe(APPLE_CALLBACK);
+		expect(url.searchParams.get("response_mode")).toBe("form_post");
+		expect(state).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		expect(nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+		// CSRF protection on the launch itself.
+		const forged = await f.app.inject({ method: "POST", url: "/login/federated/apple",
+			...form({ csrf: "forged" }, interaction.cookie) });
+		expect(forged.statusCode).toBe(400);
+	});
+
+	it("signs in a returning linked Apple identity end-to-end with honest amr/auth_time claims", async () => {
+		const f = await federatedFixture();
+		// Pre-link the provider identity to an existing HAPI subject.
+		const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "member@example.com",
+			email: "member@example.com", emailVerified: true, status: "ACTIVE" });
+		const linked = await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+		expect(linked.status).toBe("linked");
+
+		const verifier = "verifier-linked-login";
+		const interaction = await beginInteraction(f, verifier);
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		const callback = await appleCallback(f, { state, code });
+		expect(callback.statusCode, callback.body).toBe(303);
+		const location = callback.headers.location as string;
+		expect(location.startsWith(REDIRECT)).toBe(true);
+		expect(new URL(location).searchParams.get("state")).toBe("rp-state");
+
+		const token = await exchangeCode(f, location, verifier);
+		expect(token.statusCode, token.body).toBe(200);
+		const idToken = decodeJwt(JSON.parse(token.body).id_token);
+		expect(idToken.sub).toBe(subject.oidcSubject);
+		expect(idToken.amr).toEqual(["apple", "fed"]);
+		expect(idToken.nonce).toBe("rp-nonce");
+		expect(idToken.email).toBe("member@example.com");
+
+		// The link records the authentication.
+		const identities = await f.federation.listExternalIdentities(subject.id);
+		expect(identities[0].lastAuthenticatedAt).toBeDefined();
+	});
+
+	it("offers explicit account choice for an unknown provider identity and registers a NEW subject on consent", async () => {
+		const f = await federatedFixture();
+		// An existing HAPI subject with the SAME email: it must never be merged or resolved.
+		const existing = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "google-user@example.com",
+			email: "google-user@example.com", emailVerified: true, status: "ACTIVE" });
+
+		const verifier = "verifier-first-time";
+		const interaction = await beginInteraction(f, verifier);
+		const { state, code } = await launchProvider(f, interaction, "GOOGLE");
+		const callback = await f.app.inject({ method: "GET",
+			url: `/federation/google/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}` });
+		expect(callback.statusCode, callback.body).toBe(200);
+		expect(callback.body).toContain("isn't connected to an account here yet");
+
+		const completed = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: interaction.csrf, choice: "create" }, interaction.cookie) });
+		expect(completed.statusCode, completed.body).toBe(303);
+		const token = await exchangeCode(f, completed.headers.location as string, verifier);
+		expect(token.statusCode, token.body).toBe(200);
+		const idToken = decodeJwt(JSON.parse(token.body).id_token);
+		expect(idToken.amr).toEqual(["google", "fed"]);
+		// A brand-new subject was minted; the email-matching subject was never touched.
+		expect(idToken.sub).not.toBe(existing.oidcSubject);
+		const created = await f.subjects.findByOidcSubject(idToken.sub as string);
+		expect(created?.primaryProvider).toBe("Google");
+		expect(created?.id).not.toBe(existing.id);
+		const linkedIdentities = await f.federation.listExternalIdentities(created!.id);
+		expect(linkedIdentities[0]).toMatchObject({ provider: "GOOGLE", providerSubject: f.identities.GOOGLE.sub, status: "linked" });
+	});
+
+	it("lets the user switch to email sign-in instead, dropping the pending federated identity", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-switch-email");
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		await appleCallback(f, { state, code });
+		const completed = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: interaction.csrf, choice: "email" }, interaction.cookie) });
+		expect(completed.statusCode).toBe(303);
+		expect(completed.headers.location).toBe("/login/email");
+		// The pending identity is gone: a create retry fails safe.
+		const retried = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: interaction.csrf, choice: "create" }, interaction.cookie) });
+		expect(retried.statusCode).toBe(400);
+	});
+
+	it("requires the interaction CSRF token to complete account creation", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-csrf");
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		await appleCallback(f, { state, code });
+		const forged = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: "forged", choice: "create" }, interaction.cookie) });
+		expect(forged.statusCode).toBe(400);
+		// No subject was registered.
+		expect((await f.subjects.list()).length).toBe(0);
+	});
+
+	it("fails closed on state replay, forged states, and link-purpose transactions at the login callback", async () => {
+		const f = await federatedFixture();
+		const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "replay@example.com",
+			email: "replay@example.com", emailVerified: true, status: "ACTIVE" });
+		await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+		const interaction = await beginInteraction(f, "verifier-replay");
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		const first = await appleCallback(f, { state, code });
+		expect(first.statusCode).toBe(303);
+		// Replaying the captured callback (same state) is rejected.
+		const replay = await appleCallback(f, { state, code });
+		expect(replay.statusCode).toBe(400);
+		// Forged state is rejected.
+		expect((await appleCallback(f, { state: "F".repeat(43), code })).statusCode).toBe(400);
+		// A link-purpose transaction cannot complete a login.
+		const linkTxn = await f.transactions.create({ purpose: "link", provider: "APPLE",
+			identitySubjectId: subject.id, sessionId: randomUUID() });
+		f.codes.set("link-code", { provider: "APPLE", nonce: linkTxn.nonce });
+		expect((await appleCallback(f, { state: linkTxn.state, code: "link-code" })).statusCode).toBe(400);
+	});
+
+	it("recovers gracefully from provider denial, exchange failure, and nonce-mismatched tokens", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-recovery");
+
+		// User cancelled at the provider: back to the chooser with a friendly message.
+		const denied = await launchProvider(f, interaction, "APPLE");
+		const deniedCallback = await appleCallback(f, { state: denied.state, error: "user_cancelled_authorize" });
+		expect(deniedCallback.statusCode).toBe(400);
+		expect(deniedCallback.body).toContain("Sign-in was cancelled");
+		expect(deniedCallback.body).toContain("Continue with Apple");
+
+		// Invalid/stolen code fails the server-side exchange.
+		const exchange = await launchProvider(f, interaction, "APPLE");
+		const exchangeCallback = await appleCallback(f, { state: exchange.state, code: "stolen-code" });
+		expect(exchangeCallback.statusCode).toBe(400);
+		expect(exchangeCallback.body).toContain("Choose another way to continue.");
+
+		// A token bound to a different nonce (callback injection) fails verification.
+		const injected = await launchProvider(f, interaction, "APPLE");
+		f.codes.set("injected-code", { provider: "APPLE", nonce: "attacker-nonce" });
+		const injectedCallback = await appleCallback(f, { state: injected.state, code: "injected-code" });
+		expect(injectedCallback.statusCode).toBe(400);
+		// The interaction survives: the user can still sign in with email.
+		const chooser = await f.app.inject({ method: "GET", url: "/login", headers: { cookie: interaction.cookie } });
+		expect(chooser.statusCode).toBe(200);
+	});
+
+	it("refuses linked identities whose HAPI subject is locked or disabled", async () => {
+		const f = await federatedFixture();
+		const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "locked@example.com",
+			email: "locked@example.com", emailVerified: true, status: "ACTIVE" });
+		await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+		await f.subjects.update(subject.oidcSubject, { status: "LOCKED" });
+
+		const interaction = await beginInteraction(f, "verifier-locked");
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		const callback = await appleCallback(f, { state, code });
+		expect(callback.statusCode).toBe(403);
+		expect(callback.body).toContain("unavailable");
+	});
+
+	it("fails authorization-code redemption when the provider link is revoked before /token (revocation handling)", async () => {
+		const f = await federatedFixture();
+		const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "revoked@example.com",
+			email: "revoked@example.com", emailVerified: true, status: "ACTIVE" });
+		const linked = await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+		if (linked.status !== "linked") throw new Error("expected linked");
+
+		const verifier = "verifier-revoked";
+		const interaction = await beginInteraction(f, verifier);
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		const callback = await appleCallback(f, { state, code });
+		expect(callback.statusCode).toBe(303);
+
+		// Unlink (user- or provider-initiated revocation) between code issuance and redemption.
+		await f.federation.unlinkExternalIdentity({ identitySubjectId: subject.id,
+			externalIdentityId: linked.externalIdentity.id });
+		const token = await exchangeCode(f, callback.headers.location as string, verifier);
+		expect(token.statusCode).toBe(400);
+		expect(JSON.parse(token.body).error).toBe("invalid_grant");
+	});
+
+	it("establishes a fixation-safe persistent session and supports returning-user continuation", async () => {
+		const f = await federatedFixture({ flags: { HAPI_PERSISTENT_SESSIONS_ENABLED: true } });
+		const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "returning@example.com",
+			email: "returning@example.com", emailVerified: true, status: "ACTIVE" });
+		await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+
+		// A pre-planted (attacker-chosen) session that must never become authenticated.
+		const planted = await f.sessions.establishSession({ identitySubjectId: subject.id,
+			authenticationMethod: "HAPI_EMAIL" });
+
+		const verifier = "verifier-session";
+		const interaction = await beginInteraction(f, verifier,
+			`; ${HAPI_SESSION_COOKIE}=${planted.sessionToken}`);
+		const { state, code } = await launchProvider(f, interaction, "APPLE");
+		const callback = await appleCallback(f, { state, code });
+		expect(callback.statusCode).toBe(303);
+		const sessionToken = cookieFrom(callback, HAPI_SESSION_COOKIE);
+		expect(sessionToken).toBeDefined();
+		expect(sessionToken).not.toBe(planted.sessionToken);
+
+		// NOTE: the cross-site Apple form_post carries no cookies, so the planted token cannot be
+		// superseded there; it is still revoked the moment it is presented on a same-site login.
+		const session = await f.sessionRepository.findByTokenHash(hashSessionToken(sessionToken!));
+		expect(session).toMatchObject({ identitySubjectId: subject.id, authenticationMethod: "APPLE", status: "active" });
+
+		// Returning user: a NEW authorization shows "Continue as" from the live session.
+		const next = await beginInteraction(f, "verifier-continue", `; ${HAPI_SESSION_COOKIE}=${sessionToken}`);
+		expect(next.chooser.body).toContain("Continue as returning@example.com");
+		const continued = await f.app.inject({ method: "POST", url: "/login/continue",
+			...form({ csrf: next.csrf }, `${next.cookie}; ${HAPI_SESSION_COOKIE}=${sessionToken}`) });
+		expect(continued.statusCode, continued.body).toBe(303);
+		const token = await exchangeCode(f, continued.headers.location as string, "verifier-continue");
+		expect(token.statusCode, token.body).toBe(200);
+		const idToken = decodeJwt(JSON.parse(token.body).id_token);
+		expect(idToken.sub).toBe(subject.oidcSubject);
+		// Honest claims: the ORIGINAL federated authentication, not the continuation.
+		expect(idToken.amr).toEqual(["apple", "fed"]);
+		expect(idToken.auth_time).toBe(Math.floor(Date.parse(session!.authenticatedAt) / 1000));
+
+		// A stale/revoked session cannot continue.
+		await f.sessions.revokeAllSessions(subject.id, "test_revoked");
+		const stale = await beginInteraction(f, "verifier-stale", `; ${HAPI_SESSION_COOKIE}=${sessionToken}`);
+		expect(stale.chooser.body).not.toContain("Continue as");
+		const refused = await f.app.inject({ method: "POST", url: "/login/continue",
+			...form({ csrf: stale.csrf }, `${stale.cookie}; ${HAPI_SESSION_COOKIE}=${sessionToken}`) });
+		expect(refused.statusCode).toBe(401);
+	});
+
+	it("keeps the pre-federation chooser surface operational alongside federation", async () => {
+		const f = await federatedFixture();
+		const interaction = await beginInteraction(f, "verifier-email-coexists");
+		// The pre-existing non-federated option still renders with the same interaction CSRF, and
+		// the email route remains reachable (full OTP coverage lives in UniversalLogin.test.ts).
+		expect(interaction.chooser.body).toContain("Continue with Face");
+		const emailPage = await f.app.inject({ method: "GET", url: "/login/email",
+			headers: { cookie: interaction.cookie } });
+		expect([200, 303]).toContain(emailPage.statusCode);
+	});
+});
