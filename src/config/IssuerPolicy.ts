@@ -71,6 +71,45 @@ export function resolveConfiguredIssuer(injectedIssuer?: string): string {
 		return issuer;
 }
 
+// HAPI ID V2-E Stage 1: deployment-time isolation pin, enforced once at service boot. The
+// default Bookwrm issuer keeps its existing optional-allowlist behavior so production is
+// unchanged. Any other environment-configured issuer (e.g. the staging service at
+// https://id-staging.hapiinc.com) must fail closed at boot unless:
+//   1. OIDC_ALLOWED_ISSUERS is explicitly configured and allows ONLY that issuer (a single
+//      exact entry -- a looser allowlist that also names another issuer is a misconfiguration);
+//   2. CORS_TRUSTED_ORIGINS is explicitly configured (otherwise the service would silently
+//      fall back to the production Bookwrm browser-origin allowlist).
+// This is boot-time deployment policy only; resolveConfiguredIssuer() semantics (Stage 0) are
+// unchanged for library and test use.
+export function enforceDeploymentIssuerPin(): string {
+		const issuer = resolveConfiguredIssuer();
+		if (issuer === DEFAULT_OIDC_ISSUER) {
+				return issuer;
+		}
+
+		const allowedRaw = configuration.get("OIDC_ALLOWED_ISSUERS");
+		if (allowedRaw === undefined) {
+				throw new Error(
+						`OIDC_ALLOWED_ISSUERS must be configured when OIDC_ISSUER is not the default issuer: set it to exactly "${issuer}"`
+				);
+		}
+
+		const allowed = parseExactHttpsOriginList(allowedRaw, "OIDC_ALLOWED_ISSUERS entry");
+		if (allowed.size !== 1 || !allowed.has(issuer)) {
+				throw new Error(
+						`OIDC_ALLOWED_ISSUERS must allow only the configured issuer "${issuer}" (found: ${[...allowed].join(", ")})`
+				);
+		}
+
+		if (configuration.get("CORS_TRUSTED_ORIGINS") === undefined) {
+				throw new Error(
+						`CORS_TRUSTED_ORIGINS must be explicitly configured when OIDC_ISSUER is not the default issuer (the production Bookwrm default allowlist must never apply to "${issuer}")`
+				);
+		}
+
+		return issuer;
+}
+
 // Issuer binding for stored OAuth artifacts (authorization codes, access tokens, legacy refresh
 // tokens). Records minted before Stage 0 carry no issuer and remain honored ONLY by the default
 // Bookwrm issuer, preserving production behavior across the deploy; every other issuer requires

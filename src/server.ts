@@ -23,6 +23,7 @@ import { configureRegistration } from "./registration/RegistrationComposition.js
 import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposition.js";
 import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
 import { registerCorsPolicy } from "./security/CorsPolicy.js";
+import { enforceDeploymentIssuerPin } from "./config/IssuerPolicy.js";
 
 const app = Fastify({
 		logger: {
@@ -31,6 +32,11 @@ const app = Fastify({
 });
 
 configuration.validatePrivateIdConfiguration();
+
+// HAPI ID V2-E Stage 1: fail closed at boot on issuer-environment misconfiguration. Non-default
+// issuers (staging/canonical HAPI services) require an exact single-issuer OIDC_ALLOWED_ISSUERS
+// pin and an explicit CORS_TRUSTED_ORIGINS allowlist; the default Bookwrm issuer is unchanged.
+enforceDeploymentIssuerPin();
 
 // Bootstrap the Identity Registry schema (identity_subjects, schema_migrations) before serving traffic.
 // Non-fatal: a transient DB issue here surfaces via /identity/admin/health instead of blocking boot.

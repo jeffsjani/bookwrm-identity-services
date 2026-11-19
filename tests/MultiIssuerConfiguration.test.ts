@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { configuration } from "../src/config/ConfigurationService.js";
 import {
 	DEFAULT_OIDC_ISSUER,
+	enforceDeploymentIssuerPin,
 	parseExactHttpsOrigin,
 	recordIssuerAccepted,
 	resolveConfiguredIssuer
@@ -35,7 +36,7 @@ const BOOKWRM_ISSUER = "https://identity.bookwrm.com";
 const STAGING_ISSUER = "https://id-staging.hapiinc.com";
 const PRODUCTION_ISSUER = "https://id.hapiinc.com";
 
-const ISSUER_ENV_KEYS = ["OIDC_ISSUER", "OIDC_ALLOWED_ISSUERS", "HAPI_REFRESH_GRANT_ENABLED"] as const;
+const ISSUER_ENV_KEYS = ["OIDC_ISSUER", "OIDC_ALLOWED_ISSUERS", "CORS_TRUSTED_ORIGINS", "HAPI_REFRESH_GRANT_ENABLED"] as const;
 
 function setIssuerEnv(issuer?: string): void {
 	if (issuer === undefined) {
@@ -130,6 +131,56 @@ describe("V2-E Stage 0 — issuer configuration validation (fail closed)", () =>
 		expect(recordIssuerAccepted(undefined, STAGING_ISSUER)).toBe(false);
 		expect(recordIssuerAccepted(STAGING_ISSUER, STAGING_ISSUER)).toBe(true);
 		expect(recordIssuerAccepted(STAGING_ISSUER, PRODUCTION_ISSUER)).toBe(false);
+	});
+});
+
+// HAPI ID V2-E Stage 1: boot-time deployment pin. Any non-default issuer service (staging or the
+// future canonical production issuer) must be explicitly pinned to exactly its own issuer and
+// must carry an explicit CORS allowlist; the default Bookwrm issuer behavior is unchanged.
+describe("V2-E Stage 1 — deployment issuer pin (fail closed at boot)", () => {
+	afterEach(() => {
+		for (const key of ISSUER_ENV_KEYS) delete process.env[key];
+		configuration.reload();
+	});
+
+	it("keeps the default Bookwrm issuer bootable without an allowlist or CORS override (production unchanged)", () => {
+		expect(enforceDeploymentIssuerPin()).toBe(BOOKWRM_ISSUER);
+		setIssuerEnv(BOOKWRM_ISSUER);
+		expect(enforceDeploymentIssuerPin()).toBe(BOOKWRM_ISSUER);
+	});
+
+	it("refuses to boot a non-default issuer without an OIDC_ALLOWED_ISSUERS pin", () => {
+		setIssuerEnv(STAGING_ISSUER);
+		expect(() => enforceDeploymentIssuerPin()).toThrow(/OIDC_ALLOWED_ISSUERS must be configured/);
+	});
+
+	it("refuses to boot the staging issuer when the allowlist also names another issuer", () => {
+		process.env.OIDC_ALLOWED_ISSUERS = `${STAGING_ISSUER},${PRODUCTION_ISSUER}`;
+		process.env.CORS_TRUSTED_ORIGINS = "https://staging-app.hapiinc.com";
+		setIssuerEnv(STAGING_ISSUER);
+		expect(() => enforceDeploymentIssuerPin()).toThrow(/must allow only the configured issuer/);
+
+		process.env.OIDC_ALLOWED_ISSUERS = `${STAGING_ISSUER},${BOOKWRM_ISSUER}`;
+		configuration.reload();
+		expect(() => enforceDeploymentIssuerPin()).toThrow(/must allow only the configured issuer/);
+	});
+
+	it("refuses to boot a non-default issuer without an explicit CORS_TRUSTED_ORIGINS allowlist", () => {
+		process.env.OIDC_ALLOWED_ISSUERS = STAGING_ISSUER;
+		setIssuerEnv(STAGING_ISSUER);
+		expect(() => enforceDeploymentIssuerPin()).toThrow(/CORS_TRUSTED_ORIGINS must be explicitly configured/);
+	});
+
+	it("boots the staging issuer only under an exact single-issuer pin plus explicit CORS origins", () => {
+		process.env.OIDC_ALLOWED_ISSUERS = STAGING_ISSUER;
+		process.env.CORS_TRUSTED_ORIGINS = "https://id-staging.hapiinc.com,https://staging-app.hapiinc.com";
+		setIssuerEnv(STAGING_ISSUER);
+		expect(enforceDeploymentIssuerPin()).toBe(STAGING_ISSUER);
+
+		// The same rule governs the future canonical production issuer.
+		process.env.OIDC_ALLOWED_ISSUERS = PRODUCTION_ISSUER;
+		setIssuerEnv(PRODUCTION_ISSUER);
+		expect(enforceDeploymentIssuerPin()).toBe(PRODUCTION_ISSUER);
 	});
 });
 
