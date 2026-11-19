@@ -438,6 +438,17 @@ export class OIDCService {
 										};
 								}
 
+								// V2-B nonce policy: every HAPI ID transaction binds the ID Token to the client's
+								// nonce, and the token endpoint has always rejected codes without one. Enforcing the
+								// existing requirement here fails fast at /authorize instead of issuing a code that
+								// can never be exchanged. No functional client is affected: all successfully
+								// integrated clients already send nonce.
+								if (!query.nonce || query.nonce.trim().length === 0) {
+										reply.code(400);
+										error = "nonce is required";
+										return { error: "invalid_request", error_description: "nonce is required" };
+								}
+
 								const pendingContext: PendingAuthorizationContext = {
 										clientId,
 										redirectUri,
@@ -742,8 +753,14 @@ export class OIDCService {
 
 							const claims = await this.claimsService.toOIDCClaims(authenticatedUser);
 
+							// V2-B interim refresh-token policy: no refresh grant is implemented yet, so a
+							// long-lived refresh token is only issued when the client's registration explicitly
+							// includes the refresh_token grant (preserving legacy Bookwrm behavior). Newly
+							// registered clients -- e.g. future native public clients -- receive none until the
+							// rotating refresh-token family design is implemented.
+							const issueRefreshToken = this.clientAllowsRefreshTokenGrant(client);
 							const accessToken = this.createOpaqueToken();
-							const refreshToken = this.createOpaqueToken();
+							const refreshToken = issueRefreshToken ? this.createOpaqueToken() : undefined;
 							await this.storeAccessToken(accessToken, {
 									sub: claims.sub,
 									clientId,
@@ -754,11 +771,13 @@ export class OIDCService {
 										authenticatedAt: codeRecord.authenticatedAt
 									} : {})
 							});
-							await this.storeRefreshToken(refreshToken, {
-									userId: codeRecord.userId,
-									clientId,
-									scope: codeRecord.scope
-							});
+							if (refreshToken) {
+									await this.storeRefreshToken(refreshToken, {
+											userId: codeRecord.userId,
+											clientId,
+											scope: codeRecord.scope
+									});
+							}
 							const idToken = await this.createIdToken({
 							issuer,
 								subject: codeRecord.userSub,
@@ -782,7 +801,7 @@ export class OIDCService {
 								token_type: "Bearer",
 								expires_in: 300,
 								access_token: accessToken,
-								refresh_token: refreshToken,
+								...(refreshToken !== undefined ? { refresh_token: refreshToken } : {}),
 								id_token: idToken
 								};
 						} catch (err) {
@@ -1607,6 +1626,18 @@ export class OIDCService {
 				}
 
 				return grants.includes("authorization_code");
+		}
+
+		// V2-B interim refresh-token policy: issuance strictly follows the client registration.
+		// Legacy metadata without a grant list keeps its existing behavior (token issued).
+		private clientAllowsRefreshTokenGrant(client: OIDCClient): boolean {
+				const grants = client.grant_types;
+
+				if (!Array.isArray(grants)) {
+						return true;
+				}
+
+				return grants.includes("refresh_token");
 		}
 
 		private clientRequiresPkce(client: OIDCClient): boolean {

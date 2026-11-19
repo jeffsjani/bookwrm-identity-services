@@ -61,7 +61,7 @@ describe("HAPI ID H1 - OIDCService AuthenticationProvider DI", () => {
 
 				const response = await app.inject({
 						method: "GET",
-						url: "/authorize?client_id=base44-web&redirect_uri=https://example.com/callback&response_type=code&scope=openid&code_challenge=abc&code_challenge_method=S256"
+						url: "/authorize?client_id=base44-web&redirect_uri=https://example.com/callback&response_type=code&scope=openid&nonce=test-nonce&code_challenge=abc&code_challenge_method=S256"
 				});
 
 				expect(response.statusCode).toBe(302);
@@ -94,7 +94,7 @@ describe("HAPI ID H1 - OIDCService persisted OIDCClient resolution", () => {
 
 				const response = await app.inject({
 						method: "GET",
-						url: "/authorize?client_id=base44-web&redirect_uri=https://persisted.example.com/callback&response_type=code&scope=openid&code_challenge=abc&code_challenge_method=S256"
+						url: "/authorize?client_id=base44-web&redirect_uri=https://persisted.example.com/callback&response_type=code&scope=openid&nonce=test-nonce&code_challenge=abc&code_challenge_method=S256"
 				});
 
 				// The persisted redirect_uris, rather than the env values, authorize this request.
@@ -111,7 +111,7 @@ describe("HAPI ID H1 - OIDCService persisted OIDCClient resolution", () => {
 
 				const response = await app.inject({
 						method: "GET",
-						url: "/authorize?client_id=base44-web&redirect_uri=https://example.com/callback&response_type=code&scope=openid&code_challenge=abc&code_challenge_method=S256"
+						url: "/authorize?client_id=base44-web&redirect_uri=https://example.com/callback&response_type=code&scope=openid&nonce=test-nonce&code_challenge=abc&code_challenge_method=S256"
 				});
 
 				expect(response.statusCode).toBe(400);
