@@ -11,6 +11,7 @@ describe.skipIf(!databaseUrl)("Schema versioning (integration)", () => {
 		let getPostgresPool: typeof import("../src/identity/infrastructure/PostgresInfrastructure.js").getPostgresPool;
 		let closePostgresPool: typeof import("../src/identity/infrastructure/PostgresInfrastructure.js").closePostgresPool;
 		let CURRENT_SCHEMA_VERSION: typeof import("../src/identity/infrastructure/PostgresInfrastructure.js").CURRENT_SCHEMA_VERSION;
+		let CURRENT_SCHEMA_DESCRIPTION: typeof import("../src/identity/infrastructure/PostgresInfrastructure.js").CURRENT_SCHEMA_DESCRIPTION;
 
 		beforeAll(async () => {
 				process.env.DATABASE_URL = databaseUrl;
@@ -19,7 +20,8 @@ describe.skipIf(!databaseUrl)("Schema versioning (integration)", () => {
 						getSchemaVersionInfo,
 						getPostgresPool,
 						closePostgresPool,
-						CURRENT_SCHEMA_VERSION
+						CURRENT_SCHEMA_VERSION,
+						CURRENT_SCHEMA_DESCRIPTION
 				} = await import("../src/identity/infrastructure/PostgresInfrastructure.js"));
 		});
 
@@ -42,7 +44,7 @@ describe.skipIf(!databaseUrl)("Schema versioning (integration)", () => {
 				);
 
 				expect(result.rows).toHaveLength(1);
-				expect(result.rows[0].description).toBe("Initial Identity Registry");
+				expect(result.rows[0].description).toBe(CURRENT_SCHEMA_DESCRIPTION);
 
 				const info = await getSchemaVersionInfo();
 				expect(info.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
