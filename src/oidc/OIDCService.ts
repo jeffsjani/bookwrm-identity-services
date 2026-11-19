@@ -16,6 +16,7 @@ import { VerificationError } from "../email/VerificationChallenge.js";
 
 import type { AuthenticationProvider, AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import { configuration } from "../config/ConfigurationService.js";
+import { DEFAULT_OIDC_ISSUER, recordIssuerAccepted, resolveConfiguredIssuer } from "../config/IssuerPolicy.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
@@ -210,7 +211,7 @@ export type OIDCDashboardSnapshot = {
 };
 
 export class OIDCService {
-		private static readonly DEFAULT_ISSUER = "https://identity.bookwrm.com";
+		private static readonly DEFAULT_ISSUER = DEFAULT_OIDC_ISSUER;
 		private static readonly AUTHORIZATION_CODE_TTL_MS = 60_000;
 		private static readonly AUTHORIZATION_CODE_CLEANUP_INTERVAL_MS = 30_000;
 		private static readonly ACCESS_TOKEN_TTL_MS = 300_000;
@@ -598,7 +599,7 @@ export class OIDCService {
 								const accessToken = authorization.slice("Bearer ".length).trim();
 								const tokenRecord = await this.getAccessTokenRecord(accessToken);
 
-								if (!tokenRecord) {
+								if (!tokenRecord || !recordIssuerAccepted(tokenRecord.issuer, this.resolveIssuer())) {
 										reply.code(401);
 										error = "Access token is invalid or expired";
 										return { error: "invalid_token", error_description: "Access token is invalid or expired" };
@@ -709,6 +710,15 @@ export class OIDCService {
 								if (!codeRecord) {
 										reply.code(400);
 										error = "Invalid or expired authorization code";
+										return { error: "invalid_grant", error_description: "Invalid or expired authorization code" };
+								}
+
+								// HAPI ID V2-E Stage 0: authorization codes are issuer-bound. A code minted
+								// under a different issuer environment is never redeemable here, even when the
+								// environments share a backing store.
+								if (!recordIssuerAccepted(codeRecord.issuer, this.resolveIssuer())) {
+										reply.code(400);
+										error = "authorization code issuer mismatch";
 										return { error: "invalid_grant", error_description: "Invalid or expired authorization code" };
 								}
 
@@ -875,6 +885,7 @@ export class OIDCService {
 									clientId,
 									nonce: codeRecord.nonce,
 									scope: codeRecord.scope,
+									issuer,
 									...(codeRecord.authenticationMethod ? {
 										authenticationMethod: codeRecord.authenticationMethod,
 										authenticatedAt: codeRecord.authenticatedAt
@@ -884,7 +895,8 @@ export class OIDCService {
 									await this.storeRefreshToken(legacyRefreshToken, {
 											userId: codeRecord.userId,
 											clientId,
-											scope: codeRecord.scope
+											scope: codeRecord.scope,
+											issuer
 									});
 							}
 							const idToken = await this.createIdToken({
@@ -965,12 +977,11 @@ export class OIDCService {
 				return discovery;
 		}
 
+		// HAPI ID V2-E Stage 0: the resolved issuer is always validated (exact https origin, no
+		// wildcard/suffix matching) and checked against OIDC_ALLOWED_ISSUERS when configured --
+		// malformed or conflicting issuer configuration fails closed here.
 		private resolveIssuer(): string {
-				if (this.options.issuer) {
-						return this.options.issuer;
-				}
-
-				return configuration.getOidcIssuer(OIDCService.DEFAULT_ISSUER);
+				return resolveConfiguredIssuer(this.options.issuer);
 		}
 
 		private assertSigningKeyConfiguration(): void {
@@ -1006,8 +1017,19 @@ export class OIDCService {
 						}
 				}
 
-				if (discovery.issuer !== OIDCService.DEFAULT_ISSUER) {
+				// HAPI ID V2-E Stage 0: the configured issuer is the authoritative expected value --
+				// discovery must assert exactly the resolved issuer, and every advertised endpoint
+				// must be anchored to that issuer. No wildcard or suffix matching.
+				const expectedIssuer = this.resolveIssuer();
+				if (discovery.issuer !== expectedIssuer) {
 						throw new Error("OpenID discovery validation failed: issuer mismatch");
+				}
+
+				for (const endpointField of ["authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri"]) {
+						const value = discovery[endpointField];
+						if (typeof value !== "string" || !value.startsWith(`${expectedIssuer}/`)) {
+								throw new Error(`OpenID discovery validation failed: ${endpointField} is not anchored to the issuer`);
+						}
 				}
 		}
 
@@ -1176,6 +1198,7 @@ export class OIDCService {
 						codeChallenge: context.codeChallenge,
 						userId: user.id,
 						userSub: user.sub,
+						issuer: this.resolveIssuer(),
 						...(user.authenticationMethod ? {
 							authenticationMethod: user.authenticationMethod,
 							authenticatedAt: user.authenticatedAt
@@ -2300,6 +2323,7 @@ export class OIDCService {
 						// Refresh exchanges carry no authentication-request nonce (OIDC Core §12).
 						nonce: "",
 						scope: rotated.family.scope,
+						issuer: this.resolveIssuer(),
 						...(rotated.family.authenticationMethod ? {
 								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE",
 								...(rotated.family.authenticatedAt

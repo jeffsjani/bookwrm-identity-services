@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { FaceEnrollmentError } from "../authenticators/FaceEnrollmentTypes.js";
 import type { HapiFaceEnrollmentService } from "../authenticators/HapiFaceEnrollmentService.js";
+import { recordIssuerAccepted, resolveConfiguredIssuer } from "../config/IssuerPolicy.js";
 import type { RedisOIDCStore } from "../oidc/infrastructure/RedisOIDCStore.js";
 import type { AccessTokenRecord } from "../oidc/infrastructure/RedisOIDCStore.js";
 import { clearPrivateIDBrowserReturn, PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
@@ -15,7 +16,11 @@ export async function registerHapiFaceEnrollmentRoutes(app: FastifyInstance,
 			throw new FaceEnrollmentError("UNAUTHORIZED", 401);
 		}
 		const token = await tokens.getAccessTokenRecord(authorization.slice(7).trim());
-		if (!token) throw new FaceEnrollmentError("UNAUTHORIZED", 401);
+		// V2-E Stage 0: access tokens are issuer-bound; tokens minted by another issuer
+		// environment are never accepted here.
+		if (!token || !recordIssuerAccepted(token.issuer, resolveConfiguredIssuer())) {
+			throw new FaceEnrollmentError("UNAUTHORIZED", 401);
+		}
 		return token;
 	};
 

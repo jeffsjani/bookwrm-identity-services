@@ -1,13 +1,25 @@
 import { randomUUID } from "node:crypto";
 
 import { configuration } from "../config/ConfigurationService.js";
+import { parseExactHttpsOriginList } from "../config/IssuerPolicy.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import type { PrivateIDResult } from "./PrivateIDResult.js";
 import type { PrivateIDSession, PrivateIDSessionStatus } from "./PrivateIDSession.js";
 import { findPrivateIDSession, getCurrentPrivateIDSessionRecord, storePrivateIDResult, storePrivateIDSession } from "./PrivateIDSessionStore.js";
 
 type PrivateIDSessionApiResponse = Record<string, unknown>;
-const PRIVATEID_WEBHOOK_CALLBACK_URL = "https://identity.bookwrm.com/privateid/webhook";
+
+// HAPI ID V2-E Stage 0: the server-to-server webhook callback URL is configurable per issuer
+// environment via PRIVATEID_CALLBACK_URL, with the previous hardcoded production value preserved
+// as the default. Configured values are validated (https scheme, no credentials/query/fragment)
+// and their origin must be one of the supported identity-service hosts, optionally extended via
+// PRIVATEID_ALLOWED_CALLBACK_ORIGINS. Unexpected callback origins fail closed.
+const DEFAULT_PRIVATEID_WEBHOOK_CALLBACK_URL = "https://identity.bookwrm.com/privateid/webhook";
+const SUPPORTED_PRIVATEID_CALLBACK_ORIGINS = new Set([
+		"https://identity.bookwrm.com",
+		"https://id-staging.hapiinc.com",
+		"https://id.hapiinc.com"
+]);
 
 export type PrivateIDCallbackPayload = {
 		reason: string;
@@ -339,7 +351,36 @@ export class PrivateIDClient {
 		}
 
 		private resolveCallbackUrl(): string {
-				return PRIVATEID_WEBHOOK_CALLBACK_URL;
+				const configured = configuration.get("PRIVATEID_CALLBACK_URL")?.trim();
+				if (!configured) {
+						return DEFAULT_PRIVATEID_WEBHOOK_CALLBACK_URL;
+				}
+
+				let url: URL;
+				try {
+						url = new URL(configured);
+				} catch {
+						throw new Error("PRIVATEID_CALLBACK_URL is not a valid URL");
+				}
+				if (url.protocol !== "https:") {
+						throw new Error("PRIVATEID_CALLBACK_URL must use the https scheme");
+				}
+				if (url.username || url.password || url.search || url.hash) {
+						throw new Error("PRIVATEID_CALLBACK_URL must not contain credentials, query, or fragment");
+				}
+
+				const allowedOrigins = new Set(SUPPORTED_PRIVATEID_CALLBACK_ORIGINS);
+				const extraOrigins = configuration.get("PRIVATEID_ALLOWED_CALLBACK_ORIGINS");
+				if (extraOrigins !== undefined) {
+						for (const origin of parseExactHttpsOriginList(extraOrigins, "PRIVATEID_ALLOWED_CALLBACK_ORIGINS origin")) {
+								allowedOrigins.add(origin);
+						}
+				}
+				if (!allowedOrigins.has(url.origin)) {
+						throw new Error(`PRIVATEID_CALLBACK_URL origin is not an allowed callback origin: ${url.origin}`);
+				}
+
+				return url.toString();
 		}
 
 		private resolveCallbackHeaders(): Record<string, string> {

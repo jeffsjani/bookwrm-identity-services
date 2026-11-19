@@ -10,6 +10,9 @@ type AccessTokenRecord = {
 		nonce: string;
 		scope: string;
 		expiresAt: number;
+		// HAPI ID V2-E Stage 0: issuer binding -- tokens are only honored by the issuer that
+		// minted them (legacy records without an issuer bind to the default Bookwrm issuer).
+		issuer?: string;
 		authenticationMethod?: OIDCAuthorizationCode["authenticationMethod"];
 		authenticatedAt?: string;
 };
@@ -19,6 +22,7 @@ type RefreshTokenRecord = {
 		clientId: string;
 		scope: string;
 		expiresAt: number;
+		issuer?: string;
 };
 
 export class RedisOIDCStore {

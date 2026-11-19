@@ -477,8 +477,9 @@ describe("PrivateID callback", () => {
 				"https://identity.bookwrm.com/privateid/callback",
 				"https://identity.bookwrm.com/face-setup/callback"
 			]);
-			// The server-to-server webhook is never re-targeted by the browser return path.
-			expect(new Set(sent.map(body => body.callback.url))).toEqual(new Set(["https://identity.bookwrm.com/privateid/webhook"]));
+			// The server-to-server webhook is never re-targeted by the browser return path; it is
+			// pinned to the environment-configured PRIVATEID_CALLBACK_URL (V2-E Stage 0).
+			expect(new Set(sent.map(body => body.callback.url))).toEqual(new Set(["https://example.com/privateid/webhook"]));
 			await expect(client.createEnrollmentSession(randomUUID(), undefined, { redirectPath: "//evil.example/x" })).rejects.toThrow();
 			await expect(client.createEnrollmentSession(randomUUID(), undefined, { redirectPath: "https://evil.example/x" })).rejects.toThrow();
 			expect(fetchMock).toHaveBeenCalledTimes(3);
