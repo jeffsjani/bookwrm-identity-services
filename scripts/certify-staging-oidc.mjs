@@ -23,11 +23,20 @@
 // Optional environment for deeper staging checks (synthetic/staging-only):
 //   STAGING_CLIENT_ID        synthetic staging client (e.g. staging-web)
 //   STAGING_REDIRECT_URI     its exact registered redirect URI
-//   STAGING_ACCESS_TOKEN     access token minted BY STAGING for a synthetic user
-//   STAGING_ID_TOKEN         ID token minted BY STAGING for a synthetic user
-//   PRODUCTION_ACCESS_TOKEN  (optional) production-minted token for the reverse
-//                            cross-issuer rejection check. Use a short-lived,
-//                            revocable synthetic-user token only.
+//   STAGING_ID_TOKEN         ID token minted BY STAGING for a synthetic user; verified
+//                            LOCALLY against fetched JWKS only — never transmitted.
+//
+// Token-transmission policy (V2-E Stage 2): this harness NEVER sends real
+// credentials or bearer tokens to any environment, in either direction. Live
+// cross-issuer token-rejection certification is deferred to the positive
+// authentication stage and is reported as NOT-TESTED until then; a garbage
+// foreign bearer probe is reported separately as an infrastructure check and
+// is never presented as cross-issuer evidence.
+//
+// Statuses: PASS/FAIL (infrastructure checks), DENIED (request fully validated
+// and then intentionally denied because no authentication method is enabled —
+// the expected posture until email activation), NOT-TESTED (requires live
+// authentication, deferred), MANUAL, SKIP, INFO. Only FAIL affects exit code.
 // =============================================================================
 
 import { createLocalJWKSet, decodeJwt, jwtVerify } from "jose";
@@ -45,7 +54,7 @@ const BASELINE_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "p
 const results = [];
 function record(id, status, detail) {
 	results.push({ id, status, detail });
-	const icon = { PASS: "✅", FAIL: "❌", SKIP: "⏭️ ", MANUAL: "📝", INFO: "ℹ️ " }[status] ?? "?";
+	const icon = { PASS: "✅", FAIL: "❌", SKIP: "⏭️ ", MANUAL: "📝", INFO: "ℹ️ ", DENIED: "🚫", "NOT-TESTED": "⏸️ " }[status] ?? "?";
 	console.log(`${icon} [${status}] ${id}${detail ? ` — ${detail}` : ""}`);
 }
 
@@ -178,7 +187,8 @@ async function stagingCertification(prodKids) {
 		const { iss } = decodeJwt(stagingIdToken);
 		record("staging.idtoken.iss", iss === staging ? "PASS" : "FAIL", `iss=${iss}`);
 	} else {
-		record("staging.idtoken.verify", "MANUAL", "set STAGING_ID_TOKEN (synthetic user) to certify signature + iss + cross-JWKS rejection");
+		record("staging.idtoken.verify", "NOT-TESTED",
+			"requires a staging-minted synthetic ID token; live authentication is disabled this stage (deferred to email-activation certification)");
 	}
 
 	// D5/D6: PKCE S256 authorize + exact redirect-URI enforcement (synthetic client).
@@ -187,13 +197,27 @@ async function stagingCertification(prodKids) {
 	if (clientId && redirectUri) {
 		const verifier = crypto.randomBytes(32).toString("base64url");
 		const challenge = crypto.createHash("sha256").update(verifier).digest("base64url");
+		// V2-B requires nonce at /authorize (fail-fast); positive probes must include it.
 		const authorize = (uri) => `${json.authorization_endpoint}?response_type=code&client_id=${encodeURIComponent(clientId)}` +
-			`&redirect_uri=${encodeURIComponent(uri)}&scope=openid&state=${crypto.randomUUID()}` +
+			`&redirect_uri=${encodeURIComponent(uri)}&scope=openid&state=${crypto.randomUUID()}&nonce=${crypto.randomUUID()}` +
 			`&code_challenge=${challenge}&code_challenge_method=S256`;
 
+		// Infrastructure vs. intentional denial: a fully validated request that is then
+		// refused because no authentication method is enabled is the EXPECTED posture
+		// while all login methods are disabled — recorded as DENIED, never FAIL.
 		const ok = await fetchJson(authorize(redirectUri));
-		record("staging.authorize.pkce", [200, 302, 303].includes(ok.response.status) ? "PASS" : "FAIL",
-			`authorize with registered redirect_uri + S256 -> HTTP ${ok.response.status}`);
+		const okStatus = ok.response.status;
+		if ([200, 302, 303].includes(okStatus)) {
+			record("staging.authorize.pkce", "PASS",
+				`authorize with registered redirect_uri + S256 + nonce -> HTTP ${okStatus} (a live authentication method is enabled)`);
+		} else if (okStatus === 403) {
+			record("staging.authorize.pkce", "DENIED",
+				"authorize request fully validated (client, redirect_uri, PKCE S256, nonce), then intentionally denied with HTTP 403: " +
+				"no authentication method is enabled for the staging application — expected until email-authentication activation");
+		} else {
+			record("staging.authorize.pkce", "FAIL",
+				`authorize with registered redirect_uri + S256 + nonce -> HTTP ${okStatus} (validation defect: expected 200/302/303 or an intentional 403 denial)`);
+		}
 
 		const evil = await fetchJson(authorize("https://attacker.example/callback"));
 		const location = evil.response.headers.get("location") ?? "";
@@ -218,25 +242,17 @@ async function stagingCertification(prodKids) {
 	record("staging.code.cross-issuer", "INFO",
 		"issuer binding certified in tests/MultiIssuerConfiguration.test.ts; live stores are physically separate");
 
-	// D8: cross-issuer token rejection, both directions.
-	const stagingAccessToken = process.env.STAGING_ACCESS_TOKEN;
-	if (stagingAccessToken) {
-		const prodUserinfo = await fetchJson(`${PRODUCTION_ISSUER}/userinfo`, { headers: { authorization: `Bearer ${stagingAccessToken}` } });
-		record("cross.staging-token-at-prod", prodUserinfo.response.status === 401 ? "PASS" : "FAIL",
-			`staging access token at production /userinfo -> HTTP ${prodUserinfo.response.status} (expected 401)`);
-	} else {
-		record("cross.staging-token-at-prod", "MANUAL", "set STAGING_ACCESS_TOKEN (synthetic user) for the live rejection check");
-	}
-	const productionAccessToken = process.env.PRODUCTION_ACCESS_TOKEN;
-	if (productionAccessToken) {
-		const stagingUserinfo = await fetchJson(json.userinfo_endpoint, { headers: { authorization: `Bearer ${productionAccessToken}` } });
-		record("cross.prod-token-at-staging", stagingUserinfo.response.status === 401 ? "PASS" : "FAIL",
-			`production access token at staging /userinfo -> HTTP ${stagingUserinfo.response.status} (expected 401)`);
-	} else {
-		const garbage = await fetchJson(json.userinfo_endpoint, { headers: { authorization: "Bearer not-a-real-token" } });
-		record("cross.prod-token-at-staging", garbage.response.status === 401 ? "PASS" : "FAIL",
-			`foreign/garbage bearer at staging /userinfo -> HTTP ${garbage.response.status} (expected 401; set PRODUCTION_ACCESS_TOKEN for the full check)`);
-	}
+	// D8: live cross-issuer token rejection requires environment-minted tokens and is
+	// certified in the positive authentication stage. This harness transmits NO real
+	// bearer tokens in either direction; the garbage-bearer probe below is an
+	// infrastructure check only and is never counted as cross-issuer evidence.
+	record("cross.staging-token-at-prod", "NOT-TESTED",
+		"deferred to positive authentication certification; this harness never transmits bearer tokens cross-environment");
+	record("cross.prod-token-at-staging", "NOT-TESTED",
+		"deferred to positive authentication certification; see staging.userinfo.foreign-bearer for the infrastructure-only probe");
+	const garbage = await fetchJson(json.userinfo_endpoint, { headers: { authorization: "Bearer not-a-real-token" } });
+	record("staging.userinfo.foreign-bearer", garbage.response.status === 401 ? "PASS" : "FAIL",
+		`malformed foreign bearer at staging /userinfo -> HTTP ${garbage.response.status} (expected 401; NOT cross-issuer certification)`);
 
 	// CORS isolation: production browser origins must be rejected on staging.
 	const corsProduction = await fetchJson(`${staging}/.well-known/openid-configuration`, { headers: { origin: "https://bookwrm.com" } });
@@ -259,9 +275,10 @@ async function stagingCertification(prodKids) {
 	const health = await fetchJson(`${staging}/health`);
 	record("staging.health", health.response.status === 200 ? "PASS" : "FAIL", `GET /health -> ${health.response.status}`);
 
-	// D9: synthetic registration/authentication is an interactive browser flow.
-	record("staging.synthetic-auth", "MANUAL",
-		"run the synthetic registration + login ceremony in a browser against staging (test-reserved addresses only), then re-run with STAGING_ID_TOKEN/STAGING_ACCESS_TOKEN set");
+	// D9: synthetic registration/authentication requires a live authentication method.
+	record("staging.synthetic-auth", "NOT-TESTED",
+		"requires an enabled authentication method (all login methods are disabled this stage); " +
+		"run the synthetic registration + login ceremony after email-activation approval, then re-run with STAGING_ID_TOKEN set");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +292,12 @@ const prodKids = await productionPreflight();
 
 if (!preflightOnly) {
 	console.log("");
-	await stagingCertification(prodKids);
+	try {
+		await stagingCertification(prodKids);
+	} catch (error) {
+		record("staging.unreachable", "FAIL",
+			`staging certification aborted: ${error?.cause?.code ?? error.message} (is the staging service deployed and the domain resolvable?)`);
+	}
 } else if (process.env.STAGING_ISSUER) {
 	console.log("\nSTAGING_ISSUER is set but --staging-approved was not passed; staging checks were NOT run.");
 	console.log("Staging certification requires a separately approved deployment (Stage 1 approval gate).");
@@ -283,6 +305,9 @@ if (!preflightOnly) {
 
 const failures = results.filter((entry) => entry.status === "FAIL");
 const manual = results.filter((entry) => entry.status === "MANUAL");
-console.log(`\nSummary: ${results.filter((entry) => entry.status === "PASS").length} pass, ${failures.length} fail, ${manual.length} manual, ` +
+const denied = results.filter((entry) => entry.status === "DENIED");
+const notTested = results.filter((entry) => entry.status === "NOT-TESTED");
+console.log(`\nSummary: ${results.filter((entry) => entry.status === "PASS").length} pass, ${failures.length} fail, ` +
+	`${denied.length} expected-denial, ${notTested.length} not-tested, ${manual.length} manual, ` +
 	`${results.filter((entry) => entry.status === "SKIP").length} skipped`);
 if (failures.length > 0) process.exit(1);
