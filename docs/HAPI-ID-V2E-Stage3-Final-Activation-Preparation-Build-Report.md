@@ -163,18 +163,34 @@ the end of the session.
 
 ## 8. Remaining path to Phase D activation
 
-1. Operator completes B1 (staging Resend key + verified sender) and B2 (controlled inbox).
-2. Operator rotates the `staging-web` secret with D1 against the staging database and places the
-   new value in the secret manager + test-shell environment (closes B3 operationally).
-3. Operator applies the readiness §3.1 Railway variables to `charismatic-charm` only
-   (`HAPI_EMAIL_PROVIDER=resend`, `HAPI_EMAIL_VERIFICATION_SECRET`, `RESEND_API_KEY`,
-   `HAPI_EMAIL_FROM`, `HAPI_EMAIL_AUTHENTICATION_ENABLED=true`; `HAPI_UNIVERSAL_LOGIN_ENABLED`
-   may remain `false` for the harness-driven Path 2 test) and redeploys (B5 — approval gate).
-4. With the separate written Phase D approval, run:
-   `STAGING_CLIENT_SECRET=… STAGING_TEST_EMAIL=… node scripts/stage3-email-auth-test.mjs
-   --staging-live-approved --register-identity --negative-verifier`
-5. Execute the readiness §3.7 rollback and Phase E before/after checks (production preflight,
-   subject-count delta = 1, gated endpoints restored to 404).
+1. Confirm a staging-only Resend key and verified sender, a reachable controlled test inbox,
+  and separate written approval for staging-only activation and Phase D. Do not send an OTP
+  or enable authentication before these prerequisites are met.
+2. After approval, an authorized operator configures and activates staging-only email per
+  readiness §3.1. Keep Universal Login, Apple, Google, refresh grants and persistent sessions
+  disabled. Confirm the rotation flag remains absent.
+3. Use an approved operator-controlled workstation with this updated checkout, Node.js
+  dependencies, an interactive terminal, and an authorized Railway CLI linked to the staging
+  project `charismatic-charm`. Set `STAGING_TEST_EMAIL` to the controlled inbox in the local
+  environment. `railway run` fetches the selected service's variables and injects them into the
+  local command, including `STAGING_WEB_CLIENT_SECRET`; it therefore requires a trusted runner
+  authorized to access all those variables. Do not use Codespaces, log variables, enable shell
+  tracing, or put secrets in commands. Stop if this secure access is unavailable.
+4. On that workstation run `railway run --service <staging-backend-service> --environment production
+  --no-local node scripts/stage3-email-auth-test.mjs --staging-live-approved --register-identity`,
+  replacing the service placeholder with the existing staging backend service name. The Railway
+  environment named `production` here is inside the staging project, not the Bookwrm production
+  project. `--no-local` prevents local overrides of the Railway variables.
+  Use `--register-identity` only when the approved synthetic identity needs registration; omit it
+  when that identity already exists. Optionally add `--negative-verifier` for another OTP round.
+  The harness aborts before OTP unless the correct secret returns HTTP 400 `INVALID_EVIDENCE` and
+  a random incorrect secret returns HTTP 401. Enter OTPs only at its hidden terminal prompt.
+5. After the test, restore the pre-test staging email settings: disable
+  `HAPI_EMAIL_AUTHENTICATION_ENABLED`, leave `HAPI_UNIVERSAL_LOGIN_ENABLED` disabled, and remove
+  only email provider variables added for the test. Apply the rollback on the same backend
+  revision that was running before the test; do not use the historical SHA in readiness §3.7.
+  Verify email routes are unavailable and rerun production preflight. Retain the synthetic
+  identity unless separate cleanup is approved.
 6. B6 (Railway datastore-scoping evidence) remains strongly recommended now and **required**
    before any later persistent-session activation.
 

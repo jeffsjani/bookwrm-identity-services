@@ -52,7 +52,7 @@
 // Basic-auth headers to the staging origin.
 //
 // Required environment:
-//   STAGING_CLIENT_SECRET   staging-web secret (env only; never in argv/chat/git)
+//   STAGING_WEB_CLIENT_SECRET or STAGING_CLIENT_SECRET (environment only)
 //   STAGING_TEST_EMAIL      the approved controlled test inbox address
 // Optional:
 //   STAGING_ISSUER          default https://id-staging.hapiinc.com (must match)
@@ -60,7 +60,6 @@
 //   STAGING_REDIRECT_URI    default https://staging-app.hapiinc.com/callback
 //
 // Usage (after separate written Phase D approval only):
-//   STAGING_CLIENT_SECRET=... STAGING_TEST_EMAIL=... \
 //   node scripts/stage3-email-auth-test.mjs --staging-live-approved \
 //     [--register-identity] [--negative-verifier]
 // =============================================================================
@@ -75,7 +74,7 @@ const args = new Set(process.argv.slice(2));
 const issuer = process.env.STAGING_ISSUER ?? EXPECTED_STAGING_ISSUER;
 const clientId = process.env.STAGING_CLIENT_ID ?? "staging-web";
 const redirectUri = process.env.STAGING_REDIRECT_URI ?? "https://staging-app.hapiinc.com/callback";
-const clientSecret = process.env.STAGING_CLIENT_SECRET;
+const clientSecret = process.env.STAGING_WEB_CLIENT_SECRET ?? process.env.STAGING_CLIENT_SECRET;
 const testEmail = process.env.STAGING_TEST_EMAIL;
 
 const results = [];
@@ -95,7 +94,7 @@ if (!args.has("--staging-live-approved")) {
 		"This script sends a real OTP email and performs live staging authentication.");
 }
 if (issuer !== EXPECTED_STAGING_ISSUER) fatal(`STAGING_ISSUER must be exactly ${EXPECTED_STAGING_ISSUER} (got "${issuer}")`);
-if (!clientSecret || clientSecret.trim().length < 32) fatal("STAGING_CLIENT_SECRET missing or too short (set via environment only; never argv)");
+if (!clientSecret || clientSecret.trim().length < 32) fatal("Client secret missing or too short (set via environment only; never argv)");
 if (!testEmail || !testEmail.includes("@")) fatal("STAGING_TEST_EMAIL missing or invalid");
 if (process.argv.some(a => a.includes(clientSecret))) fatal("Refusing to run: the client secret appears in argv — pass it via the environment only");
 
@@ -144,7 +143,7 @@ async function emailAuthenticationRound(label) {
 		body: JSON.stringify({ email: testEmail })
 	});
 	if (start.response.status !== 200 || !start.json?.challengeId) {
-		record(`${label}.start`, "FAIL", `POST /v1/authentication/email/start -> HTTP ${start.response.status} ${JSON.stringify(start.json ?? {})}`);
+		record(`${label}.start`, "FAIL", `POST /v1/authentication/email/start -> HTTP ${start.response.status}`);
 		return undefined;
 	}
 	record(`${label}.start`, "PASS", `challenge created (expires in ${start.json.expiresIn}s); OTP sent to the controlled inbox`);
@@ -173,7 +172,7 @@ async function registerSyntheticIdentity() {
 		body: JSON.stringify({ email: testEmail, purpose: "REGISTRATION" })
 	});
 	if (start.response.status !== 200 || !start.json?.challengeId) {
-		record("register.start", "FAIL", `POST /v1/identity/email/start -> HTTP ${start.response.status} ${JSON.stringify(start.json ?? {})}`);
+		record("register.start", "FAIL", `POST /v1/identity/email/start -> HTTP ${start.response.status}`);
 		return false;
 	}
 	record("register.start", "PASS", "REGISTRATION challenge created; OTP sent to the controlled inbox");
@@ -215,7 +214,7 @@ async function authorizeHandoff(label, authenticationResult, { codeChallenge, no
 		})
 	});
 	if (response.status !== 200 || !json?.redirectUri) {
-		record(`${label}.authorize`, "FAIL", `POST /authorize -> HTTP ${response.status} ${JSON.stringify(json ?? {})}`);
+		record(`${label}.authorize`, "FAIL", `POST /authorize -> HTTP ${response.status}`);
 		return undefined;
 	}
 	if (response.headers.get("set-cookie")) {
@@ -255,6 +254,12 @@ if (discovery.response.status !== 200 || !discovery.json) fatal(`discovery -> HT
 record("discovery.issuer", discovery.json.issuer === issuer ? "PASS" : "FAIL", `issuer=${discovery.json.issuer}`);
 record("discovery.grants", JSON.stringify(discovery.json.grant_types_supported) === '["authorization_code"]' ? "PASS" : "FAIL",
 	`grant_types_supported=${JSON.stringify(discovery.json.grant_types_supported)}`);
+if (discovery.json.issuer !== issuer || JSON.stringify(discovery.json.grant_types_supported) !== '["authorization_code"]') {
+	fatal("Staging discovery issuer or grants do not match the approved configuration");
+}
+if (discovery.json.jwks_uri !== `${issuer}/jwks` || discovery.json.userinfo_endpoint !== `${issuer}/userinfo`) {
+	fatal("Staging discovery endpoints do not match the approved issuer");
+}
 
 const stagingJwks = await fetchJson(discovery.json.jwks_uri);
 const stagingKeys = stagingJwks.json?.keys ?? [];
@@ -268,14 +273,17 @@ const probeBody = JSON.stringify({ verificationId: crypto.randomUUID() });
 const goodProbe = await fetchJson(`${issuer}/v1/registration/complete`, {
 	method: "POST", headers: { authorization: basic, "content-type": "application/json" }, body: probeBody
 });
-record("secret.accepted", goodProbe.response.status === 400 ? "PASS" : "FAIL",
-	`correct secret + unknown evidence -> HTTP ${goodProbe.response.status} (expected 400: client authenticated, evidence invalid)`);
+const goodProbeAccepted = goodProbe.response.status === 400 && goodProbe.json?.error === "INVALID_EVIDENCE";
+record("secret.accepted", goodProbeAccepted ? "PASS" : "FAIL",
+	`correct secret + unknown evidence -> HTTP ${goodProbe.response.status} (expected 400 INVALID_EVIDENCE)`);
+if (!goodProbeAccepted) fatal("Client authentication could not be verified; aborting before OTP delivery");
 const wrongBasic = "Basic " + Buffer.from(`${encodeURIComponent(clientId)}:${crypto.randomBytes(24).toString("base64url")}`).toString("base64");
 const badProbe = await fetchJson(`${issuer}/v1/registration/complete`, {
 	method: "POST", headers: { authorization: wrongBasic, "content-type": "application/json" }, body: probeBody
 });
 record("secret.rejected", badProbe.response.status === 401 ? "PASS" : "FAIL",
 	`incorrect secret -> HTTP ${badProbe.response.status} (expected 401)`);
+if (badProbe.response.status !== 401) fatal("Incorrect client secret was not rejected; aborting before OTP delivery");
 
 // --- 2b. Optional: create/confirm the synthetic identity (H2/H3) -------------
 if (args.has("--register-identity")) {
