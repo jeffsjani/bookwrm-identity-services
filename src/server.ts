@@ -15,6 +15,7 @@ import { registerAccountAuthenticationMethodRoutes } from "./routes/accountAuthe
 import { registerAuthenticatorStatusRoutes } from "./routes/authenticatorStatus.js";
 import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
 import { ensureBookwrmApplicationSeed } from "./adapters/base44/Base44ApplicationSeed.js";
+import { rotateStagingWebSecretAtBoot } from "./identity/StagingWebSecretRotation.js";
 import { oidcService } from "./oidc/oidcServiceInstance.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
@@ -54,6 +55,16 @@ if (configuration.getIdentityRegistryDriver() === "postgres") {
 		} catch (error) {
 				app.log.error({ error }, "Failed to seed Bookwrm Tenant/Application at startup");
 		}
+}
+
+// HAPI ID V2-E Stage 3: one-time, flag-gated staging-web client-secret rotation. No-op unless
+// STAGING_WEB_SECRET_ROTATION_ENABLED=true on the staging deployment (see the Stage 3 runbook §7).
+// Non-fatal on failure: the old secret keeps working and the service stays up; the operator must
+// verify the rotation log line (or this error) before removing the flag.
+try {
+		await rotateStagingWebSecretAtBoot(app.log);
+} catch (error) {
+		app.log.error({ error }, "STAGING-WEB SECRET ROTATION FAILED — fail closed, no change persisted; resolve the guard before retrying");
 }
 
 // Security

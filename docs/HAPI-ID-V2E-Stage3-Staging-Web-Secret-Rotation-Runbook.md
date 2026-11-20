@@ -4,6 +4,13 @@
 (secure provisioning of the `staging-web` secret) ahead of the Stage 3 live email/OIDC
 certification. Nothing in this document has been run against Railway or the staging database.
 
+> **Superseded (2026-11-20): use §7 — boot-time rotation in the HAPI backend.** The temporary-job
+> procedures (§§1–6 and both `scripts/rotate-staging-web-*` files) are retired. The operator
+> decided to stop the temporary Railway job approach; the rotation now ships as a flag-gated
+> one-time startup task inside the existing backend (`src/identity/StagingWebSecretRotation.ts`),
+> reusing the `STAGING_WEB_CLIENT_SECRET` variable already on the backend service. No new
+> service, no SSH, no HTTP endpoint. §§1–6 are kept for audit history only.
+
 - Repository: `jeffsjani/bookwrm-identity-services`
 - Rotation script (reviewed, unmodified): [`scripts/rotate-staging-web-secret.sql`](../scripts/rotate-staging-web-secret.sql)
 - Reviewed/pinned commit: `0dc1cdb9fad7aab9b12a22c1f07af79994c8879a`
@@ -327,6 +334,53 @@ safe — the rotation is verified idempotent/repeat-safe.
 3. `STAGING_WEB_CLIENT_SECRET` remains on the backend service (inert) for Phase D use; the
    operator secret manager keeps its copy. Rollback, if ever needed, is rotation-as-rollback
    (ground rule 5): set a fresh value on `STAGING_WEB_CLIENT_SECRET` and re-run §6.2–6.4.
+
+---
+
+## 7. Boot-time rotation in the HAPI backend (CURRENT procedure, supersedes §§1–6)
+
+Implemented in [`src/identity/StagingWebSecretRotation.ts`](../src/identity/StagingWebSecretRotation.ts)
+and wired into server boot after the schema/seed bootstrap. It is a **no-op unless
+`STAGING_WEB_SECRET_ROTATION_ENABLED=true`** is set on the deployment.
+
+### 7.1 Guards (all fail closed; every refusal is secret-free)
+
+1. Activation flag `STAGING_WEB_SECRET_ROTATION_ENABLED` must be exactly `true`.
+2. Identity-registry driver must be `postgres`.
+3. The configured issuer must be **exactly** `https://id-staging.hapiinc.com` (production boots
+   as `https://identity.bookwrm.com`, so the task can never act there).
+4. `STAGING_WEB_CLIENT_SECRET` must be present, ≥ 32 characters, and not a placeholder.
+5. In one transaction: server-side parameter-logging channels closed (`log_statement`,
+   `log_min_duration_statement`, `log_parameter_max_length_on_error`); **no OIDC client outside
+   `staging-web`/`staging-native`**; active `hapi-staging` tenant with the `HAPI_STAGING`
+   application (the certified Stage 2 seed); `staging-web` matches the certified shape under
+   `FOR UPDATE`; exactly one row updated; `staging-native` byte-identical afterwards; persisted
+   value re-verified. Any failure rolls the whole mutation back.
+
+**BOOKWRM-guard change (vs. the retired SQL script):** the deployed backend itself seeds the
+BOOKWRM tenant/application at every boot (`ensureBookwrmApplicationSeed`), so BOOKWRM presence is
+legitimate in staging and is **not** used as a production indicator. The replacement is the
+positive staging fingerprint above (guard 5), which a production registry cannot satisfy: it
+always contains the Bookwrm/Base44 OIDC client and never the `hapi-staging`/`HAPI_STAGING` pair.
+
+### 7.2 Operator procedure (Railway dashboard, project `charismatic-charm` only)
+
+1. `STAGING_WEB_CLIENT_SECRET` is already set on the HAPI backend service (§6.1 deviation).
+2. Deploy the backend revision containing this task to the staging service
+   (`release/hapi-id-staging`).
+3. Backend service → **Variables** → add `STAGING_WEB_SECRET_ROTATION_ENABLED` = `true` → deploy.
+4. Watch the deploy logs for
+   `staging-web secret rotation: rotated … fingerprintMd5_8=…` and compare the fingerprint with
+   `printf %s "$SECRET" | md5sum | cut -c1-8` (secret read from the secret manager). A re-run
+   after success logs `unchanged` (repeat-safe). `STAGING-WEB SECRET ROTATION FAILED` means a
+   guard tripped: fail closed, nothing persisted — stop and report.
+5. Verify authentication over public TLS (same certified 400/401 semantics as §4):
+   correct secret → HTTP **400** at `POST /v1/registration/complete` (client authenticated,
+   synthetic evidence rejected); wrong secret → HTTP **401**.
+6. Cleanup: delete the `STAGING_WEB_SECRET_ROTATION_ENABLED` variable (redeploys; rotation
+   becomes inert again). `STAGING_WEB_CLIENT_SECRET` remains for Phase D per §6.4. Remove the
+   rotation module in a follow-up commit once Stage 3 certification no longer needs it.
+   Rollback remains rotation-as-rollback (ground rule 5): set a fresh value and repeat 3–6.
 
 ---
 
