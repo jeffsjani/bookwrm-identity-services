@@ -27,6 +27,7 @@ import { privateIdWebhookDiagnosticsRepository } from "../identity/infrastructur
 import { privateIDEnrollmentService } from "../identity/PrivateIDEnrollmentService.js";
 import { AuthenticatorLoginError, authenticatorLoginResolver } from "../identity/AuthenticatorLoginResolver.js";
 import { FaceEnrollmentError, type FaceEnrollmentCallbacks, type FaceEnrollmentReply } from "../authenticators/FaceEnrollmentTypes.js";
+import { requestLogPath } from "../security/RequestLogging.js";
 
 type QueryRecord = Record<string, unknown>;
 type WebhookBody = Record<string, unknown>;
@@ -184,7 +185,7 @@ export async function registerPrivateIdRoutes(app: FastifyInstance, faceEnrollme
 								requestId,
 								correlationId,
 								method: request.method,
-								path: request.url,
+								path: requestLogPath(request.url),
 								headers: sanitizeHeaders(headers as unknown as Record<string, unknown>)
 						},
 						"PrivateID webhook received"

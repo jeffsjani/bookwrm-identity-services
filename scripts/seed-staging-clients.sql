@@ -100,7 +100,8 @@ BEGIN
 		IF v_client.application_id <> v_app.id
 			OR v_client.token_endpoint_auth_method <> 'client_secret_basic'
 			OR NOT v_client.require_pkce
-			OR v_client.redirect_uris <> ARRAY['https://staging-app.hapiinc.com/callback']
+			OR (v_client.redirect_uris <> ARRAY['https://staging-app.hapiinc.com/callback']
+				AND v_client.redirect_uris <> ARRAY['https://staging-app.hapiinc.com/callback', 'https://id-staging.hapiinc.com/staging-console/callback'])
 			OR v_client.grant_types <> ARRAY['authorization_code']
 			OR v_client.status <> 'active' THEN
 			RAISE EXCEPTION 'Existing client staging-web does not match the expected staging configuration — refusing (fail closed)';

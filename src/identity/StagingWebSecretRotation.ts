@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { configuration } from "../config/ConfigurationService.js";
 import { resolveConfiguredIssuer } from "../config/IssuerPolicy.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
+import { isStagingWebRedirectSet } from "./StagingConsoleClientRegistration.js";
 import {
 		withPostgresTransaction,
 		type PostgresClient,
@@ -35,7 +36,6 @@ export const STAGING_WEB_CLIENT_SECRET_VARIABLE = "STAGING_WEB_CLIENT_SECRET";
 
 const STAGING_ISSUER = "https://id-staging.hapiinc.com";
 const STAGING_CLIENT_IDS = ["staging-web", "staging-native"];
-const STAGING_WEB_REDIRECT_URIS = ["https://staging-app.hapiinc.com/callback"];
 const STAGING_WEB_GRANT_TYPES = ["authorization_code"];
 
 export type StagingWebSecretRotationResult = "disabled" | "rotated" | "unchanged";
@@ -141,7 +141,7 @@ async function rotateInTransaction(client: PostgresClient, secret: string): Prom
 				web.token_endpoint_auth_method !== "client_secret_basic" ||
 				!web.require_pkce ||
 				web.status !== "active" ||
-				!arraysEqual(web.redirect_uris, STAGING_WEB_REDIRECT_URIS) ||
+				!isStagingWebRedirectSet(web.redirect_uris) ||
 				!arraysEqual(web.grant_types, STAGING_WEB_GRANT_TYPES)
 		) {
 				throw refusal("staging-web does not match the certified staging configuration — resolve manually (fail closed)");

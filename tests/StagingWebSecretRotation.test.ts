@@ -8,6 +8,7 @@ import {
 	type StagingWebSecretRotationDependencies
 } from "../src/identity/StagingWebSecretRotation.js";
 import type { PostgresClient, TransactionRunner } from "../src/identity/infrastructure/PostgresInfrastructure.js";
+import { STAGING_CONSOLE_CALLBACK } from "../src/oidc/StagingTestConsole.js";
 
 // =============================================================================
 // HAPI ID V2-E Stage 3 — boot-time staging-web secret rotation (fail-closed matrix)
@@ -172,6 +173,13 @@ describe("StagingWebSecretRotation (boot-time, flag-gated)", () => {
 		const result = await rotateStagingWebSecretAtBoot(captureLog(), dependencies(db));
 		expect(result).toBe("unchanged");
 		expect(db.clients[0].client_secret).toBe(NEW_SECRET);
+	});
+
+	it("allows the additive staging-console callback during secret rotation", async () => {
+		const db = fakeStagingDb({ clients: [stagingWebRow({
+			redirect_uris: ["https://staging-app.hapiinc.com/callback", STAGING_CONSOLE_CALLBACK]
+		}), stagingNativeRow()] });
+		expect(await rotateStagingWebSecretAtBoot(captureLog(), dependencies(db))).toBe("rotated");
 	});
 
 	it("refuses when the configured issuer is not exactly the staging issuer", async () => {

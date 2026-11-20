@@ -15,6 +15,7 @@ import { EmailAuthenticationError } from "../authentication/email/EmailAuthentic
 import { VerificationError } from "../email/VerificationChallenge.js";
 
 import type { AuthenticationProvider, AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
+import { isStagingConsoleInternalRequest } from "./StagingConsoleInternal.js";
 import { configuration } from "../config/ConfigurationService.js";
 import { DEFAULT_OIDC_ISSUER, recordIssuerAccepted, resolveConfiguredIssuer } from "../config/IssuerPolicy.js";
 import { featureFlags } from "../config/FeatureFlagService.js";
@@ -561,7 +562,7 @@ export class OIDCService {
 										keys: await this.keyRotationService.getPublicKeys()
 								};
 						} catch (err) {
-								error = err instanceof Error ? err.message : "unknown_error";
+								error = isStagingConsoleInternalRequest(request) ? "staging_console_verification_failed" : err instanceof Error ? err.message : "unknown_error";
 								throw err;
 						} finally {
 								this.logOidcRequest(app, {
@@ -569,7 +570,7 @@ export class OIDCService {
 										clientId: "",
 										flow: "jwks",
 										latency: Date.now() - startedAt,
-										success: this.replySucceeded(reply),
+										success: this.replySucceeded(reply) && (!isStagingConsoleInternalRequest(request) || !error),
 										error,
 										user: "",
 										pkce: "N/A",
@@ -623,7 +624,7 @@ export class OIDCService {
 								};
 								return userInfoResponse;
 						} catch (err) {
-								error = err instanceof Error ? err.message : "unknown_error";
+								error = isStagingConsoleInternalRequest(request) ? "staging_console_verification_failed" : err instanceof Error ? err.message : "unknown_error";
 								throw err;
 						} finally {
 								this.logOidcRequest(app, {
@@ -631,7 +632,7 @@ export class OIDCService {
 										clientId,
 										flow: "userinfo",
 										latency: Date.now() - startedAt,
-										success: this.replySucceeded(reply),
+										success: this.replySucceeded(reply) && (!isStagingConsoleInternalRequest(request) || !error),
 										error,
 										user,
 										pkce: "N/A",
@@ -926,7 +927,7 @@ export class OIDCService {
 								id_token: idToken
 								};
 						} catch (err) {
-								error = err instanceof Error ? err.message : "unknown_error";
+								error = isStagingConsoleInternalRequest(request) ? "staging_console_verification_failed" : err instanceof Error ? err.message : "unknown_error";
 								if (err instanceof VerificationError) return reply.code(400).send({ error: "unauthorized_client" });
 								throw err;
 						} finally {
@@ -935,7 +936,7 @@ export class OIDCService {
 										clientId: clientId ?? "",
 										flow: "token",
 										latency: Date.now() - startedAt,
-										success: this.replySucceeded(reply),
+										success: this.replySucceeded(reply) && (!isStagingConsoleInternalRequest(request) || !error),
 										error,
 										user,
 										pkce,

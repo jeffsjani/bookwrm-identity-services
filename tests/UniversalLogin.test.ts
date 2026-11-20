@@ -24,12 +24,15 @@ import { identityRegistry, IdentityRegistry } from "../src/identity/IdentityRegi
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
-import { getRedisClient } from "../src/oidc/infrastructure/RedisInfrastructure.js";
+import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.js";
 import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
 import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
 import { RegistrationService } from "../src/registration/RegistrationService.js";
+import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
+import { protectStagingConsoleInternalLogs } from "../src/oidc/StagingConsoleInternal.js";
+import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "../src/security/RequestLogging.js";
 
 const REDIRECT = "https://rp.example/callback";
 const CLIENT_ID = "ul-client";
@@ -89,9 +92,12 @@ function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
 				|| (entry!.event as string).startsWith("EMAIL_AUTHENTICATION_") || (entry!.event as string).startsWith("EMAIL_REGISTRATION_")));
 }
 
-async function emailFixture(options: { emailInteractive?: boolean; clientId?: string } = {}) {
+async function emailFixture(options: { emailInteractive?: boolean; clientId?: string; redirectUri?: string; console?: boolean; knownEmail?: string } = {}) {
 	ensureOidcTestEnvironment();
 	const clientId = options.clientId ?? CLIENT_ID;
+	const redirectUri = options.redirectUri ?? REDIRECT;
+	const clientSecret = options.console ? CLIENT_SECRET.padEnd(40, "x") : CLIENT_SECRET;
+	const knownEmail = options.knownEmail ?? KNOWN_EMAIL;
 	const tenantId = randomUUID();
 	const applicationId = randomUUID();
 	const tenants = new InMemoryTenantRepository();
@@ -100,11 +106,11 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 	await tenants.upsert({ id: tenantId, name: "Bookwrm", slug: `bookwrm-${tenantId}`, status: "active" });
 	await applications.upsert({ id: applicationId, tenantId, name: "Bookwrm Web", slug: "web", status: "active",
 		allowedAuthenticationMethods: ["HAPI_EMAIL", "PRIVATEID_FACE"] });
-	await clients.upsert({ id: randomUUID(), applicationId, clientId, clientSecret: CLIENT_SECRET,
-		redirectUris: [REDIRECT], scopes: ["openid", "profile", "email"], grantTypes: ["authorization_code"],
+	await clients.upsert({ id: randomUUID(), applicationId, clientId, clientSecret,
+		redirectUris: [redirectUri], scopes: ["openid", "profile", "email"], grantTypes: ["authorization_code"],
 		responseTypes: ["code"], tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
 	const h1 = { clients, applications, tenants };
-	const oidcClient: OIDCClient = { client_id: clientId, client_secret: CLIENT_SECRET, redirect_uris: [REDIRECT],
+	const oidcClient: OIDCClient = { client_id: clientId, client_secret: clientSecret, redirect_uris: [redirectUri],
 		scope: "openid profile email", grant_types: ["authorization_code"], response_types: ["code"],
 		token_endpoint_auth_method: "client_secret_basic", require_pkce: true };
 
@@ -118,7 +124,7 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 	const subjects = new InMemoryIdentitySubjectRepository();
 	const subjectRegistry = new IdentityRegistry(subjects);
 	const subject = await subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId,
-		primaryProvider: "HAPI_EMAIL", primaryProviderSubject: KNOWN_EMAIL, email: KNOWN_EMAIL,
+		primaryProvider: "HAPI_EMAIL", primaryProviderSubject: knownEmail, email: knownEmail,
 		emailVerified: true, status: "ACTIVE" });
 	const results = new Map<string, EmailPrincipal & { context: string }>();
 	const created: string[] = [];
@@ -126,10 +132,10 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 		audit: vi.fn(async () => {}),
 		establish: vi.fn(async (authority, challengeId) => {
 			const challenge = await challenges.findById(challengeId);
-			if (challenge?.destinationNormalized.toLowerCase() !== KNOWN_EMAIL) throw new EmailAuthenticationError();
+			if (challenge?.destinationNormalized.toLowerCase() !== knownEmail) throw new EmailAuthenticationError();
 			const authenticatedAt = new Date(now).toISOString();
 			const authenticationResult = randomBytes(32).toString("base64url");
-			results.set(authenticationResult, { id: subject.id, sub: subject.oidcSubject, email: KNOWN_EMAIL, emailVerified: true,
+			results.set(authenticationResult, { id: subject.id, sub: subject.oidcSubject, email: knownEmail, emailVerified: true,
 				authenticationMethod: "HAPI_EMAIL", authenticatedAt, assurance: "email_otp",
 				context: `${authority.context.tenantId}:${authority.context.applicationId}:${authority.clientId}` });
 			return { authenticated: true as const, subject: subject.oidcSubject, authenticationResult, expiresIn: 60,
@@ -168,12 +174,24 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 		}) })
 	});
 	const logs: string[] = [];
-	const app = Fastify({ logger: { level: "info", stream: new Writable({ write(chunk, _enc, done) { logs.push(String(chunk)); done(); } }) } });
+	const app = Fastify({ trustProxy: options.console ? "127.0.0.1" : false,
+		logger: { level: "info", stream: new Writable({ write(chunk, _enc, done) { logs.push(String(chunk)); done(); } }),
+			...(options.console ? { serializers: { req: serializeRequestForLog } } : {}) } });
+	if (options.console) {
+		registerPathOnlyNotFoundHandler(app);
+		protectStagingConsoleInternalLogs(app);
+	}
 	await app.register(formbody);
 	await oidc.registerEndpoints(app);
+	if (options.console) await registerStagingTestConsole(app, {
+		issuer: STAGING_ISSUER, env: { STAGING_TEST_CONSOLE_ENABLED: "true",
+			STAGING_TEST_CONSOLE_USERNAME: "operator", STAGING_TEST_CONSOLE_PASSWORD: "operator-password-".padEnd(40, "x"),
+			HAPI_EMAIL_PROVIDER: "resend", HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_UNIVERSAL_LOGIN_ENABLED: "true",
+			STAGING_WEB_CLIENT_SECRET: clientSecret }
+	});
 	await app.ready();
 	const lookup = vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(sub => subjects.findByOidcSubject(sub));
-	const basic = { authorization: "Basic " + Buffer.from(`${clientId}:${CLIENT_SECRET}`).toString("base64") };
+	const basic = { authorization: "Basic " + Buffer.from(`${clientId}:${clientSecret}`).toString("base64") };
 	return { app, oidc, h1, oidcClient, provider, delivery, service, challenges, repository, registrationRepository,
 		registration, subjects, subject, created, logs, lookup, basic,
 		advance: (ms: number) => { now += ms; }, tenantId, applicationId };
@@ -251,6 +269,103 @@ describe("H6 AuthorizationInteractionStore", () => {
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, interaction.csrf)).toBe(true);
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, "x")).toBe(false);
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, undefined)).toBe(false);
+	});
+});
+
+describe("Staging browser console", () => {
+	it.each(["REGISTRATION", "AUTHENTICATION", "TOKEN_ERROR", "USERINFO_ERROR"])("handles %s with one OTP and the real OIDC flow without logging secrets", async scenario => {
+		vi.stubEnv("OIDC_ISSUER", STAGING_ISSUER);
+		vi.stubEnv("OIDC_ALLOWED_ISSUERS", STAGING_ISSUER);
+		setFlag(true);
+		const f = await emailFixture({ clientId: "staging-web", redirectUri: STAGING_CONSOLE_CALLBACK, console: true,
+			...(scenario !== "REGISTRATION" ? { knownEmail: "jeff@hapiinc.com" } : {}) });
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => { throw new Error("unexpected network request"); });
+		const auth = "Basic " + Buffer.from(`operator:${"operator-password-".padEnd(40, "x")}`).toString("base64");
+		const headers = { host: "id-staging.hapiinc.com", "x-forwarded-proto": "https", authorization: auth };
+		try {
+			const missing = await f.app.inject({ method: "GET", url: "/missing?token=SENSITIVE_OTHER_QUERY" });
+			expect(missing.statusCode).toBe(404);
+			expect(missing.json().message).toBe("Route GET:/missing not found");
+			const index = await f.app.inject({ method: "GET", url: "/staging-console/", headers });
+			expect(index.statusCode).toBe(200);
+			const consoleCookie = String(index.headers["set-cookie"]).split(";")[0];
+			const start = await f.app.inject({ method: "POST", url: "/staging-console/start",
+				headers: { ...headers, cookie: consoleCookie, origin: STAGING_ISSUER, "content-type": "application/x-www-form-urlencoded" },
+				payload: new URLSearchParams({ csrf: csrfFrom(index.body) }).toString() });
+			expect(start.statusCode).toBe(303);
+			const authorizeUrl = new URL(String(start.headers.location));
+			expect(authorizeUrl.origin).toBe(STAGING_ISSUER);
+			const authorize = await f.app.inject({ method: "GET", url: authorizeUrl.pathname + authorizeUrl.search });
+			expect(authorize.statusCode).toBe(302);
+			const loginCookie = `${COOKIE}=${cookieFrom(authorize)}`;
+			const emailPage = await f.app.inject({ method: "GET", url: "/login/email", headers: { cookie: loginCookie } });
+			const csrf = csrfFrom(emailPage.body);
+			const send = await f.app.inject({ method: "POST", url: "/login/email", headers: {
+				cookie: loginCookie, "content-type": "application/x-www-form-urlencoded"
+			}, payload: new URLSearchParams({ csrf, email: "jeff@hapiinc.com" }).toString() });
+			expect(send.statusCode).toBe(303);
+			expect(f.delivery.messages).toHaveLength(1);
+			expect(f.delivery.messages[0].purpose).toBe(scenario === "REGISTRATION" ? "REGISTRATION" : "AUTHENTICATION");
+			const otp = f.delivery.messages[0].code;
+			const verify = await f.app.inject({ method: "POST", url: "/login/email/code", headers: {
+				cookie: loginCookie, "content-type": "application/x-www-form-urlencoded"
+			}, payload: new URLSearchParams({ csrf, code: otp }).toString() });
+			expect(verify.statusCode, verify.body).toBe(303);
+			const callback = new URL(String(verify.headers.location));
+			expect(`${callback.origin}${callback.pathname}`).toBe(STAGING_CONSOLE_CALLBACK);
+			if (scenario === "TOKEN_ERROR") f.lookup.mockRejectedValueOnce(new Error("SENSITIVE_TOKEN_LOG_SENTINEL"));
+			if (scenario === "USERINFO_ERROR") f.lookup.mockImplementationOnce(sub => f.subjects.findByOidcSubject(sub))
+				.mockImplementationOnce(sub => f.subjects.findByOidcSubject(sub))
+				.mockRejectedValueOnce(new Error("SENSITIVE_USERINFO_LOG_SENTINEL"));
+			const challenged = await f.app.inject({ method: "GET", url: callback.pathname + callback.search,
+				headers: { ...headers, authorization: "", cookie: consoleCookie } });
+			expect(challenged.statusCode).toBe(401);
+			expect(challenged.headers["www-authenticate"]).toContain("Basic");
+			const callbackResponse = await f.app.inject({ method: "GET", url: callback.pathname + callback.search,
+				headers: { ...headers, cookie: consoleCookie } });
+			expect(callbackResponse.statusCode, callbackResponse.body).toBe(303);
+			expect(callbackResponse.headers.location).toBe("/staging-console/results");
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results",
+				headers: { ...headers, cookie: consoleCookie } });
+			const failed = scenario === "TOKEN_ERROR" || scenario === "USERINFO_ERROR";
+			expect(results.body).toContain(failed ? "Test failed" : "Test passed");
+			if (!failed) expect(results.body).toContain("PASS: UserInfo");
+			expect(results.body).not.toContain(callback.searchParams.get("code")!);
+			expect(results.body).not.toContain(otp);
+			const codeReplay = await f.app.inject({ method: "POST", url: "/token",
+				headers: { ...f.basic, "content-type": "application/x-www-form-urlencoded" },
+				payload: new URLSearchParams({ grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+					redirect_uri: STAGING_CONSOLE_CALLBACK, code_verifier: "a".repeat(43) }).toString() });
+			expect(codeReplay.statusCode).toBe(400);
+			expect(codeReplay.json().error).toBe("invalid_grant");
+			const replay = await f.app.inject({ method: "GET", url: callback.pathname + callback.search,
+				headers: { ...headers, cookie: consoleCookie } });
+			expect(replay.statusCode).toBe(400);
+			expect(f.logs.join("")).not.toContain(callback.searchParams.get("code")!);
+			expect(f.logs.join("")).not.toContain(callback.searchParams.get("state")!);
+			expect(f.logs.join("")).not.toContain(authorizeUrl.searchParams.get("nonce")!);
+			expect(f.logs.join("")).not.toContain(otp);
+			expect(f.logs.join("")).not.toContain(CLIENT_SECRET.padEnd(40, "x"));
+			expect(f.logs.join("")).not.toContain(auth);
+			expect(f.logs.join("")).not.toContain("SENSITIVE_TOKEN_LOG_SENTINEL");
+			expect(f.logs.join("")).not.toContain("SENSITIVE_USERINFO_LOG_SENTINEL");
+			expect(f.logs.join("")).not.toContain("SENSITIVE_OTHER_QUERY");
+			if (scenario === "TOKEN_ERROR") expect(f.logs.join("")).toContain("STAGING_CONSOLE_TOKEN_FAILED");
+			if (scenario === "USERINFO_ERROR") expect(f.logs.join("")).toContain("STAGING_CONSOLE_USERINFO_FAILED");
+			if (failed) {
+				const audit = f.logs.map(line => JSON.parse(line) as { Flow?: string; Error?: string; Success?: boolean })
+					.find(entry => entry.Flow === (scenario === "TOKEN_ERROR" ? "token" : "userinfo") &&
+						entry.Error === "staging_console_verification_failed");
+				expect(audit?.Success).toBe(false);
+			}
+			expect(fetchSpy).not.toHaveBeenCalled();
+		} finally {
+			await f.app.close();
+			await getRedisClient().del(oidcRedisKey("ratelimit:ip:127.0.0.1"), oidcRedisKey("ratelimit:client:staging-web"));
+			vi.restoreAllMocks();
+			vi.unstubAllEnvs();
+			setFlag(undefined);
+		}
 	});
 });
 

@@ -16,6 +16,7 @@ import { registerAuthenticatorStatusRoutes } from "./routes/authenticatorStatus.
 import { ensureIdentitySchema } from "./identity/infrastructure/PostgresInfrastructure.js";
 import { ensureBookwrmApplicationSeed } from "./adapters/base44/Base44ApplicationSeed.js";
 import { rotateStagingWebSecretAtBoot } from "./identity/StagingWebSecretRotation.js";
+import { registerStagingConsoleCallbackAtBoot } from "./identity/StagingConsoleClientRegistration.js";
 import { oidcService } from "./oidc/oidcServiceInstance.js";
 import { metricsContentType, renderMetrics } from "./oidc/infrastructure/OIDCMetrics.js";
 import { closeRedisClient } from "./oidc/infrastructure/RedisInfrastructure.js";
@@ -25,19 +26,34 @@ import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposit
 import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
 import { registerCorsPolicy } from "./security/CorsPolicy.js";
 import { enforceDeploymentIssuerPin } from "./config/IssuerPolicy.js";
+import { registerStagingTestConsole, validStagingConsoleProxy, STAGING_ISSUER } from "./oidc/StagingTestConsole.js";
+import { protectStagingConsoleInternalLogs } from "./oidc/StagingConsoleInternal.js";
+import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "./security/RequestLogging.js";
 
+const isStagingIssuer = configuration.get("OIDC_ISSUER")?.trim() === STAGING_ISSUER;
+const consoleEnabled = configuration.get("STAGING_TEST_CONSOLE_ENABLED") === "true" && isStagingIssuer;
+const trustedProxies = consoleEnabled
+		? (configuration.get("STAGING_TEST_CONSOLE_TRUSTED_PROXIES") ?? "").split(",").map(value => value.trim()).filter(Boolean)
+		: [];
+if (consoleEnabled && (trustedProxies.length === 0 || trustedProxies.some(value => !validStagingConsoleProxy(value)))) {
+		throw new Error("Staging console requires narrowly scoped trusted proxy addresses");
+}
 const app = Fastify({
+		trustProxy: trustedProxies.length ? trustedProxies : false,
 		logger: {
-					level: configuration.getLogLevel()
+					level: configuration.getLogLevel(),
+					serializers: { req: serializeRequestForLog }
 		}
 });
+registerPathOnlyNotFoundHandler(app);
+if (isStagingIssuer) protectStagingConsoleInternalLogs(app);
 
 configuration.validatePrivateIdConfiguration();
 
 // HAPI ID V2-E Stage 1: fail closed at boot on issuer-environment misconfiguration. Non-default
 // issuers (staging/canonical HAPI services) require an exact single-issuer OIDC_ALLOWED_ISSUERS
 // pin and an explicit CORS_TRUSTED_ORIGINS allowlist; the default Bookwrm issuer is unchanged.
-enforceDeploymentIssuerPin();
+const issuer = enforceDeploymentIssuerPin();
 
 // Bootstrap the Identity Registry schema (identity_subjects, schema_migrations) before serving traffic.
 // Non-fatal: a transient DB issue here surfaces via /identity/admin/health instead of blocking boot.
@@ -66,6 +82,8 @@ try {
 } catch (error) {
 		app.log.error({ error }, "STAGING-WEB SECRET ROTATION FAILED — fail closed, no change persisted; resolve the guard before retrying");
 }
+const callbackRegistration = await registerStagingConsoleCallbackAtBoot({ issuer });
+if (callbackRegistration !== "disabled") app.log.info({ result: callbackRegistration }, "Staging console callback registration");
 
 // Security
 await app.register(helmet);
@@ -95,6 +113,7 @@ emailAuthentication?.configureRegistration(registration);
 if (emailAuthentication) oidcService.configureEmailAuthentication(emailAuthentication);
 await configureFaceSetupCeremony(app, faceEnrollment, emailAuthentication);
 await oidcService.registerEndpoints(app);
+await registerStagingTestConsole(app, { issuer, env: process.env });
 
 app.get("/metrics", async (_request, reply) => {
 		if (!configuration.getFeatureFlag("METRICS_ENABLED", true)) {
