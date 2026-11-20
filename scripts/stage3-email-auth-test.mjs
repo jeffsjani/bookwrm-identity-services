@@ -333,16 +333,25 @@ if (!tokenOk) fatal("token exchange failed; aborting");
 const idToken = token.json.id_token;
 try {
 	const header = decodeProtectedHeader(idToken);
-	const { payload } = await jwtVerify(idToken, createLocalJWKSet({ keys: stagingKeys }), { issuer, audience: clientId });
+	const { payload } = await jwtVerify(idToken, createLocalJWKSet({ keys: stagingKeys }), {
+		issuer, audience: clientId, algorithms: ["RS256"], requiredClaims: ["sub", "iat", "exp", "nonce"]
+	});
 	const now = Math.floor(Date.now() / 1000);
 	record("idtoken.verify", "PASS", `signature valid against staging JWKS; iss=${payload.iss} aud=${payload.aud} alg=${header.alg}`);
 	record("idtoken.alg", header.alg === "RS256" ? "PASS" : "FAIL", `alg=${header.alg}`);
-	record("idtoken.nonce", payload.nonce === nonce ? "PASS" : "FAIL", "nonce echo matches the authorization request");
-	record("idtoken.sub", payload.sub === round.subject ? "PASS" : "FAIL", "sub matches the authenticated subject");
-	record("idtoken.times", typeof payload.iat === "number" && typeof payload.exp === "number" &&
-		payload.iat <= now + 60 && payload.exp > now ? "PASS" : "FAIL", `iat/exp sane (exp in ${payload.exp - now}s)`);
-} catch (error) {
-	record("idtoken.verify", "FAIL", error.message);
+	const nonceOk = payload.nonce === nonce;
+	record("idtoken.nonce", nonceOk ? "PASS" : "FAIL", "nonce echo matches the authorization request");
+	if (!nonceOk) fatal("ID token nonce invalid; aborting before UserInfo");
+	const subjectOk = payload.sub === round.subject;
+	record("idtoken.sub", subjectOk ? "PASS" : "FAIL", "sub matches the authenticated subject");
+	if (!subjectOk) fatal("ID token subject invalid; aborting before UserInfo");
+	const timesOk = typeof payload.iat === "number" && Number.isFinite(payload.iat) &&
+		typeof payload.exp === "number" && Number.isFinite(payload.exp) && payload.iat <= now + 60 && payload.exp > now;
+	record("idtoken.times", timesOk ? "PASS" : "FAIL", "iat/exp sanity check");
+	if (!timesOk) fatal("ID token timing claims invalid; aborting before UserInfo");
+} catch {
+	record("idtoken.verify", "FAIL", "signature or required claims invalid");
+	fatal("ID token validation failed; aborting before UserInfo");
 }
 try {
 	await jwtVerify(idToken, createLocalJWKSet({ keys: prodKeys }));
