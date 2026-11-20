@@ -83,6 +83,14 @@ supported; use the CLI directly.
 **Stop condition:** if `railway ssh` is unavailable to the operator (CLI/permissions), **stop**.
 Do not fall back to a Railway variable of any kind; report back for an alternative design.
 
+> **Superseded for this rotation (2026-11-20).** The operator explicitly decided to store the
+> new secret as the Railway variable `STAGING_WEB_CLIENT_SECRET` on the HAPI backend service in
+> `charismatic-charm`, accepting the ground-rule-3 deviation (§6.1). That removes the only
+> reason for the interactive `railway ssh` mechanism above: the reviewed script reads the secret
+> via psql `\getenv NEW_STAGING_WEB_SECRET`, which a Railway variable **reference** on a
+> temporary job satisfies directly. Use the simplified §6 procedure; §§1–3 remain the
+> documented alternative when no Railway variable may hold the secret.
+
 ---
 
 ## 1. Phase 0 — Generate and retain the secret (operator workstation)
@@ -240,6 +248,85 @@ fresh secret (rotation-as-rollback, ground rule 5) and re-verify.
    and the deployed HAPI backend revision are unchanged.
 3. The new secret now exists **only** in the operator secret manager, ready to be supplied as
    `STAGING_CLIENT_SECRET` (environment-only) to the Stage 3 Phase D harness.
+
+---
+
+## 6. Simplified Railway-variable procedure (dashboard-only, non-interactive)
+
+Adopted 2026-11-20 after the operator stored the new secret in Railway (see §0.2 note).
+No terminal, CLI, or SSH is used; every step is a dashboard action in project
+**`charismatic-charm`**. The reviewed SQL script and all of its fail-closed guards are used
+exactly as committed. Production project `fulfilling-spirit` is never touched, and
+`HAPI_EMAIL_AUTHENTICATION_ENABLED` stays `false`.
+
+- Job wrapper (reviewed, committed): [`scripts/rotate-staging-web-railway-job.sh`](../scripts/rotate-staging-web-railway-job.sh)
+- Pinned commit: `b9061700c05f12c99ae98e6e0e1c7085f46ccfcd`
+- Wrapper SHA-256 at that commit:
+  `3f98ac7a589b2b8180868616652029611799b9e7fe9bd48a6abb4b7662e65cde`
+- The wrapper itself fetches the rotation SQL pinned to `0dc1cdb` and enforces its SHA-256
+  (`ed2fa2…cf708`), so both layers are integrity-checked at runtime.
+
+### 6.1 Residual exposure delta (operator-accepted)
+
+In addition to the §0.1 exposures, the secret persists in Railway's variable store
+(`STAGING_WEB_CLIENT_SECRET` on the HAPI backend service): readable by anyone with
+variable-level access to the project and retained by Railway's configuration storage. This is
+accepted for staging because the same value is already plaintext at rest in the staging
+database (§0.1), inside the same project trust domain. The variable is **inert** to the
+backend — no source code reads `STAGING_WEB_CLIENT_SECRET` — and is deliberately **kept after
+rotation** as the source for the Stage 3 Phase D harness's `STAGING_CLIENT_SECRET`.
+
+### 6.2 Create the temporary job
+
+1. **+ New → Docker Image** → `postgres:16` → name **`tmp-rotate-staging-web`**. Do not deploy yet.
+2. **Settings → Deploy → Restart Policy: Never.**
+3. **Settings → Networking:** no public domain, no TCP proxy.
+4. **Variables** — exactly two, both **references** (the job's configuration carries no secret
+   value; use the dashboard autocomplete for the real service names):
+
+   ```
+   DATABASE_URL           = ${{Postgres.DATABASE_URL}}
+   NEW_STAGING_WEB_SECRET = ${{<backend-service>.STAGING_WEB_CLIENT_SECRET}}
+   ```
+
+   `DATABASE_URL` must resolve to the **private** `…railway.internal` URL (the wrapper aborts
+   otherwise). Referencing the backend's variable does **not** redeploy the backend.
+5. **Settings → Deploy → Custom Start Command** (secret-free; fetches the pinned wrapper and
+   enforces its hash, fail closed):
+
+   ```
+   bash -c 'apt-get update -qq && apt-get install -y -qq curl ca-certificates >/dev/null && curl -fsSL https://raw.githubusercontent.com/jeffsjani/bookwrm-identity-services/b9061700c05f12c99ae98e6e0e1c7085f46ccfcd/scripts/rotate-staging-web-railway-job.sh -o /tmp/job.sh && echo "3f98ac7a589b2b8180868616652029611799b9e7fe9bd48a6abb4b7662e65cde  /tmp/job.sh" | sha256sum -c - && bash /tmp/job.sh'
+   ```
+
+6. Deploy once and watch the deploy logs.
+
+### 6.3 Expected log output (and only this — no secret material)
+
+1. `PRIVATE-OK`, `secret present: length=…` (≥ 32), tooling versions, two `… OK` hash checks.
+2. Pre-rotation snapshot of `oidc_clients` (no secret columns).
+3. The reviewed script's `NOTICE`: `staging-web secret rotated … fingerprint(md5-8)=…`, then the
+   wrapper's `local fingerprint(md5-8)=…` — **the two fingerprints must match**.
+4. Post-rotation snapshot: `staging-web.updated_at` advanced;
+   `staging-native preserved: status/auth-method/updated_at unchanged`.
+5. Probes: `new secret -> HTTP 400` (client **authenticated**, synthetic evidence rejected;
+   audit rows only) and `wrong secret -> HTTP 401` (rejected) — the certified
+   `secret.accepted`/`secret.rejected` semantics of
+   [`scripts/stage3-email-auth-test.mjs`](../scripts/stage3-email-auth-test.mjs).
+6. `ROTATION-AND-VERIFICATION-COMPLETE`, then the container exits (Restart Policy *Never*).
+
+**Any other outcome is fail-closed** (`JOB-FAILED` or a guard exception from the SQL): the
+database needs no cleanup; fix the reported condition or stop and report. Re-running the job is
+safe — the rotation is verified idempotent/repeat-safe.
+
+### 6.4 Cleanup
+
+1. Dashboard → `tmp-rotate-staging-web` → **Settings → Delete Service** (removes the container,
+   its reference variables, and the fetched script copies).
+2. Confirm the project canvas shows only the original services; the staging PostgreSQL service
+   and the deployed HAPI backend revision are unchanged.
+3. `STAGING_WEB_CLIENT_SECRET` remains on the backend service (inert) for Phase D use; the
+   operator secret manager keeps its copy. Rollback, if ever needed, is rotation-as-rollback
+   (ground rule 5): set a fresh value on `STAGING_WEB_CLIENT_SECRET` and re-run §6.2–6.4.
 
 ---
 
