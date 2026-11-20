@@ -17,6 +17,27 @@ const HANDLE = /^[A-Za-z0-9_-]{43}$/;
 const random = () => randomBytes(32).toString("base64url");
 const hash = (value: string) => createHash("sha256").update(value).digest("base64url");
 
+export type StagingConsoleUserInfo = { sub?: unknown; email?: unknown; email_verified?: unknown };
+export type StagingConsoleIdClaims = { sub?: unknown; amr?: unknown; email?: unknown; email_verified?: unknown };
+
+export function validateStagingConsoleUserInfo(claims: StagingConsoleIdClaims,
+	info: StagingConsoleUserInfo, emailOtpMailbox: string): boolean {
+	if (typeof claims.sub !== "string" || typeof info.sub !== "string" || info.sub !== claims.sub) return false;
+	const amr = Array.isArray(claims.amr) ? claims.amr.filter((value): value is string => typeof value === "string") : [];
+	if (amr.includes("email") && !amr.includes("google") && !amr.includes("apple") && !amr.includes("fed")) {
+		return info.email === emailOtpMailbox && info.email_verified === true;
+	}
+	if (amr.includes("google") && amr.includes("fed") && !amr.includes("apple")) {
+		return claims.email === undefined || (typeof claims.email === "string" && info.email === claims.email
+			&& claims.email_verified === true && info.email_verified === true);
+	}
+	if (amr.includes("apple") && amr.includes("fed") && !amr.includes("google")) {
+		return claims.email === undefined || (typeof claims.email === "string" && info.email === claims.email
+			&& claims.email_verified === true && info.email_verified === true);
+	}
+	return false;
+}
+
 type Flow = { csrf: string; state: string; nonce: string; verifier: string };
 type Result = { name: string; passed: boolean };
 type Options = {
@@ -149,16 +170,18 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 				if (jwksResponse.statusCode !== 200) throw new Error("JWKS unavailable");
 				const jwks = jwksResponse.json() as JSONWebKeySet;
 				let subject: string | undefined;
+			let idClaims: StagingConsoleIdClaims | undefined;
 				try {
 					const { payload } = await jwtVerify(tokens.id_token, createLocalJWKSet(jwks), {
 						issuer: STAGING_ISSUER, audience: CLIENT, algorithms: ["RS256"],
-						requiredClaims: ["sub", "exp", "iat", "nonce"]
+						requiredClaims: ["sub", "exp", "iat", "nonce", "amr"]
 					});
 					if (payload.nonce !== flow.nonce || payload.aud !== CLIENT || typeof payload.sub !== "string" ||
 						typeof payload.iat !== "number" || payload.iat > Math.floor(Date.now() / 1000) + 60) {
 						throw new Error("Invalid ID token claims");
 					}
 					subject = payload.sub;
+					idClaims = payload;
 					results.push({ name: "Signed ID token, issuer, audience, nonce and expiration", passed: true });
 				} catch {
 					results.push({ name: "Signed ID token, issuer, audience, nonce and expiration", passed: false });
@@ -167,8 +190,9 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 				if (subject) {
 					const response = await app.inject({ method: "GET", url: "/userinfo",
 						headers: { ...stagingConsoleInternalHeaders(), authorization: `Bearer ${tokens.access_token}` } });
-					const info: { sub?: unknown; email?: unknown; email_verified?: unknown } = response.json();
-					const matched = response.statusCode === 200 && info.sub === subject && info.email === EMAIL && info.email_verified === true;
+					const info: StagingConsoleUserInfo = response.json();
+					const matched = response.statusCode === 200 && idClaims !== undefined
+						&& validateStagingConsoleUserInfo(idClaims, info, EMAIL);
 					results.push({ name: "UserInfo matches the test mailbox", passed: matched });
 					if (!matched) request.log.warn({ event: "STAGING_CONSOLE_USERINFO_FAILED" }, "Staging console UserInfo verification failed");
 				}

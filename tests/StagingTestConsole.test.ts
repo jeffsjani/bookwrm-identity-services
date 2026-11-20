@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import formbody from "@fastify/formbody";
 import { exportJWK, importPKCS8, SignJWT } from "jose";
 import { describe, expect, it, vi } from "vitest";
-import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
+import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER, validateStagingConsoleUserInfo } from "../src/oidc/StagingTestConsole.js";
 import { requestLogPath } from "../src/security/RequestLogging.js";
 import { registerStagingConsoleCallbackAtBoot, STAGING_WEB_ORIGINAL_CALLBACK } from "../src/identity/StagingConsoleClientRegistration.js";
 import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
@@ -33,7 +33,7 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 		const body = request.body as Record<string, string>;
 		const expected = createHash("sha256").update(body.code_verifier).digest("base64url");
 		if (scenario === "bad-pkce" || expected !== challenge) return reply.code(400).send({ error: "invalid_grant" });
-		const idToken = await new SignJWT({ nonce: scenario === "bad-nonce" ? "wrong" : nonce })
+		const idToken = await new SignJWT({ nonce: scenario === "bad-nonce" ? "wrong" : nonce, amr: ["email"] })
 			.setProtectedHeader({ alg: "RS256", kid: "test" }).setIssuer(scenario === "bad-issuer" ? "https://identity.bookwrm.com" : STAGING_ISSUER)
 			.setAudience(scenario === "bad-audience" ? "other-client" : "staging-web").setSubject("test-subject").setIssuedAt()
 			.setExpirationTime(scenario === "expired" ? "1 second ago" : "5 minutes").sign(privateKey);
@@ -62,6 +62,32 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 }
 
 describe("staging test console", () => {
+	it("validates Email OTP, Google and Apple provider claims consistently", () => {
+		const emailSub = "email-subject";
+		expect(validateStagingConsoleUserInfo(
+			{ sub: emailSub, amr: ["email"], email: "jeff@hapiinc.com", email_verified: true },
+			{ sub: emailSub, email: "jeff@hapiinc.com", email_verified: true }, "jeff@hapiinc.com")).toBe(true);
+		expect(validateStagingConsoleUserInfo(
+			{ sub: emailSub, amr: ["email"], email: "different@hapiinc.com", email_verified: true },
+			{ sub: emailSub, email: "different@hapiinc.com", email_verified: true }, "jeff@hapiinc.com")).toBe(false);
+
+		const googleSub = "google-subject";
+		expect(validateStagingConsoleUserInfo(
+			{ sub: googleSub, amr: ["google", "fed"], email: "google-user@example.com", email_verified: true },
+			{ sub: googleSub, email: "google-user@example.com", email_verified: true }, "jeff@hapiinc.com")).toBe(true);
+		expect(validateStagingConsoleUserInfo(
+			{ sub: googleSub, amr: ["google", "fed"], email: "google-user@example.com", email_verified: true },
+			{ sub: "other-subject", email: "google-user@example.com", email_verified: true }, "jeff@hapiinc.com")).toBe(false);
+
+		const appleSub = "apple-subject";
+		expect(validateStagingConsoleUserInfo(
+			{ sub: appleSub, amr: ["apple", "fed"], email: "relay@privaterelay.appleid.com", email_verified: true },
+			{ sub: appleSub, email: "relay@privaterelay.appleid.com", email_verified: true }, "jeff@hapiinc.com")).toBe(true);
+		expect(validateStagingConsoleUserInfo(
+			{ sub: appleSub, amr: ["email", "fed"], email: "wrong@example.com", email_verified: true },
+			{ sub: appleSub, email: "wrong@example.com", email_verified: true }, "jeff@hapiinc.com")).toBe(false);
+	});
+
 	it("requires operator credentials on every endpoint regardless of forwarding headers", async () => {
 		const f = await fixture();
 		try {
