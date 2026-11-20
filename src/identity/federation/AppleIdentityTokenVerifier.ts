@@ -17,6 +17,7 @@ export const APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys";
 // Apple private relay addresses are forwarding aliases owned by Apple, not user mailboxes. They
 // are safe to display/store as contact hints but MUST never participate in account matching.
 export const APPLE_PRIVATE_RELAY_DOMAIN = "privaterelay.appleid.com";
+export const APPLE_ICLOUD_RELAY_DOMAIN = "private.icloud.com";
 
 export type AppleVerificationErrorCode =
 		| "invalid_token"
@@ -131,8 +132,11 @@ export class AppleIdentityTokenVerifier {
 						: undefined;
 				// Apple serializes some boolean claims as the strings "true"/"false".
 				const emailVerified = this.normalizeAppleBoolean(payload.email_verified);
+				const normalizedEmail = email?.toLowerCase();
 				const isPrivateRelayEmail = this.normalizeAppleBoolean(payload.is_private_email) === true
-						|| (email !== undefined && email.toLowerCase().endsWith(`@${APPLE_PRIVATE_RELAY_DOMAIN}`));
+						|| (normalizedEmail !== undefined
+							&& (normalizedEmail.endsWith(`@${APPLE_PRIVATE_RELAY_DOMAIN}`)
+								|| normalizedEmail.endsWith(`@${APPLE_ICLOUD_RELAY_DOMAIN}`)));
 
 				const audience = Array.isArray(payload.aud)
 						? String(payload.aud[0])

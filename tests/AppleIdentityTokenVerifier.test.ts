@@ -94,6 +94,11 @@ describe("V2-C Apple identity-token verification (synthetic keys)", () => {
 						await syntheticAppleToken({ email: "xyz789@privaterelay.appleid.com" }),
 						{ nonce: NONCE });
 				expect(byDomain.isPrivateRelayEmail).toBe(true);
+
+				const byIcloudDomain = await verifier.verify(
+						await syntheticAppleToken({ email: "abc123@private.icloud.com" }),
+						{ nonce: NONCE });
+				expect(byIcloudDomain.isPrivateRelayEmail).toBe(true);
 		});
 
 		it("rejects a token from any other issuer", async () => {

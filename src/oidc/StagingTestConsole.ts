@@ -50,10 +50,12 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 		throw new Error("Staging console requires an independent operator credential and staging client secret");
 	}
 	if (env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== "true" || env.HAPI_UNIVERSAL_LOGIN_ENABLED !== "true" ||
-		env.HAPI_EMAIL_PROVIDER !== "resend" ||
-		["HAPI_APPLE_FEDERATION_ENABLED", "HAPI_GOOGLE_FEDERATION_ENABLED", "HAPI_REFRESH_GRANT_ENABLED",
-			"HAPI_PERSISTENT_SESSIONS_ENABLED"].some(flag => env[flag] !== undefined && env[flag] !== "false")) {
-		throw new Error("Staging console requires email and Universal Login only; federation, refresh and persistent sessions must be off");
+		env.HAPI_EMAIL_PROVIDER !== "resend") {
+		throw new Error("Staging console requires email and Universal Login");
+	}
+	if (["HAPI_REFRESH_GRANT_ENABLED", "HAPI_PERSISTENT_SESSIONS_ENABLED"]
+		.some(flag => env[flag] !== undefined && env[flag] !== "false")) {
+		throw new Error("Staging console requires refresh and persistent sessions to remain off");
 	}
 	const redis = options.redis ?? getRedisClient();
 	const key = (handle: string, suffix: string) => oidcRedisKey(`staging_console:${hash(handle)}:${suffix}`);

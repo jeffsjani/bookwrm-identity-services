@@ -127,13 +127,24 @@ describe("staging test console", () => {
 		}
 	});
 
-	it("refuses to enable without the approved email-only feature configuration", async () => {
+	it("refuses to enable without the approved email and Universal Login configuration", async () => {
 		for (const overrides of [
 			{ HAPI_UNIVERSAL_LOGIN_ENABLED: "false" }, { HAPI_EMAIL_AUTHENTICATION_ENABLED: "false" },
-			{ HAPI_APPLE_FEDERATION_ENABLED: "true" }, { HAPI_GOOGLE_FEDERATION_ENABLED: "true" },
 			{ HAPI_REFRESH_GRANT_ENABLED: "true" }, { HAPI_PERSISTENT_SESSIONS_ENABLED: "true" }
 		]) {
-			await expect(fixture("valid", STAGING_ISSUER, { ...env, ...overrides })).rejects.toThrow(/email and Universal Login only/);
+			await expect(fixture("valid", STAGING_ISSUER, { ...env, ...overrides })).rejects.toThrow(/Staging console/);
+		}
+	});
+
+	it("allows Google or Apple to be enabled independently of email test mode", async () => {
+		for (const overrides of [
+			{ HAPI_GOOGLE_FEDERATION_ENABLED: "true" },
+			{ HAPI_APPLE_FEDERATION_ENABLED: "true" },
+			{ HAPI_GOOGLE_FEDERATION_ENABLED: "true", HAPI_APPLE_FEDERATION_ENABLED: "true" }
+		]) {
+			const f = await fixture("valid", STAGING_ISSUER, { ...env, ...overrides });
+			expect((await f.app.inject({ method: "GET", url: "/staging-console/", headers })).statusCode).toBe(200);
+			await f.app.close();
 		}
 	});
 
