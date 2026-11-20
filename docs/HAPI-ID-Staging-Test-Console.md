@@ -21,15 +21,15 @@ URL; it is exchanged server-side and redirected to a clean results URL.
 - Confirm the staging Resend key, verified sender and verification secret exist and are dedicated
   to staging. Confirm `STAGING_WEB_CLIENT_SECRET` matches the database's `staging-web` secret.
   Do not paste any secret or OTP into chat.
-- Railway terminates HTTPS at the edge and rewrites `X-Forwarded-Proto` and `X-Forwarded-Host`.
-  Identify the **actual inbound proxy IPs/CIDRs** and configure only verified addresses that cannot
-  be used by untrusted peers; do not use a broad private CIDR or trust-all proxy. Other services
-  can reach private-network peers. If this source boundary cannot be established, do not enable
-  the console. Fastify trusts forwarding headers only from configured proxies, and the console
-  requires HTTPS and the exact staging host. Railway appends `X-Forwarded-For`, so its incoming
-  portion is not authoritative. The console's rate limit uses the direct peer, not that header;
-  its 120 requests/minute limit is shared by requests through the same proxy. Proxy trust also
-  affects Fastify's client IP handling for other routes.
+- Railway terminates public HTTPS at the edge. The app does not trust `X-Forwarded-*` headers and
+  validates the actual `Host` header against `id-staging.hapiinc.com`; TCP peer addresses are used
+  only to scope a request-rate limit, never to grant console access. A caller that can reach the
+  app over Railway's private network still must supply the independent HTTP Basic operator
+  credential on every console endpoint. OAuth callback
+  processing additionally requires the short-lived Secure, HttpOnly session cookie, server-side
+  flow state, matching state, and an unused callback; PKCE, nonce, token signature/claims and
+  UserInfo are verified server-side. Thus private-network reachability alone does not grant console
+  access or bypass the OAuth flow. Public browser access relies on Railway's HTTPS edge.
 - Application incoming-request logs contain paths only, not query strings; the console does not
   log OTPs, codes, verifiers, secrets or tokens. Railway edge HTTP query-string logging remains
   unverified and is outside application control; see [Railway logs](https://docs.railway.com/observability/logs).
@@ -57,7 +57,6 @@ URL; it is exchanged server-side and redirected to a clean results URL.
    | --- | --- |
    | `STAGING_TEST_CONSOLE_USERNAME` | Dedicated operator username, without a colon |
    | `STAGING_TEST_CONSOLE_PASSWORD` | Independently generated high-entropy secret, at least 32 characters; never a client, service or signing key |
-   | `STAGING_TEST_CONSOLE_TRUSTED_PROXIES` | Comma-separated, verified proxy IPs or CIDRs; no trust-all range |
    | `STAGING_WEB_CLIENT_SECRET` | Existing matching staging OAuth client secret, server-side only |
    | `OIDC_ISSUER`, `OIDC_ALLOWED_ISSUERS` | Both exactly `https://id-staging.hapiinc.com` |
    | `CORS_TRUSTED_ORIGINS` | Explicit staging-only browser origin allowlist |

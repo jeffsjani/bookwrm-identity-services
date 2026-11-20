@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import formbody from "@fastify/formbody";
 import { exportJWK, importPKCS8, SignJWT } from "jose";
 import { describe, expect, it, vi } from "vitest";
-import { registerStagingTestConsole, validStagingConsoleProxy, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
+import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
 import { requestLogPath } from "../src/security/RequestLogging.js";
 import { registerStagingConsoleCallbackAtBoot, STAGING_WEB_ORIGINAL_CALLBACK } from "../src/identity/StagingConsoleClientRegistration.js";
 import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
@@ -18,7 +18,7 @@ const authorization = "Basic " + Buffer.from(`operator:${password}`).toString("b
 const headers = { host: "id-staging.hapiinc.com", "x-forwarded-proto": "https", authorization };
 
 async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: NodeJS.ProcessEnv = env) {
-	const app = Fastify({ trustProxy: "127.0.0.1" });
+	const app = Fastify({ trustProxy: false });
 	await app.register(formbody);
 	const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
 	const privateKey = await importPKCS8(pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(), "RS256");
@@ -62,17 +62,44 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 }
 
 describe("staging test console", () => {
-	it("requires an authorized browser over trusted HTTPS for every route", async () => {
+	it("requires operator credentials on every endpoint regardless of forwarding headers", async () => {
 		const f = await fixture();
 		try {
 			for (const url of ["/staging-console/", "/staging-console/callback", "/staging-console/results"]) {
 				expect((await f.app.inject({ method: "GET", url, headers: { ...headers, authorization: "" } })).statusCode).toBe(401);
 				expect((await f.app.inject({ method: "GET", url, headers: { ...headers, authorization: "Basic " + Buffer.from("operator:wrong").toString("base64") } })).statusCode).toBe(401);
-				expect((await f.app.inject({ method: "GET", url, headers: { ...headers, "x-forwarded-proto": "http" } })).statusCode).toBe(404);
-				expect((await f.app.inject({ method: "GET", url, remoteAddress: "203.0.113.5", headers })).statusCode).toBe(404);
 			}
 			expect((await f.app.inject({ method: "POST", url: "/staging-console/start", headers: { ...headers, authorization: "" } })).statusCode).toBe(401);
+			expect((await f.app.inject({ method: "POST", url: "/staging-console/start",
+				headers: { ...headers, authorization: "Basic " + Buffer.from("operator:wrong").toString("base64") } })).statusCode).toBe(401);
 			expect((await f.app.inject({ method: "GET", url: "/staging-console/", headers })).statusCode).toBe(200);
+		} finally { await f.app.close(); }
+	});
+
+	it("uses the actual Host and operator credentials, not forwarded headers or peer trust", async () => {
+		const f = await fixture();
+		try {
+			const forwardedHeaders = await f.app.inject({ method: "GET", url: "/staging-console/",
+				remoteAddress: "203.0.113.5",
+				headers: { ...headers, "x-forwarded-proto": "http", "x-forwarded-host": "attacker.invalid",
+					"x-forwarded-for": "203.0.113.1" } });
+			expect(forwardedHeaders.statusCode).toBe(200);
+
+			const forgedHost = await f.app.inject({ method: "GET", url: "/staging-console/",
+				headers: { ...headers, host: "attacker.invalid", "x-forwarded-host": "id-staging.hapiinc.com" } });
+			expect(forgedHost.statusCode).toBe(404);
+
+			const privatePeerWithoutCredentials = await f.app.inject({ method: "GET", url: "/staging-console/",
+				remoteAddress: "10.0.0.8", headers: { host: "id-staging.hapiinc.com", "x-forwarded-proto": "https",
+					"x-forwarded-host": "id-staging.hapiinc.com", "x-forwarded-for": "198.51.100.10" } });
+			expect(privatePeerWithoutCredentials.statusCode).toBe(401);
+
+			const privatePeerWithCredentialsButNoSession = await f.app.inject({ method: "GET",
+				url: "/staging-console/callback?code=forged&state=forged", remoteAddress: "10.0.0.8",
+				headers: { ...headers, "x-forwarded-proto": "https", "x-forwarded-host": "id-staging.hapiinc.com",
+					"x-forwarded-for": "198.51.100.10", cookie: `__Host-hapi_staging_test=${"A".repeat(43)}` } });
+			expect(privatePeerWithCredentialsButNoSession.statusCode).toBe(400);
+			expect(f.tokenCalls()).toBe(0);
 		} finally { await f.app.close(); }
 	});
 
@@ -194,10 +221,6 @@ describe("staging test console", () => {
 		expect(requestLogPath("/health")).toBe("/health");
 	});
 
-	it("requires explicit proxy addresses rather than a trust-all proxy", () => {
-		for (const value of ["", "loopback", "0.0.0.0/0", "::/00", "10.0.0.1/99"]) expect(validStagingConsoleProxy(value)).toBe(false);
-		for (const value of ["127.0.0.1", "10.1.0.0/16", "2001:db8::1/128"]) expect(validStagingConsoleProxy(value)).toBe(true);
-	});
 });
 
 describe("staging callback registration", () => {

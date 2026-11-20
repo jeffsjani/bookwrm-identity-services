@@ -1,5 +1,4 @@
 import { createHash, randomBytes } from "node:crypto";
-import { isIP } from "node:net";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import { renderHapiPage, csrfField } from "../presentation/HapiPagePresentation.js";
@@ -9,6 +8,7 @@ import { stagingConsoleInternalHeaders } from "./StagingConsoleInternal.js";
 
 export const STAGING_ISSUER = "https://id-staging.hapiinc.com";
 export const STAGING_CONSOLE_CALLBACK = `${STAGING_ISSUER}/staging-console/callback`;
+const STAGING_HOST = new URL(STAGING_ISSUER).host;
 const CLIENT = "staging-web";
 const EMAIL = "jeff@hapiinc.com";
 const COOKIE = "__Host-hapi_staging_test";
@@ -39,16 +39,6 @@ function page(reply: FastifyReply, status: number, title: string, body: string, 
 		.type("text/html; charset=utf-8").send(rendered.html);
 }
 
-export function validStagingConsoleProxy(value: string): boolean {
-	const parts = value.split("/");
-	const version = isIP(parts[0]);
-	if (!version || parts.length > 2) return false;
-	if (parts.length === 1) return true;
-	if (!/^\d+$/.test(parts[1])) return false;
-	const bits = Number(parts[1]);
-	return bits > 0 && bits <= (version === 4 ? 32 : 128);
-}
-
 export async function registerStagingTestConsole(app: FastifyInstance, options: Options): Promise<void> {
 	const { issuer, env } = options;
 	if (env.STAGING_TEST_CONSOLE_ENABLED !== "true" || issuer !== STAGING_ISSUER) return;
@@ -69,7 +59,7 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 	const key = (handle: string, suffix: string) => oidcRedisKey(`staging_console:${hash(handle)}:${suffix}`);
 	const authenticate = async (request: FastifyRequest, reply: FastifyReply) => {
 		reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer");
-		if (request.protocol !== "https" || request.hostname !== new URL(STAGING_ISSUER).host) {
+		if (request.headers.host !== STAGING_HOST) {
 			return reply.code(404).send({ error: "not_found" });
 		}
 		const peer = request.socket.remoteAddress;

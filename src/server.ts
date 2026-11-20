@@ -26,20 +26,12 @@ import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposit
 import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
 import { registerCorsPolicy } from "./security/CorsPolicy.js";
 import { enforceDeploymentIssuerPin } from "./config/IssuerPolicy.js";
-import { registerStagingTestConsole, validStagingConsoleProxy, STAGING_ISSUER } from "./oidc/StagingTestConsole.js";
+import { registerStagingTestConsole, STAGING_ISSUER } from "./oidc/StagingTestConsole.js";
 import { protectStagingConsoleInternalLogs } from "./oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "./security/RequestLogging.js";
 
 const isStagingIssuer = configuration.get("OIDC_ISSUER")?.trim() === STAGING_ISSUER;
-const consoleEnabled = configuration.get("STAGING_TEST_CONSOLE_ENABLED") === "true" && isStagingIssuer;
-const trustedProxies = consoleEnabled
-		? (configuration.get("STAGING_TEST_CONSOLE_TRUSTED_PROXIES") ?? "").split(",").map(value => value.trim()).filter(Boolean)
-		: [];
-if (consoleEnabled && (trustedProxies.length === 0 || trustedProxies.some(value => !validStagingConsoleProxy(value)))) {
-		throw new Error("Staging console requires narrowly scoped trusted proxy addresses");
-}
 const app = Fastify({
-		trustProxy: trustedProxies.length ? trustedProxies : false,
 		logger: {
 					level: configuration.getLogLevel(),
 					serializers: { req: serializeRequestForLog }
