@@ -30,12 +30,57 @@ describe.skipIf(!databaseUrl)("staging console callback registration (PostgreSQL
 	beforeEach(async () => {
 		await pool.query("DELETE FROM oidc_clients WHERE client_id = 'foreign-client'");
 		await pool.query("UPDATE oidc_clients SET redirect_uris = $1 WHERE client_id = 'staging-web'", [[STAGING_WEB_ORIGINAL_CALLBACK]]);
+		await pool.query("UPDATE applications SET allowed_authentication_methods = ARRAY['HAPI_EMAIL','EXTERNAL_OIDC'] WHERE application_key='HAPI_STAGING'");
 	});
 
 	afterAll(async () => {
 		await pool.end();
 		await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
 		await admin.end();
+	});
+
+	it("seeds the staging application with exactly HAPI_EMAIL and EXTERNAL_OIDC", async () => {
+		const app = await pool.query<{ allowed_authentication_methods: string[] }>(
+			"SELECT allowed_authentication_methods FROM applications WHERE application_key='HAPI_STAGING'");
+		expect(app.rows).toHaveLength(1);
+		expect(app.rows[0].allowed_authentication_methods).toEqual(["HAPI_EMAIL", "EXTERNAL_OIDC"]);
+	});
+
+	it("updates staging Google permissions idempotently without changing OAuth clients", async () => {
+		const beforeWeb = await pool.query("SELECT * FROM oidc_clients WHERE client_id='staging-web'");
+		const beforeNative = await pool.query("SELECT * FROM oidc_clients WHERE client_id='staging-native'");
+		await pool.query("UPDATE applications SET allowed_authentication_methods=ARRAY['HAPI_EMAIL'] WHERE application_key='HAPI_STAGING'");
+		const update = readFileSync(new URL("../scripts/update-staging-google-permissions.sql", import.meta.url), "utf8");
+		const client = await pool.connect();
+		try {
+			await client.query("SET hapi.staging_issuer='https://id-staging.hapiinc.com'");
+			await client.query(update);
+			await client.query(update);
+			const app = await client.query<{ allowed_authentication_methods: string[] }>(
+				"SELECT allowed_authentication_methods FROM applications WHERE application_key='HAPI_STAGING'");
+			expect(app.rows[0].allowed_authentication_methods).toEqual(["HAPI_EMAIL", "EXTERNAL_OIDC"]);
+			const afterWeb = await client.query("SELECT * FROM oidc_clients WHERE client_id='staging-web'");
+			const afterNative = await client.query("SELECT * FROM oidc_clients WHERE client_id='staging-native'");
+			expect(afterWeb.rows).toEqual(beforeWeb.rows);
+			expect(afterNative.rows).toEqual(beforeNative.rows);
+		} finally {
+			client.release();
+		}
+	});
+
+	it("refuses the staging Google permission update for the wrong issuer", async () => {
+		await pool.query("UPDATE applications SET allowed_authentication_methods=ARRAY['HAPI_EMAIL'] WHERE application_key='HAPI_STAGING'");
+		const update = readFileSync(new URL("../scripts/update-staging-google-permissions.sql", import.meta.url), "utf8");
+		const client = await pool.connect();
+		try {
+			await client.query("SET hapi.staging_issuer='https://identity.bookwrm.com'");
+			await expect(client.query(update)).rejects.toThrow(/issuer marker/);
+			const app = await client.query<{ allowed_authentication_methods: string[] }>(
+				"SELECT allowed_authentication_methods FROM applications WHERE application_key='HAPI_STAGING'");
+			expect(app.rows[0].allowed_authentication_methods).toEqual(["HAPI_EMAIL"]);
+		} finally {
+			client.release();
+		}
 	});
 
 	it("atomically appends the callback, preserves existing data and is idempotent under concurrency", async () => {

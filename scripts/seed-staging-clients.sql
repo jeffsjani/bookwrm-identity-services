@@ -1,7 +1,8 @@
 -- =============================================================================
 -- HAPI ID V2-E Stage 2 — staging synthetic OAuth client seed (STAGING ONLY)
 -- =============================================================================
--- Seeds tenant 'hapi-staging' -> application 'hapi-staging-app' (HAPI_EMAIL only)
+-- Seeds tenant 'hapi-staging' -> application 'hapi-staging-app'
+-- (HAPI_EMAIL + EXTERNAL_OIDC for Google/Apple Universal Login)
 -- -> clients 'staging-web' (confidential, client_secret_basic, PKCE S256) and
 -- 'staging-native' (public, token_endpoint_auth_method=none, PKCE S256).
 --
@@ -70,7 +71,7 @@ BEGIN
 			application_key, allowed_authentication_methods, allowed_identity_providers,
 			face_setup_enabled, presentation)
 		VALUES (gen_random_uuid(), v_tenant_id, 'HAPI Staging App', 'hapi-staging-app', 'active', now(), now(),
-			'HAPI_STAGING', ARRAY['HAPI_EMAIL'], ARRAY[]::TEXT[], false, '{}'::jsonb)
+			'HAPI_STAGING', ARRAY['HAPI_EMAIL','EXTERNAL_OIDC'], ARRAY[]::TEXT[], false, '{}'::jsonb)
 		RETURNING * INTO v_app;
 	ELSE
 		IF v_app.tenant_id <> v_tenant_id THEN
@@ -79,8 +80,15 @@ BEGIN
 		IF v_app.slug <> 'hapi-staging-app' OR v_app.application_key <> 'HAPI_STAGING' THEN
 			RAISE EXCEPTION 'Application natural keys conflict (slug=%, application_key=%) — refusing', v_app.slug, v_app.application_key;
 		END IF;
-		IF v_app.allowed_authentication_methods <> ARRAY['HAPI_EMAIL'] THEN
-			RAISE EXCEPTION 'Application hapi-staging-app allows methods % — expected exactly {HAPI_EMAIL}; refusing', v_app.allowed_authentication_methods;
+		IF v_app.allowed_authentication_methods <> ARRAY['HAPI_EMAIL','EXTERNAL_OIDC']
+			AND v_app.allowed_authentication_methods <> ARRAY['HAPI_EMAIL'] THEN
+			RAISE EXCEPTION 'Application hapi-staging-app allows methods % — expected exactly {HAPI_EMAIL} or {HAPI_EMAIL,EXTERNAL_OIDC}; refusing', v_app.allowed_authentication_methods;
+		END IF;
+		IF v_app.allowed_authentication_methods <> ARRAY['HAPI_EMAIL','EXTERNAL_OIDC'] THEN
+			UPDATE applications
+			SET allowed_authentication_methods = ARRAY['HAPI_EMAIL','EXTERNAL_OIDC'], updated_at = now()
+			WHERE id = v_app.id;
+			SELECT * INTO v_app FROM applications WHERE id = v_app.id;
 		END IF;
 		IF v_app.status <> 'active' OR v_app.face_setup_enabled THEN
 			RAISE EXCEPTION 'Application hapi-staging-app has unexpected status/face_setup state — refusing';
