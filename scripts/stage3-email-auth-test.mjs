@@ -316,7 +316,7 @@ const replayResult = await fetchJson(`${issuer}/authorize`, {
 		authentication_result: round.authenticationResult
 	})
 });
-record("negative.result-replay", replayResult.response.status >= 400 && !replayResult.json?.redirectUri ? "PASS" : "FAIL",
+record("negative.result-replay", replayResult.response.status >= 400 && replayResult.response.status < 500 && !replayResult.json?.redirectUri ? "PASS" : "FAIL",
 	`replayed authentication_result -> HTTP ${replayResult.response.status} (expected 4xx, no redirectUri)`);
 
 const token = await tokenExchange(code, codeVerifier);

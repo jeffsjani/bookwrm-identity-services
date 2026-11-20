@@ -73,12 +73,14 @@ let tokenExchanged = false;
 process.stdin.resume = () => { process.nextTick(() => process.stdin.emit("data", Buffer.from("123456\\n"))); return process.stdin; };
 process.stdin.pause = () => process.stdin;
 globalThis.fetch = async (url, init = {}) => {
-	if (tokenExchanged) { console.error("MOCK_AFTER_TOKEN"); process.exit(77); }
+	if (tokenExchanged && scenario !== "replay-500") { console.error("MOCK_AFTER_TOKEN"); process.exit(77); }
 	if (url.endsWith("/.well-known/openid-configuration")) return Response.json({
 		issuer: "https://id-staging.hapiinc.com", grant_types_supported: ["authorization_code"],
 		jwks_uri: "https://id-staging.hapiinc.com/jwks", userinfo_endpoint: "https://id-staging.hapiinc.com/userinfo"
 	});
-	if (url.endsWith("/jwks")) return Response.json({ keys: [publicKey] });
+	if (url.endsWith("/jwks")) return Response.json({ keys: [
+		scenario === "replay-500" && url.startsWith("https://identity.bookwrm.com") ? { ...publicKey, kid: "other" } : publicKey
+	] });
 	if (url.endsWith("/v1/registration/complete")) {
 		probes++;
 		return Response.json({ error: "INVALID_EVIDENCE" }, { status: probes === 1 ? 400 : 401 });
@@ -87,13 +89,14 @@ globalThis.fetch = async (url, init = {}) => {
 	if (url.endsWith("/v1/authentication/email/verify")) return Response.json({ authenticationResult: "synthetic-result", subject: "subject", expiresIn: 60 });
 	if (url.endsWith("/authorize")) {
 		const request = JSON.parse(init.body);
-		if (nonce) return Response.json({}, { status: 400 });
+		if (nonce) return Response.json({}, { status: scenario === "replay-500" ? 500 : 400 });
 		nonce = request.nonce;
 		if (request.code_challenge_method !== "S256") throw new Error("PKCE S256 not requested");
 		codeChallenge = request.code_challenge;
 		return Response.json({ redirectUri: "https://staging-app.hapiinc.com/callback?code=synthetic-code&state=" + request.state });
 	}
 	if (url.endsWith("/token")) {
+		if (tokenExchanged) return Response.json({ error: "invalid_grant" }, { status: 400 });
 		const verifier = new URLSearchParams(init.body).get("code_verifier");
 		if (!verifier || crypto.createHash("sha256").update(verifier).digest("base64url") !== codeChallenge) throw new Error("PKCE verifier mismatch");
 		const now = Math.floor(Date.now() / 1000);
@@ -112,13 +115,18 @@ globalThis.fetch = async (url, init = {}) => {
 		tokenExchanged = true;
 		return Response.json({ access_token: "synthetic-access-token", id_token: idToken });
 	}
+	if (url.endsWith("/userinfo")) {
+		return init.headers.authorization === "Bearer not-a-real-token"
+			? Response.json({}, { status: 401 })
+			: Response.json({ sub: "subject", email: "test@example.invalid" });
+	}
 	throw new Error("Unexpected request");
 };`;
 
 function runTokenFlow(scenario: string) {
 	const preload = `data:text/javascript;base64,${Buffer.from(mockTokenFlow).toString("base64")}`;
 	return spawnSync(process.execPath, ["--import", preload, "scripts/stage3-email-auth-test.mjs",
-		"--staging-live-approved", "--negative-verifier"], {
+		"--staging-live-approved", ...(scenario === "replay-500" ? [] : ["--negative-verifier"])], {
 		encoding: "utf8", timeout: 20000,
 		env: { ...process.env, STAGING_WEB_CLIENT_SECRET: "x".repeat(32), STAGING_TEST_EMAIL: "test@example.invalid",
 			STAGING_ISSUER: "https://id-staging.hapiinc.com", STAGING_CLIENT_ID: "staging-web",
@@ -143,6 +151,14 @@ describe("Stage 3 ID-token validation", () => {
 	it("continues to the mocked UserInfo request with a valid ID token", () => {
 		const result = runTokenFlow("valid");
 		expect(result.status).toBe(77);
+		expect(result.stdout).toContain("[PASS] negative.result-replay — replayed authentication_result -> HTTP 400");
 		expect(result.stderr).toContain("MOCK_AFTER_TOKEN");
+	});
+
+	it("fails the report when authentication-result replay returns HTTP 500", () => {
+		const result = runTokenFlow("replay-500");
+		expect(result.status).toBe(1);
+		expect(result.stdout).toContain("[FAIL] negative.result-replay — replayed authentication_result -> HTTP 500");
+		expect(result.stdout).toMatch(/Summary: \d+ pass, 1 fail,/);
 	});
 });
