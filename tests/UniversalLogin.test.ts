@@ -31,6 +31,7 @@ import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUse
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
 import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
+import * as redisInfrastructure from "../src/oidc/infrastructure/RedisInfrastructure.js";
 import { OIDCRateLimiter } from "../src/oidc/infrastructure/OIDCRateLimiter.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.js";
@@ -41,6 +42,7 @@ import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } 
 import { protectStagingConsoleInternalLogs } from "../src/oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "../src/security/RequestLogging.js";
 import { PostgresPasskeyCredentialRepository } from "../src/identity/PostgresPasskeyCredentialRepository.js";
+import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
 import type { AuthenticationResponseJSON, PublicKeyCredentialCreationOptionsJSON,
 	PublicKeyCredentialRequestOptionsJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 
@@ -1154,7 +1156,7 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		vi.restoreAllMocks();
 	});
 
-	async function setup() {
+	async function setup(realOidcPersistence = false) {
 		vi.spyOn(OIDCRateLimiter.prototype, "assertWithinLimits").mockResolvedValue();
 		setFlag(true);
 		vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "true");
@@ -1162,10 +1164,14 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		vi.stubEnv("OIDC_ALLOWED_ISSUERS", stagingOrigin);
 		configuration.reload();
 		const redis = new Redis({ host: "127.0.0.1", port: Number(passkeyRedisPort) });
+		if (realOidcPersistence) vi.spyOn(redisInfrastructure, "getRedisClient").mockReturnValue(redis);
 		const store = new AuthorizationInteractionStore(redis);
 		const credentials = new PostgresPasskeyCredentialRepository(pool);
 		const f = await emailFixture({ interactionStore: store, passkeyCredentials: credentials });
-		vi.spyOn(identityRegistry, "findById").mockImplementation(id => f.subjects.findById(id));
+		const postgresSubjects = new PostgresIdentitySubjectRepository(pool);
+		vi.spyOn(identityRegistry, "findById").mockImplementation(id =>
+			realOidcPersistence ? postgresSubjects.findById(id) : f.subjects.findById(id));
+		if (realOidcPersistence) f.lookup.mockImplementation(sub => postgresSubjects.findByOidcSubject(sub));
 		await pool.query(`INSERT INTO identity_subjects
 			(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
 			VALUES ($1, $2, 'HAPI_EMAIL', $3, 'ACTIVE', now(), now())`,
@@ -1279,6 +1285,36 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 				expect((await login.verify(assertion)).statusCode).not.toBe(200);
 			}
 			expect(t.f.delivery.messages).toHaveLength(emailCount);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("redeems a passkey authorization code once with real Redis OIDC storage and PostgreSQL identity resolution", async () => {
+		const t = await setup(true);
+		const a = await authenticator();
+		try {
+			await enroll(t, a.page);
+			const login = await beginPasskeyLogin(t);
+			const assertion = await createAssertion(a.page, (await login.options()).json());
+			const verified = await login.verify(assertion);
+			expect(verified.statusCode, verified.body).toBe(200);
+			const code = new URL(verified.json().redirect).searchParams.get("code")!;
+			expect(await t.redis.get(oidcRedisKey(`auth_code:${code}`))).not.toBeNull();
+			const tokens = await Promise.all(Array.from({ length: 5 }, () => t.f.app.inject({
+				method: "POST", url: "/token", headers: t.f.basic,
+				payload: { grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: "p".repeat(43) }
+			})));
+			const success = tokens.filter(response => response.statusCode === 200);
+			expect(success).toHaveLength(1);
+			const token = success[0].json();
+			const jwks = (await t.f.app.inject({ method: "GET", url: "/jwks" })).json().keys;
+			const jwk = jwks.find((key: { kid?: string }) => key.kid === decodeProtectedHeader(token.id_token).kid);
+			const signed = await jwtVerify(token.id_token, await importJWK(jwk, "RS256"), { issuer: stagingOrigin, audience: CLIENT_ID });
+			expect(signed.payload).toMatchObject({ sub: t.f.subject.oidcSubject, amr: ["passkey"] });
+			expect(await t.redis.get(oidcRedisKey(`access_token:${token.access_token}`))).not.toBeNull();
+			const userinfo = await t.f.app.inject({ method: "GET", url: "/userinfo",
+				headers: { authorization: `Bearer ${token.access_token}` } });
+			expect(userinfo.statusCode, userinfo.body).toBe(200);
+			expect(userinfo.json().sub).toBe(t.f.subject.oidcSubject);
 		} finally { await a.close(); await t.close(); }
 	}, 30_000);
 
