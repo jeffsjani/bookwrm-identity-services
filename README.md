@@ -69,12 +69,17 @@ to its existing subject and rejects revoked credentials. User verification is
 required. Passkey-authenticated logins do not create persistent sessions or
 refresh tokens.
 
-Users can list, add, or revoke passkeys after a fresh email OTP or a
+Users can list, name, rename, add, or revoke passkeys after a fresh email OTP or a
 user-verified passkey reauthentication. A new Apple or Google callback alone is
 not proof that the upstream authentication was recent; users can manage their
-passkeys by reauthenticating with an existing passkey or email OTP. Revoking the
-passkey used for management requires starting sign-in again. Renaming is not
-supported. The guarded staging permission update in
+passkeys by reauthenticating with an existing passkey or email OTP. Names must be
+distinct among active passkeys. Existing unnamed passkeys retain a numbered fallback;
+when there is more than one, select **Manage passkeys** at sign-in and verify with
+the passkey to identify and name it. An unnamed passkey must be named before it can
+be revoked. Revocation displays the selected name and requires a separate confirmation;
+revoking the passkey used for management requires starting sign-in again.
+Schema version 1.4.0 adds a nullable display name and an active-name uniqueness index
+without changing existing credentials. The guarded staging permission update in
 `scripts/update-staging-passkey-permissions.sql` requires separate review and
 execution; it is not applied automatically.
 

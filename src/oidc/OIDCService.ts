@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import {
 		createHash,
+		createHmac,
 		createPrivateKey,
 		createPublicKey,
 		createSign,
@@ -66,7 +67,7 @@ import {
 		type AuthorizationInteraction,
 		type AuthorizationInteractionBinding
 } from "./AuthorizationInteractionStore.js";
-import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, passkeyManagePage, passkeyOfferPage, type RenderedLoginPage } from "./UniversalLoginPages.js";
+import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, passkeyManagePage, passkeyNameInUsePage, passkeyOfferPage, passkeyRevokeConfirmationPage, type RenderedLoginPage } from "./UniversalLoginPages.js";
 import type { InteractiveEmailAuthority, InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
 import {
@@ -99,6 +100,8 @@ const universalLoginEmailSchema = z.string().trim().min(3).max(320).email();
 const isInteractiveEmailMode = (value: unknown): value is InteractiveEmailMode =>
 	value === "AUTHENTICATION" || value === "REGISTRATION" || value === "INELIGIBLE";
 const base64url = z.string().regex(/^[A-Za-z0-9_-]+$/).max(100_000);
+const passkeyDisplayName = z.string().trim().min(1).max(80).refine(value => !/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(value));
+const managementNonce = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const registrationResponseSchema = z.object({
 		id: base64url, rawId: base64url, type: z.literal("public-key"),
 		authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
@@ -1589,67 +1592,133 @@ export class OIDCService {
 								managementAvailable: freshManagementDeadline(enrollment.principal) > Date.now(),
 								available: !enrollment.expired && await passkeyOffered(loaded.interaction) }));
 				});
+				const loadManagement = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean, route: string) => {
+						const loaded = await load(request, reply, mutation, route);
+						if (!loaded) return null;
+						if (mutation && request.headers.origin !== this.resolveIssuer()) {
+								reply.code(403).send({ error: "invalid_origin" }); return null;
+						}
+						const proof = browserProof(request);
+						const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+						if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED" ||
+								!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) {
+								expired(reply); return null;
+						}
+						const deadline = Math.min(enrollment.expiresAt, freshManagementDeadline(enrollment.principal));
+						if (deadline <= Date.now() || !await activeManagementCredential(enrollment.principal)) {
+								reply.code(403).send({ error: "fresh_authentication_required" }); return null;
+						}
+						const subject = await identityRegistry.findById(enrollment.principal.id);
+						if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) {
+								expired(reply); return null;
+						}
+						await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+								this.applicationMethodFor(enrollment.principal.authenticationMethod));
+						return { ...loaded, proof, enrollment, subject, deadline };
+				};
+				const managementError = (reply: FastifyReply, error: unknown) => {
+						if (error instanceof PasskeyAuthenticationRejected) return reply.code(403).send({ error: "fresh_authentication_required" });
+						if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+						app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_MANAGE_UNAVAILABLE" }, "Passkey management unavailable");
+						return unavailable(reply);
+				};
+				const credentialRef = (proof: string, nonce: string, id: string) =>
+						createHmac("sha256", proof).update(nonce).update(":").update(id).digest("base64url");
 				app.get("/login/passkey/manage", async (request, reply) => {
 						try {
-								const loaded = await load(request, reply, false, "GET /login/passkey/manage");
-								if (!loaded) return reply;
-								const proof = browserProof(request);
-								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
-								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED" ||
-										!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) return expired(reply);
-								if (freshManagementDeadline(enrollment.principal) <= Date.now()) return reply.code(403).send({ error: "fresh_authentication_required" });
-								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
-								const subject = await identityRegistry.findById(enrollment.principal.id);
-								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
-								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
-										this.applicationMethodFor(enrollment.principal.authenticationMethod));
-								const credentials = await this.passkeyCredentials.list(subject.id, subject.oidcSubject,
-										Math.min(enrollment.expiresAt, freshManagementDeadline(enrollment.principal)), enrollment.principal.passkeyCredentialId);
-								return send(reply, 200, passkeyManagePage({ tenantName: loaded.interaction.binding?.tenantName,
-										clientId: loaded.interaction.clientId, csrf: loaded.interaction.csrf, credentials }));
+								const context = await loadManagement(request, reply, false, "GET /login/passkey/manage");
+								if (!context) return reply;
+								const { subject, enrollment, deadline, handle, proof, interaction } = context;
+								const credentials = await this.passkeyCredentials.list(subject.id, subject.oidcSubject, deadline, enrollment.principal.passkeyCredentialId);
+								const nonce = await this.interactions.issuePasskeyManagement(handle, proof, interaction.csrf, subject.id, "list");
+								if (!nonce) return expired(reply);
+								return send(reply, 200, passkeyManagePage({ tenantName: interaction.binding?.tenantName,
+										clientId: interaction.clientId, csrf: interaction.csrf, nonce,
+										credentials: credentials.map(credential => ({
+												ref: credentialRef(proof, nonce, credential.id), displayName: credential.displayName, createdAt: credential.createdAt,
+												usedToAuthenticate: credential.id === enrollment.principal.passkeyCredentialId,
+												canRename: Boolean(credential.displayName) || credentials.length === 1 ||
+														credential.id === enrollment.principal.passkeyCredentialId
+										})) }));
+						} catch (error) { return managementError(reply, error); }
+				});
+				app.post("/login/passkey/rename", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const context = await loadManagement(request, reply, true, "POST /login/passkey/rename");
+								if (!context) return reply;
+								const { subject, enrollment, deadline, handle, proof, interaction, body } = context;
+								const nonce = managementNonce.safeParse(body.nonce);
+								const ref = managementNonce.safeParse(body.ref);
+								const name = passkeyDisplayName.safeParse(body.displayName);
+								if (!nonce.success || !ref.success || !name.success) return reply.code(400).send({ error: "invalid_request" });
+								const credentials = await this.passkeyCredentials.list(subject.id, subject.oidcSubject, deadline, enrollment.principal.passkeyCredentialId);
+								const credential = credentials.find(item => constantTimeStringEqual(credentialRef(proof, nonce.data, item.id), ref.data));
+								if (!credential) return reply.code(404).send({ error: "credential_not_found" });
+								if (!credential.displayName && credentials.length > 1 && credential.id !== enrollment.principal.passkeyCredentialId) {
+										return reply.code(403).send({ error: "passkey_identification_required" });
+								}
+								if (!await this.interactions.claimPasskeyManagement(handle, proof, interaction.csrf, subject.id, nonce.data, "list")) return expired(reply);
+								let renamed: boolean;
+								try {
+										renamed = await this.passkeyCredentials.rename(subject.id, subject.oidcSubject, credential.id, name.data,
+												deadline, enrollment.principal.passkeyCredentialId);
+								} finally {
+										if (!await this.interactions.transitionPasskeyEnrollment(handle, proof, interaction.csrf, subject.id, "MANAGING", "OFFERED")) {
+												throw new Error("Passkey management transition failed");
+										}
+								}
+								if (!renamed) return reply.code(404).send({ error: "credential_not_found" });
+								return reply.header("Cache-Control", "no-store").redirect("/login/passkey/manage", 303);
 						} catch (error) {
-								if (error instanceof PasskeyAuthenticationRejected) return reply.code(403).send({ error: "fresh_authentication_required" });
-								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
-								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_MANAGE_UNAVAILABLE" }, "Passkey management unavailable");
-								return unavailable(reply);
+								if ((error as { code?: string }).code === "23505") return send(reply, 409, passkeyNameInUsePage());
+								return managementError(reply, error);
 						}
+				});
+				app.post("/login/passkey/confirm", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const context = await loadManagement(request, reply, true, "POST /login/passkey/confirm");
+								if (!context) return reply;
+								const { subject, enrollment, deadline, handle, proof, interaction, body } = context;
+								const nonce = managementNonce.safeParse(body.nonce);
+								const ref = managementNonce.safeParse(body.ref);
+								if (!nonce.success || !ref.success) return reply.code(400).send({ error: "invalid_request" });
+								const credentials = await this.passkeyCredentials.list(subject.id, subject.oidcSubject, deadline, enrollment.principal.passkeyCredentialId);
+								const credential = credentials.find(item => constantTimeStringEqual(credentialRef(proof, nonce.data, item.id), ref.data));
+								if (!credential) return reply.code(404).send({ error: "credential_not_found" });
+								if (!credential.displayName) return reply.code(400).send({ error: "passkey_name_required" });
+								if (!await this.interactions.claimPasskeyManagement(handle, proof, interaction.csrf, subject.id, nonce.data, "list")) return expired(reply);
+								const confirmation = await this.interactions.issuePasskeyManagement(handle, proof, interaction.csrf, subject.id,
+										"confirm", { credentialId: credential.id, name: credential.displayName });
+								if (!confirmation) return unavailable(reply);
+								return send(reply, 200, passkeyRevokeConfirmationPage({ tenantName: interaction.binding?.tenantName,
+										clientId: interaction.clientId, csrf: interaction.csrf, nonce: confirmation, name: credential.displayName }));
+						} catch (error) { return managementError(reply, error); }
 				});
 				app.post("/login/passkey/revoke", { bodyLimit: 4096 }, async (request, reply) => {
 						try {
-								const loaded = await load(request, reply, true, "POST /login/passkey/revoke");
-								if (!loaded) return reply;
-								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
-								const credentialId = base64url.safeParse(loaded.body.credential_id);
-								if (!credentialId.success) return reply.code(400).send({ error: "invalid_credential" });
-								const proof = browserProof(request);
-								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
-								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED" ||
-										!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) return expired(reply);
-								const freshUntil = freshManagementDeadline(enrollment.principal);
-								if (freshUntil <= Date.now()) return reply.code(403).send({ error: "fresh_authentication_required" });
-								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
-								const subject = await identityRegistry.findById(enrollment.principal.id);
-								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
-								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
-										this.applicationMethodFor(enrollment.principal.authenticationMethod));
-								if (!await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
-										subject.id, "OFFERED", "MANAGING")) return expired(reply);
-								const revoked = await this.passkeyCredentials.revoke(subject.id, subject.oidcSubject, credentialId.data,
-										Math.min(enrollment.expiresAt, freshUntil), enrollment.principal.passkeyCredentialId);
-								if (!await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
-										subject.id, "MANAGING", "OFFERED")) return unavailable(reply);
+								const context = await loadManagement(request, reply, true, "POST /login/passkey/revoke");
+								if (!context) return reply;
+								const { subject, enrollment, deadline, handle, proof, interaction, body } = context;
+								const nonce = managementNonce.safeParse(body.nonce);
+								if (!nonce.success) return reply.code(400).send({ error: "invalid_request" });
+								const target = await this.interactions.claimPasskeyManagement(handle, proof, interaction.csrf, subject.id, nonce.data, "confirm");
+								if (!target?.credentialId || !target.name) return expired(reply);
+								let revoked: boolean;
+								try {
+										revoked = await this.passkeyCredentials.revoke(subject.id, subject.oidcSubject, target.credentialId,
+												deadline, enrollment.principal.passkeyCredentialId, target.name);
+								} finally {
+										if (!await this.interactions.transitionPasskeyEnrollment(handle, proof, interaction.csrf, subject.id, "MANAGING", "OFFERED")) {
+												throw new Error("Passkey management transition failed");
+										}
+								}
 								if (!revoked) return reply.code(404).send({ error: "credential_not_found" });
-								if (credentialId.data === enrollment.principal.passkeyCredentialId) {
+								if (target.credentialId === enrollment.principal.passkeyCredentialId) {
 										return send(reply, 200, messagePage({ title: "Passkey revoked",
 												message: "Your passkey was revoked. Start sign-in again using another method." }));
 								}
 								return reply.header("Cache-Control", "no-store").redirect("/login/passkey/manage", 303);
-						} catch (error) {
-								if (error instanceof PasskeyAuthenticationRejected) return reply.code(403).send({ error: "fresh_authentication_required" });
-								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
-								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_REVOKE_UNAVAILABLE" }, "Passkey revocation failed");
-								return unavailable(reply);
-						}
+						} catch (error) { return managementError(reply, error); }
 				});
 				app.post("/login/passkey/options", { bodyLimit: 4096 }, async (request, reply) => {
 						try {
@@ -1666,12 +1735,17 @@ export class OIDCService {
 								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
 								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
 										this.applicationMethodFor(enrollment.principal.authenticationMethod));
-								const userHandle = await this.passkeyCredentials.userHandle(subject.id);
 								const excludeCredentials = await this.passkeyCredentials.activeCredentials(subject.id);
 								if (excludeCredentials.length && freshManagementDeadline(enrollment.principal) <= Date.now()) {
 										return reply.code(403).send({ error: "fresh_authentication_required" });
 								}
 								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
+								const displayName = passkeyDisplayName.safeParse(loaded.body.displayName);
+								if (!displayName.success) return reply.code(400).send({ error: "invalid_passkey_name" });
+								if (await this.passkeyCredentials.nameInUse(subject.id, displayName.data)) {
+										return reply.code(409).send({ error: "passkey_name_in_use" });
+								}
+								const userHandle = await this.passkeyCredentials.userHandle(subject.id);
 								const issuer = this.resolveIssuer();
 								const options = await generateRegistrationOptions({
 										rpName: issuer === "https://id-staging.hapiinc.com" ? "HAPI ID Staging" : "HAPI ID",
@@ -1681,7 +1755,7 @@ export class OIDCService {
 										authenticatorSelection: { residentKey: "required", userVerification: "required" }
 								});
 								if (!await this.interactions.beginPasskeyRegistration(loaded.handle, proof, loaded.interaction.csrf,
-										subject.id, options.challenge, userHandle.toString("base64url"))) return expired(reply);
+										subject.id, options.challenge, userHandle.toString("base64url"), displayName.data)) return expired(reply);
 								return reply.header("Cache-Control", "no-store").send(options);
 						} catch (error) {
 								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
@@ -1699,6 +1773,8 @@ export class OIDCService {
 								}
 								const parsed = registrationResponseSchema.safeParse(loaded.body.credential);
 								if (!parsed.success || parsed.data.id !== parsed.data.rawId) return reply.code(400).send({ error: "invalid_credential" });
+								const displayName = passkeyDisplayName.safeParse(loaded.body.displayName);
+								if (!displayName.success) return reply.code(400).send({ error: "invalid_passkey_name" });
 								const proof = browserProof(request);
 								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
 								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "ENROLLING") return expired(reply);
@@ -1708,6 +1784,11 @@ export class OIDCService {
 										this.applicationMethodFor(enrollment.principal.authenticationMethod));
 								const claimed = await this.interactions.claimPasskeyRegistration(loaded.handle, proof, loaded.interaction.csrf, subject.id);
 								if (!claimed) return expired(reply);
+								if (claimed.displayName !== displayName.data) {
+										await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+												subject.id, "VERIFYING", "FAILED");
+										return reply.code(400).send({ error: "invalid_passkey_name" });
+								}
 								let verified;
 								try {
 										verified = await verifyRegistrationResponse({
@@ -1734,7 +1815,7 @@ export class OIDCService {
 												authorizingCredentialId: claimed.principal.passkeyCredentialId,
 												credential: verified.registrationInfo.credential,
 												backupEligible: verified.registrationInfo.credentialDeviceType === "multiDevice",
-												backupState: verified.registrationInfo.credentialBackedUp
+												backupState: verified.registrationInfo.credentialBackedUp, displayName: claimed.displayName
 										});
 								} catch (error) {
 										try {
@@ -1758,6 +1839,7 @@ export class OIDCService {
 										.header("Referrer-Policy", "no-referrer").send({ redirect });
 						} catch (error) {
 								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								if ((error as { code?: string }).code === "23505") return reply.code(409).send({ error: "passkey_or_name_in_use" });
 								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_VERIFY_UNAVAILABLE" }, "Passkey enrollment failed");
 								return reply.code(503).send({ error: "passkey_unavailable" });
 						}

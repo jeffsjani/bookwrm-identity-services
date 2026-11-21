@@ -18,8 +18,10 @@ let pool: pg.Pool | undefined;
 let schemaEnsured = false;
 
 // Current Identity Registry schema version (Task 3, Sprint 5.1; bumped by HAPI ID V2-B, V2-C).
-export const CURRENT_SCHEMA_VERSION = "1.3.0";
-export const CURRENT_SCHEMA_DESCRIPTION = "Passkey credential enrollment (V2-E)";
+export const CURRENT_SCHEMA_VERSION = "1.4.0";
+export const CURRENT_SCHEMA_DESCRIPTION = "Passkey display names (V2-E)";
+const PASSKEY_SCHEMA_VERSION = "1.3.0";
+const PASSKEY_SCHEMA_DESCRIPTION = "Passkey credential enrollment (V2-E)";
 const V2C_SCHEMA_VERSION = "1.2.0";
 const V2C_SCHEMA_DESCRIPTION = "Persistent HAPI sessions and refresh-token families (V2-C)";
 const V2B_SCHEMA_VERSION = "1.1.0";
@@ -64,6 +66,7 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 				[INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_DESCRIPTION],
 				[V2B_SCHEMA_VERSION, V2B_SCHEMA_DESCRIPTION],
 				[V2C_SCHEMA_VERSION, V2C_SCHEMA_DESCRIPTION],
+				[PASSKEY_SCHEMA_VERSION, PASSKEY_SCHEMA_DESCRIPTION],
 				[CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION]
 		]) {
 				await client.query(
@@ -80,7 +83,7 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 // Read-only for health reporting (Task 4); never mutates schema_migrations.
 export async function getSchemaVersionInfo(client: PostgresClient = getPostgresPool()): Promise<SchemaVersionInfo> {
 		const result = await client.query<{ version: string }>(
-				`SELECT version FROM schema_migrations ORDER BY applied_at DESC LIMIT 1`
+				`SELECT version FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1`
 		);
 
 		const latestVersion = result.rows[0]?.version ?? null;

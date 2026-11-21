@@ -158,20 +158,32 @@ export function passkeyOfferPage(input: { tenantName?: string; clientId?: string
 (() => {
 	const button = document.getElementById("passkey-add");
 	const status = document.getElementById("passkey-status");
+	const name = document.getElementById("passkey-name");
 	const csrf = document.querySelector('#passkey-skip input[name="csrf"]').value;
 	button.addEventListener("click", async () => {
+		if (!name.reportValidity()) return;
+		const displayName = name.value.trim();
+		if (!displayName || /[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]/u.test(displayName)) {
+			status.textContent = "Enter a recognizable passkey name without control characters.";
+			return;
+		}
 		button.disabled = true;
 		status.textContent = "Creating your passkey...";
 		try {
 			const headers = { "Content-Type": "application/json" };
 			const optionsResponse = await fetch("/login/passkey/options", {
-				method: "POST", headers, body: JSON.stringify({ csrf })
+				method: "POST", headers, body: JSON.stringify({ csrf, displayName })
 			});
+			if (optionsResponse.status === 409) {
+				status.textContent = "That passkey name is already in use. Choose a different name.";
+				button.disabled = false;
+				return;
+			}
 			if (!optionsResponse.ok) throw new Error("options failed");
 			const optionsJSON = await optionsResponse.json();
 			const credential = await SimpleWebAuthnBrowser.startRegistration({ optionsJSON });
 			const verification = await fetch("/login/passkey/verify", {
-				method: "POST", headers, body: JSON.stringify({ csrf, credential })
+				method: "POST", headers, body: JSON.stringify({ csrf, credential, displayName })
 			});
 			if (!verification.ok) throw new Error("verification failed");
 			const result = await verification.json();
@@ -183,6 +195,8 @@ export function passkeyOfferPage(input: { tenantName?: string; clientId?: string
 })();`;
 	return renderHapiPage({ title: heading(input.tenantName), heading: "Add a passkey", body: `
 <p>Add a passkey for future sign-in.</p>
+<label for="passkey-name">Passkey name</label>
+<input id="passkey-name" type="text" maxlength="80" required placeholder="For example, personal phone">
 <button id="passkey-add" type="button">Add Passkey</button>
 <p id="passkey-status" role="status" aria-live="polite"></p>
 ${input.managementAvailable ? '<p><a href="/login/passkey/manage">Manage passkeys</a></p>' :
@@ -192,12 +206,37 @@ ${input.managementAvailable ? '<p><a href="/login/passkey/manage">Manage passkey
 }
 
 export function passkeyManagePage(input: { tenantName?: string; clientId?: string; csrf: string;
-	credentials: { id: string; createdAt: Date }[] }): RenderedLoginPage {
-	const items = input.credentials.map((credential, index) => `<li>Passkey ${index + 1} - added ${escapeHtml(credential.createdAt.toISOString().slice(0, 10))}
-<form method="post" action="/login/passkey/revoke">${csrfField(input.csrf)}
-<input type="hidden" name="credential_id" value="${escapeHtml(credential.id)}">
-<button type="submit" class="secondary">Revoke passkey ${index + 1}</button></form></li>`).join("");
+	nonce: string; credentials: { ref: string; displayName: string | null; createdAt: Date; usedToAuthenticate: boolean; canRename: boolean }[] }): RenderedLoginPage {
+	const items = input.credentials.map((credential, index) => {
+		const name = credential.displayName ?? `Passkey ${index + 1}`;
+		const fields = `${csrfField(input.csrf)}<input type="hidden" name="nonce" value="${escapeHtml(input.nonce)}">
+<input type="hidden" name="ref" value="${escapeHtml(credential.ref)}">`;
+		return `<li><p><strong>${escapeHtml(name)}</strong>${credential.displayName ? "" : " (unnamed)"} - added ${escapeHtml(credential.createdAt.toISOString().slice(0, 10))}${credential.usedToAuthenticate ? " (used to verify this session)" : ""}</p>
+${credential.canRename ? `<form method="post" action="/login/passkey/rename">${fields}
+<label for="passkey-name-${index}">Name for ${escapeHtml(name)}</label>
+<input id="passkey-name-${index}" type="text" name="displayName" maxlength="80" required value="${escapeHtml(credential.displayName ?? "")}">
+<button type="submit" class="secondary">Save name</button></form>` :
+	"<p>To identify this unnamed passkey, start again with Manage passkeys and use this passkey to verify.</p>"}
+${credential.displayName ? `<form method="post" action="/login/passkey/confirm">${fields}
+<button type="submit" class="secondary">Revoke ${escapeHtml(name)}</button></form>` :
+	"<p>Name this passkey before revoking it.</p>"}</li>`;
+	}).join("");
 	return render(heading(input.tenantName), "Manage passkeys",
 		`${items ? `<ul>${items}</ul>` : "<p>No passkeys registered.</p>"}<p><a href="/login/passkey">Back</a></p>`,
 		undefined, brandForClient(input.clientId));
+}
+
+export function passkeyRevokeConfirmationPage(input: { tenantName?: string; clientId?: string; csrf: string;
+	nonce: string; name: string }): RenderedLoginPage {
+	return render(heading(input.tenantName), "Confirm passkey revocation",
+		`<p>Revoke <strong>${escapeHtml(input.name)}</strong>? This passkey will no longer work for sign-in.</p>
+<form method="post" action="/login/passkey/revoke">${csrfField(input.csrf)}
+<input type="hidden" name="nonce" value="${escapeHtml(input.nonce)}">
+<button type="submit">Confirm revocation</button></form><p><a href="/login/passkey/manage">Cancel</a></p>`,
+		undefined, brandForClient(input.clientId));
+}
+
+export function passkeyNameInUsePage(): RenderedLoginPage {
+	return render("Passkey name in use", "Passkey name in use",
+		'<p>Choose a different name for this passkey.</p><p><a href="/login/passkey/manage">Return to passkeys</a></p>');
 }

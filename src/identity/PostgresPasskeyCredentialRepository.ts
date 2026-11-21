@@ -36,8 +36,15 @@ export class PostgresPasskeyCredentialRepository {
 				return result.rows.map(row => ({ id: row.credential_id, transports: row.transports }));
 		}
 
+		async nameInUse(subjectId: string, displayName: string): Promise<boolean> {
+				const result = await this.reader.query(
+						`SELECT 1 FROM passkey_credentials WHERE identity_subject_id = $1 AND revoked_at IS NULL
+						 AND lower(display_name) = lower($2)`, [subjectId, displayName]);
+				return result.rows.length > 0;
+		}
+
 		async list(subjectId: string, oidcSubject: string, expiresAt: number, authorizingCredentialId?: string):
-				Promise<{ id: string; createdAt: Date; lastUsedAt: Date | null }[]> {
+				Promise<{ id: string; displayName: string | null; createdAt: Date; lastUsedAt: Date | null }[]> {
 				return withPostgresTransaction(async client => {
 						const subject = await client.query(
 								`SELECT id FROM identity_subjects WHERE id = $1 AND oidc_subject = $2 AND status = 'ACTIVE'
@@ -53,15 +60,39 @@ export class PostgresPasskeyCredentialRepository {
 						const live = await client.query<{ live: boolean }>(
 								`SELECT clock_timestamp() < to_timestamp($1::double precision / 1000) AS live`, [expiresAt]);
 						if (!live.rows[0].live) throw new PasskeyAuthenticationRejected();
-						const result = await client.query<{ credential_id: string; created_at: Date; last_used_at: Date | null }>(
-								`SELECT credential_id, created_at, last_used_at FROM passkey_credentials
+						const result = await client.query<{ credential_id: string; display_name: string | null; created_at: Date; last_used_at: Date | null }>(
+								`SELECT credential_id, display_name, created_at, last_used_at FROM passkey_credentials
 								 WHERE identity_subject_id = $1 AND revoked_at IS NULL ORDER BY created_at, credential_id`, [subjectId]);
-						return result.rows.map(row => ({ id: row.credential_id, createdAt: row.created_at, lastUsedAt: row.last_used_at }));
+						return result.rows.map(row => ({ id: row.credential_id, displayName: row.display_name, createdAt: row.created_at, lastUsedAt: row.last_used_at }));
+				}, this.pool);
+		}
+
+		async rename(subjectId: string, oidcSubject: string, credentialId: string, displayName: string,
+				expiresAt: number, authorizingCredentialId?: string): Promise<boolean> {
+				return withPostgresTransaction(async client => {
+						const subject = await client.query(
+								`SELECT id FROM identity_subjects WHERE id = $1 AND oidc_subject = $2 AND status = 'ACTIVE' FOR UPDATE`,
+								[subjectId, oidcSubject]);
+						if (!subject.rows[0]) return false;
+						if (authorizingCredentialId) {
+								const active = await client.query(
+										`SELECT 1 FROM passkey_credentials WHERE credential_id = $1 AND identity_subject_id = $2 AND revoked_at IS NULL`,
+										[authorizingCredentialId, subjectId]);
+								if (!active.rows[0]) throw new PasskeyAuthenticationRejected();
+						}
+						const result = await client.query(
+								`UPDATE passkey_credentials SET display_name = $3
+								 WHERE identity_subject_id = $1 AND credential_id = $2 AND revoked_at IS NULL
+								 AND clock_timestamp() < to_timestamp($4::double precision / 1000)
+								 AND (display_name IS NOT NULL OR credential_id = $5 OR
+								      (SELECT count(*) FROM passkey_credentials WHERE identity_subject_id = $1 AND revoked_at IS NULL) = 1)
+								 RETURNING credential_id`, [subjectId, credentialId, displayName, expiresAt, authorizingCredentialId ?? null]);
+						return result.rows.length === 1;
 				}, this.pool);
 		}
 
 		async revoke(subjectId: string, oidcSubject: string, credentialId: string, expiresAt: number,
-				authorizingCredentialId?: string): Promise<boolean> {
+				authorizingCredentialId?: string, expectedName?: string): Promise<boolean> {
 				return withPostgresTransaction(async client => {
 						const subject = await client.query<{ id: string }>(
 								`SELECT id FROM identity_subjects WHERE id = $1 AND oidc_subject = $2 AND status = 'ACTIVE' FOR UPDATE`,
@@ -77,7 +108,8 @@ export class PostgresPasskeyCredentialRepository {
 								`UPDATE passkey_credentials SET revoked_at = clock_timestamp()
 								 WHERE identity_subject_id = $1 AND credential_id = $2 AND revoked_at IS NULL
 								 AND clock_timestamp() < to_timestamp($3::double precision / 1000)
-								 RETURNING credential_id`, [subjectId, credentialId, expiresAt]);
+								 AND ($4::text IS NULL OR display_name = $4)
+								 RETURNING credential_id`, [subjectId, credentialId, expiresAt, expectedName ?? null]);
 						return result.rows.length === 1;
 				}, this.pool);
 		}
@@ -121,7 +153,7 @@ export class PostgresPasskeyCredentialRepository {
 		async insert(input: {
 				subjectId: string; oidcSubject: string; userHandle: Buffer; authorityRef: string;
 				expiresAt: number; additionalEnrollmentExpiresAt?: number; authorizingCredentialId?: string; credential: WebAuthnCredential;
-				backupEligible: boolean; backupState: boolean;
+				backupEligible: boolean; backupState: boolean; displayName?: string;
 		}): Promise<void> {
 				await withPostgresTransaction(async client => {
 						const subject = await client.query<{ id: string }>(
@@ -142,13 +174,13 @@ export class PostgresPasskeyCredentialRepository {
 						const inserted = await client.query<{ credential_id: string }>(
 								`INSERT INTO passkey_credentials
 										(credential_id, identity_subject_id, user_handle, public_key, signature_counter,
-										 transports, backup_eligible, backup_state, enrollment_authority_ref)
-								 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+										 transports, backup_eligible, backup_state, enrollment_authority_ref, display_name)
+								 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $11
 								 WHERE clock_timestamp() < to_timestamp($10::double precision / 1000)
 								 RETURNING credential_id`,
 								[input.credential.id, input.subjectId, input.userHandle, Buffer.from(input.credential.publicKey),
 										input.credential.counter, input.credential.transports ?? [], input.backupEligible,
-										input.backupState, input.authorityRef, input.expiresAt]
+										input.backupState, input.authorityRef, input.expiresAt, input.displayName ?? null]
 						);
 						if (!inserted.rows[0]) throw new Error("Passkey enrollment authority expired");
 				}, this.pool);

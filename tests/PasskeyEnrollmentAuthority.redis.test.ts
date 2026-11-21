@@ -37,6 +37,26 @@ describe.skipIf(!port)("passkey enrollment authority (isolated Redis)", () => {
 		expect(await store.claimPasskeyAuthentication(handle, (await store.find(handle))!)).toBeNull();
 	});
 
+	it("invalidates old management forms and claims a confirmation only once", async () => {
+		const { handle, interaction } = await store.create(base());
+		const user = principal();
+		const proof = (await store.offerPasskeyEnrollment(handle, interaction, user))!.browserProof;
+		const old = (await store.issuePasskeyManagement(handle, proof, interaction.csrf, user.id, "list"))!;
+		const current = (await store.issuePasskeyManagement(handle, proof, interaction.csrf, user.id, "list"))!;
+		expect(await store.claimPasskeyManagement(handle, proof, interaction.csrf, user.id, old, "list")).toBeNull();
+		expect(await store.claimPasskeyManagement(handle, randomBytes(32).toString("base64url"),
+			interaction.csrf, user.id, current, "list")).toBeNull();
+		const claims = await Promise.all(Array.from({ length: 10 }, () =>
+			store.claimPasskeyManagement(handle, proof, interaction.csrf, user.id, current, "list")));
+		expect(claims.filter(Boolean)).toHaveLength(1);
+		const confirmation = (await store.issuePasskeyManagement(handle, proof, interaction.csrf, user.id, "confirm",
+			{ credentialId: "test-credential", name: "Test device" }))!;
+		expect(await store.claimPasskeyManagement(handle, proof, interaction.csrf, user.id, confirmation, "list")).toBeNull();
+		const results = await Promise.all(Array.from({ length: 10 }, () =>
+			store.claimPasskeyManagement(handle, proof, interaction.csrf, user.id, confirmation, "confirm")));
+		expect(results.filter(Boolean)).toEqual([{ credentialId: "test-credential", name: "Test device" }]);
+	});
+
 	it("rejects authentication challenges after their short-lived authority expires", async () => {
 		let now = Date.now();
 		const timedStore = new AuthorizationInteractionStore(redis, 600_000, () => now);

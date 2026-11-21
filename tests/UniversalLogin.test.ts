@@ -84,6 +84,14 @@ function form(payload: Record<string, string>): { headers: Record<string, string
 	return { headers: { "content-type": "application/x-www-form-urlencoded" }, payload: new URLSearchParams(payload).toString() };
 }
 
+function passkeyAction(html: string, action: string, index = 0): Record<string, string> {
+	const document = new JSDOM(html).window.document;
+	const selected = document.querySelectorAll(`form[action="${action}"]`)[index];
+	if (!selected) throw new Error(`Missing passkey form: ${action}`);
+	return Object.fromEntries(Array.from(selected.querySelectorAll<HTMLInputElement>("input[name]"),
+		input => [input.name, input.value]));
+}
+
 function authorizeQuery(verifier: string, overrides: Record<string, string> = {}): string {
 	return new URLSearchParams({
 		response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT,
@@ -1186,9 +1194,9 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		const cookie = `${interaction.cookie.cookie}; ${proofCookie.split(";")[0]}`;
 		const headers = { cookie, origin: stagingOrigin };
 		const options = () => f.app.inject({ method: "POST", url: "/login/passkey/options",
-			headers, payload: { csrf: interaction.csrf } });
+			headers, payload: { csrf: interaction.csrf, displayName: "Primary device" } });
 		const verify = (credential: RegistrationResponseJSON) => f.app.inject({ method: "POST", url: "/login/passkey/verify",
-			headers, payload: { csrf: interaction.csrf, credential } });
+			headers, payload: { csrf: interaction.csrf, credential, displayName: "Primary device" } });
 		const close = async () => { await f.app.close(); await redis.quit(); };
 		return { f, redis, store, credentials, interaction, headers, options, verify, close };
 	}
@@ -1243,6 +1251,35 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			headers, payload: { csrf: interaction.csrf, credential } });
 		return { interaction, headers, options, verify };
 	}
+
+	it("upgrades existing passkey records without changing them and is idempotent", async () => {
+		const legacySchema = `legacy_passkey_${randomUUID().replaceAll("-", "")}`;
+		await admin.query(`CREATE SCHEMA ${legacySchema}`);
+		const legacy = new pg.Pool({ connectionString: passkeyDatabaseUrl, options: `-c search_path=${legacySchema}` });
+		try {
+			await legacy.query(readFileSync(new URL("../src/identity/schema.sql", import.meta.url), "utf8"));
+			const ddl = readFileSync(new URL("../src/identity/schema-passkeys.sql", import.meta.url), "utf8");
+			await legacy.query(ddl.split("ALTER TABLE passkey_credentials ADD COLUMN IF NOT EXISTS display_name TEXT;")[0]);
+			const id = randomUUID();
+			await legacy.query(`INSERT INTO identity_subjects
+				(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
+				VALUES ($1, $2, 'HAPI_EMAIL', $3, 'ACTIVE', now(), now())`, [id, randomUUID(), randomUUID()]);
+			const handle = randomBytes(32);
+			await legacy.query("INSERT INTO passkey_user_handles VALUES ($1, $2)", [id, handle]);
+			await legacy.query(`INSERT INTO passkey_credentials
+				(credential_id, identity_subject_id, user_handle, public_key, signature_counter, backup_eligible, backup_state, enrollment_authority_ref)
+				VALUES ('legacy-credential', $1, $2, $3, 5, false, false, 'legacy-authority')`, [id, handle, Buffer.from([1, 2, 3])]);
+			await legacy.query(ddl);
+			await legacy.query(ddl);
+			const result = await legacy.query(`SELECT identity_subject_id, public_key, signature_counter, revoked_at, display_name
+				FROM passkey_credentials WHERE credential_id = 'legacy-credential'`);
+			expect(result.rows).toEqual([{ identity_subject_id: id, public_key: Buffer.from([1, 2, 3]),
+				signature_counter: "5", revoked_at: null, display_name: null }]);
+		} finally {
+			await legacy.end();
+			await admin.query(`DROP SCHEMA ${legacySchema} CASCADE`);
+		}
+	});
 
 	it("enrolls and signs in twice with a passkey, PKCE, a signed ID token and matching UserInfo", async () => {
 		const t = await setup();
@@ -1432,16 +1469,30 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
 			const management = await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers });
 			expect(management.statusCode, management.body).toBe(200);
-			expect(management.body).toContain(credential.id);
+			expect(management.body).not.toContain(credential.id);
 			expect(management.body).not.toContain(foreign);
-			const revoke = (id: string, csrf = login.interaction.csrf, origin = stagingOrigin) =>
-				t.f.app.inject({ method: "POST", url: "/login/passkey/revoke", headers: { ...headers, origin },
-					payload: { csrf, credential_id: id } });
-			expect((await revoke(foreign, "wrong")).statusCode).toBe(400);
-			expect((await revoke(foreign, login.interaction.csrf, "https://evil.example")).statusCode).toBe(403);
-			expect((await revoke(foreign)).statusCode).toBe(404);
+			const action = passkeyAction(management.body, "/login/passkey/confirm");
+			const confirm = (fields: Record<string, string>, origin = stagingOrigin) =>
+				t.f.app.inject({ method: "POST", url: "/login/passkey/confirm", headers: { ...headers, origin }, payload: fields });
+			expect((await confirm({ ...action, csrf: "wrong" })).statusCode).toBe(400);
+			expect((await confirm(action, "https://evil.example")).statusCode).toBe(403);
+			expect((await confirm({ ...action, ref: randomBytes(32).toString("base64url") })).statusCode).toBe(404);
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/rename", headers,
+				payload: { ...passkeyAction(management.body, "/login/passkey/rename"),
+					ref: randomBytes(32).toString("base64url"), displayName: "Foreign" } })).statusCode).toBe(404);
+			expect(await t.credentials.rename(t.f.subject.id, t.f.subject.oidcSubject, foreign, "Foreign",
+				Date.now() + 60_000, credential.id)).toBe(false);
+			expect(await t.credentials.revoke(t.f.subject.id, t.f.subject.oidcSubject, foreign,
+				Date.now() + 60_000, credential.id)).toBe(false);
 			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [foreign])).rows[0].revoked_at).toBeNull();
-			expect((await revoke(credential.id)).statusCode).toBe(200);
+			const confirmation = await confirm(action);
+			expect(confirmation.statusCode).toBe(200);
+			expect(confirmation.body).toContain("Primary device");
+			expect((await confirm(action)).statusCode).toBe(400);
+			const revokeAction = passkeyAction(confirmation.body, "/login/passkey/revoke");
+			const revoke = () => t.f.app.inject({ method: "POST", url: "/login/passkey/revoke", headers, payload: revokeAction });
+			expect((await revoke()).statusCode).toBe(200);
+			expect((await revoke()).statusCode).not.toBe(200);
 			expect((await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers })).statusCode).toBe(403);
 			const retry = await beginPasskeyLogin(t);
 			const retryAssertion = await createAssertion(a.page, (await retry.options()).json());
@@ -1496,7 +1547,9 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			await a.page.goto(`${stagingOrigin}/login`);
 			await a.page.getByRole("button", { name: "Manage passkeys" }).click();
 			await a.page.waitForURL(`${stagingOrigin}/login/passkey/manage`, { timeout: 10_000 });
-			await a.page.getByRole("button", { name: "Revoke passkey 1" }).click();
+			await a.page.getByRole("button", { name: "Revoke Primary device" }).click();
+			await a.page.getByText("Revoke Primary device? This passkey will no longer work for sign-in.").waitFor();
+			await a.page.getByRole("button", { name: "Confirm revocation" }).click();
 			await a.page.getByText("Your passkey was revoked. Start sign-in again using another method.").waitFor();
 			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0].revoked_at).not.toBeNull();
 		} finally { await a.close(); await t.close(); }
@@ -1536,16 +1589,135 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
 			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
 			const options = await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
-				headers, payload: { csrf: login.interaction.csrf } });
+				headers, payload: { csrf: login.interaction.csrf, displayName: "Second device" } });
 			expect(options.statusCode, options.body).toBe(200);
 			const additional = await createCredential(second.page, options.json());
 			const result = await t.f.app.inject({ method: "POST", url: "/login/passkey/verify",
-				headers, payload: { csrf: login.interaction.csrf, credential: additional } });
+				headers, payload: { csrf: login.interaction.csrf, credential: additional, displayName: "Second device" } });
 			expect(result.statusCode, result.body).toBe(200);
 			const rows = await pool.query("SELECT credential_id, identity_subject_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
 			expect(rows.rows).toHaveLength(2);
 			expect(rows.rows.map(row => row.credential_id)).toEqual(expect.arrayContaining([initial.id, additional.id]));
 			expect(rows.rows.every(row => row.identity_subject_id === t.f.subject.id)).toBe(true);
+		} finally { await second.close(); await first.close(); await t.close(); }
+	}, 30_000);
+
+	it("names, renames and confirms revocation of exactly one of two same-day credentials", async () => {
+		const t = await setup();
+		const first = await authenticator();
+		const second = await authenticator();
+		try {
+			const primary = await enroll(t, first.page);
+			const addLogin = await beginPasskeyLogin(t);
+			const addAssertion = await createAssertion(first.page, (await addLogin.options("manage")).json());
+			const addVerified = await addLogin.verify(addAssertion);
+			const addProof = setCookies(addVerified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const addHeaders = { ...addLogin.headers, cookie: `${addLogin.headers.cookie}; ${addProof}` };
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+				headers: addHeaders, payload: { csrf: addLogin.interaction.csrf, displayName: "primary device" } })).statusCode).toBe(409);
+			const options = await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+				headers: addHeaders, payload: { csrf: addLogin.interaction.csrf, displayName: "Disposable device" } });
+			const disposable = await createCredential(second.page, options.json());
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/verify", headers: addHeaders,
+				payload: { csrf: addLogin.interaction.csrf, credential: disposable, displayName: "Disposable device" } })).statusCode).toBe(200);
+
+			const login = await beginPasskeyLogin(t);
+			const assertion = await createAssertion(first.page, (await login.options("manage")).json());
+			const verified = await login.verify(assertion);
+			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
+			const get = () => t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers });
+			const post = (url: string, payload: Record<string, string>) => t.f.app.inject({ method: "POST", url, headers, payload });
+			const initial = await get();
+			expect(initial.body).toContain("Primary device");
+			expect(initial.body).toContain("Disposable device");
+			expect(initial.body).not.toContain(primary.id);
+			expect(initial.body).not.toContain(disposable.id);
+			const dates = (await pool.query<{ created_at: Date }>(
+				"SELECT created_at FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id])).rows;
+			expect(dates).toHaveLength(2);
+			expect(dates[0].created_at.toISOString().slice(0, 10)).toBe(dates[1].created_at.toISOString().slice(0, 10));
+
+			const rename = { ...passkeyAction(initial.body, "/login/passkey/rename", 1), displayName: "Spare <key>" };
+			expect((await post("/login/passkey/rename", rename)).statusCode).toBe(303);
+			expect((await post("/login/passkey/rename", rename)).statusCode).toBe(400);
+			const rows = await pool.query<{ credential_id: string; display_name: string }>(
+				"SELECT credential_id, display_name FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows.find(row => row.credential_id === primary.id)?.display_name).toBe("Primary device");
+			expect(rows.rows.find(row => row.credential_id === disposable.id)?.display_name).toBe("Spare <key>");
+
+			const current = await get();
+			expect(current.body).toContain("Spare &lt;key&gt;");
+			const duplicate = { ...passkeyAction(current.body, "/login/passkey/rename", 1), displayName: "primary device" };
+			expect((await post("/login/passkey/rename", duplicate)).statusCode).toBe(409);
+			const refreshed = await get();
+			const confirmAction = passkeyAction(refreshed.body, "/login/passkey/confirm", 1);
+			const confirmation = await post("/login/passkey/confirm", confirmAction);
+			expect(confirmation.statusCode).toBe(200);
+			expect(confirmation.body).toContain("Spare &lt;key&gt;");
+			expect(confirmation.body).not.toContain(disposable.id);
+			const staleRevoke = passkeyAction(confirmation.body, "/login/passkey/revoke");
+			expect(await t.credentials.rename(t.f.subject.id, t.f.subject.oidcSubject, disposable.id, "Renamed spare",
+				Date.now() + 60_000, primary.id)).toBe(true);
+			expect((await post("/login/passkey/revoke", staleRevoke)).statusCode).toBe(404);
+			const relisted = await get();
+			const newConfirmation = await post("/login/passkey/confirm", passkeyAction(relisted.body, "/login/passkey/confirm", 1));
+			expect(newConfirmation.body).toContain("Renamed spare");
+			const revokeAction = passkeyAction(newConfirmation.body, "/login/passkey/revoke");
+			const pending = await beginPasskeyLogin(t);
+			const priorAssertion = await createAssertion(second.page, (await pending.options()).json());
+			expect((await post("/login/passkey/revoke", { ...revokeAction, credential_id: primary.id })).statusCode).toBe(303);
+			expect((await post("/login/passkey/revoke", revokeAction)).statusCode).toBe(400);
+			expect((await pending.verify(priorAssertion)).statusCode).toBe(401);
+			expect((await pending.verify(priorAssertion)).statusCode).not.toBe(200);
+
+			const rejected = await beginPasskeyLogin(t);
+			const rejectedAssertion = await createAssertion(second.page, (await rejected.options()).json());
+			expect((await rejected.verify(rejectedAssertion)).statusCode).toBe(401);
+			const surviving = await beginPasskeyLogin(t);
+			const survivingAssertion = await createAssertion(first.page, (await surviving.options()).json());
+			expect((await surviving.verify(survivingAssertion)).statusCode).toBe(200);
+			const finalRows = await pool.query<{ credential_id: string; revoked_at: Date | null }>(
+				"SELECT credential_id, revoked_at FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(finalRows.rows.find(row => row.credential_id === primary.id)?.revoked_at).toBeNull();
+			expect(finalRows.rows.find(row => row.credential_id === disposable.id)?.revoked_at).not.toBeNull();
+		} finally { await second.close(); await first.close(); await t.close(); }
+	}, 30_000);
+
+	it("requires the matching authenticator to identify an unnamed legacy credential", async () => {
+		const t = await setup();
+		const first = await authenticator();
+		const second = await authenticator();
+		try {
+			const primary = await enroll(t, first.page);
+			const add = await beginPasskeyLogin(t);
+			const addResult = await add.verify(await createAssertion(first.page, (await add.options("manage")).json()));
+			const proof = setCookies(addResult).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const headers = { ...add.headers, cookie: `${add.headers.cookie}; ${proof}` };
+			const options = await t.f.app.inject({ method: "POST", url: "/login/passkey/options", headers,
+				payload: { csrf: add.interaction.csrf, displayName: "Legacy spare" } });
+			const spare = await createCredential(second.page, options.json());
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/verify", headers,
+				payload: { csrf: add.interaction.csrf, credential: spare, displayName: "Legacy spare" } })).statusCode).toBe(200);
+			await pool.query("UPDATE passkey_credentials SET display_name = NULL WHERE identity_subject_id = $1", [t.f.subject.id]);
+
+			const login = await beginPasskeyLogin(t);
+			const verified = await login.verify(await createAssertion(second.page, (await login.options("manage")).json()));
+			const managementProof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const managementHeaders = { ...login.headers, cookie: `${login.headers.cookie}; ${managementProof}` };
+			const page = await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers: managementHeaders });
+			expect(page.body).toContain("used to verify this session");
+			expect(page.body).toContain("Name this passkey before revoking it.");
+			expect(new JSDOM(page.body).window.document.querySelectorAll('form[action="/login/passkey/rename"]')).toHaveLength(1);
+			expect(new JSDOM(page.body).window.document.querySelectorAll('form[action="/login/passkey/confirm"]')).toHaveLength(0);
+			expect(await t.credentials.rename(t.f.subject.id, t.f.subject.oidcSubject, primary.id, "Wrong",
+				Date.now() + 60_000, spare.id)).toBe(false);
+			const rename = { ...passkeyAction(page.body, "/login/passkey/rename"), displayName: "Identified spare" };
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/rename", headers: managementHeaders, payload: rename })).statusCode).toBe(303);
+			const result = await pool.query<{ credential_id: string; display_name: string | null }>(
+				"SELECT credential_id, display_name FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(result.rows.find(row => row.credential_id === primary.id)?.display_name).toBeNull();
+			expect(result.rows.find(row => row.credential_id === spare.id)?.display_name).toBe("Identified spare");
 		} finally { await second.close(); await first.close(); await t.close(); }
 	}, 30_000);
 
@@ -1592,9 +1764,12 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			const verified = await login.verify(assertion);
 			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
 			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
-			const revoke = () => t.f.app.inject({ method: "POST", url: "/login/passkey/revoke",
-				headers, payload: { csrf: login.interaction.csrf, credential_id: credential.id } });
-			vi.spyOn(t.store, "transitionPasskeyEnrollment").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+			const management = await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers });
+			const confirm = await t.f.app.inject({ method: "POST", url: "/login/passkey/confirm", headers,
+				payload: passkeyAction(management.body, "/login/passkey/confirm") });
+			const revokeAction = passkeyAction(confirm.body, "/login/passkey/revoke");
+			const revoke = () => t.f.app.inject({ method: "POST", url: "/login/passkey/revoke", headers, payload: revokeAction });
+			vi.spyOn(t.store, "claimPasskeyManagement").mockRejectedValueOnce(new Error("synthetic Redis failure"));
 			expect((await revoke()).statusCode).toBe(503);
 			await pool.query(`CREATE FUNCTION reject_test_revoke() RETURNS trigger LANGUAGE plpgsql AS $$
 				BEGIN RAISE EXCEPTION 'synthetic revocation failure'; END $$`);
@@ -1658,6 +1833,23 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		} finally { await a.close(); await t.close(); }
 	}, 30_000);
 
+	it("validates the name before enrollment and binds it to the registration", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			for (const displayName of ["  ", "bad\u202ename"]) {
+				const response = await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+					headers: t.headers, payload: { csrf: t.interaction.csrf, displayName } });
+				expect(response.statusCode).toBe(400);
+			}
+			const credential = await createCredential(a.page, (await t.options()).json());
+			const response = await t.f.app.inject({ method: "POST", url: "/login/passkey/verify",
+				headers: t.headers, payload: { csrf: t.interaction.csrf, credential, displayName: "Different device" } });
+			expect(response.statusCode).toBe(400);
+			expect((await pool.query("SELECT 1 FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id])).rows).toHaveLength(0);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
 	it("runs the actual Add Passkey page and native browser ceremony", async () => {
 		const t = await setup();
 		const context = await browser.newContext();
@@ -1689,6 +1881,7 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 				isUserVerified: true, automaticPresenceSimulation: true
 			} });
 			await page.goto(`${stagingOrigin}/login/passkey`);
+			await page.getByLabel("Passkey name").fill("Primary device");
 			await page.getByRole("button", { name: "Add Passkey" }).click();
 			await page.waitForURL("https://rp.example/**", { timeout: 10_000 });
 			expect(new URL(page.url()).searchParams.has("code")).toBe(true);

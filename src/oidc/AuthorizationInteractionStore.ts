@@ -64,7 +64,8 @@ type EnrollmentAuthority = {
 	csrfHash: string;
 	expiresAt: number;
 	state: "OFFERED" | "ENROLLING" | "VERIFYING" | "MANAGING" | "SKIPPED" | "ENROLLED" | "FAILED";
-	registration?: { challenge: string; userHandle: string };
+	registration?: { challenge: string; userHandle: string; displayName: string };
+	management?: { nonce: string; purpose: "list" | "confirm"; credentialId?: string; name?: string };
 };
 
 const SAVE_SCRIPT = `
@@ -259,19 +260,47 @@ export class AuthorizationInteractionStore {
 		if (!allowed) return false;
 		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId, to === "FAILED");
 		if (!loaded || loaded.authority.state !== from) return false;
-		const updated = JSON.stringify({ ...loaded.authority, state: to });
+		const updated = JSON.stringify({ ...loaded.authority, state: to,
+			...(from === "MANAGING" && to === "OFFERED" ? { management: undefined } : {}) });
 		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
 			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
 			Math.floor(loaded.interaction.expiresAt - this.clock()), to === "FAILED" ? "0" : "1");
 		return result === 1;
 	}
 
+	async issuePasskeyManagement(handle: string, browserProof: string, csrf: string, subjectId: string,
+		purpose: "list" | "confirm", target?: { credentialId: string; name: string }): Promise<string | null> {
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
+		const from = purpose === "list" ? "OFFERED" : "MANAGING";
+		if (!loaded || loaded.authority.state !== from || (purpose === "confirm" && !target)) return null;
+		const nonce = randomBytes(32).toString("base64url");
+		const updated = JSON.stringify({ ...loaded.authority, state: "OFFERED",
+			management: { nonce, purpose, ...target } });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), "1");
+		return result === 1 ? nonce : null;
+	}
+
+	async claimPasskeyManagement(handle: string, browserProof: string, csrf: string, subjectId: string,
+		nonce: string, purpose: "list" | "confirm"):
+		Promise<{ credentialId?: string; name?: string } | null> {
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
+		const action = loaded?.authority.management;
+		if (!loaded || loaded.authority.state !== "OFFERED" || !action || action.nonce !== nonce || action.purpose !== purpose) return null;
+		const updated = JSON.stringify({ ...loaded.authority, state: "MANAGING", management: undefined });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), "1");
+		return result === 1 ? { credentialId: action.credentialId, name: action.name } : null;
+	}
+
 	async beginPasskeyRegistration(handle: string, browserProof: string, csrf: string,
-		subjectId: string, challenge: string, userHandle: string): Promise<boolean> {
+		subjectId: string, challenge: string, userHandle: string, displayName: string): Promise<boolean> {
 		if (!HANDLE_PATTERN.test(challenge) || !HANDLE_PATTERN.test(userHandle)) return false;
 		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
 		if (!loaded || loaded.authority.state !== "OFFERED") return false;
-		const updated = JSON.stringify({ ...loaded.authority, state: "ENROLLING", registration: { challenge, userHandle } });
+		const updated = JSON.stringify({ ...loaded.authority, state: "ENROLLING", registration: { challenge, userHandle, displayName } });
 		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
 			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
 			Math.floor(loaded.interaction.expiresAt - this.clock()), "1");
@@ -279,7 +308,7 @@ export class AuthorizationInteractionStore {
 	}
 
 	async claimPasskeyRegistration(handle: string, browserProof: string, csrf: string, subjectId: string):
-		Promise<{ principal: AuthenticatedUser; challenge: string; userHandle: string; expiresAt: number; authorityRef: string } | null> {
+		Promise<{ principal: AuthenticatedUser; challenge: string; userHandle: string; displayName: string; expiresAt: number; authorityRef: string } | null> {
 		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
 		if (!loaded || loaded.authority.state !== "ENROLLING" || !loaded.authority.registration) return null;
 		const updated = JSON.stringify({ ...loaded.authority, state: "VERIFYING" });

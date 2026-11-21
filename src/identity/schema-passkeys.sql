@@ -25,3 +25,8 @@ CREATE TABLE IF NOT EXISTS passkey_credentials (
 
 CREATE INDEX IF NOT EXISTS passkey_credentials_subject_idx
 		ON passkey_credentials (identity_subject_id);
+
+ALTER TABLE passkey_credentials ADD COLUMN IF NOT EXISTS display_name TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS passkey_credentials_active_name_idx
+		ON passkey_credentials (identity_subject_id, lower(display_name))
+		WHERE revoked_at IS NULL AND display_name IS NOT NULL;

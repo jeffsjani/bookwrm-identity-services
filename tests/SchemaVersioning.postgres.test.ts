@@ -88,4 +88,10 @@ describe.skipIf(!databaseUrl)("Schema versioning (integration)", () => {
 				expect(health.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
 				expect(health.migrationStatus).toBe("current");
 		});
+
+		it("reports the newest schema when migration timestamps are identical", async () => {
+				const pool = getPostgresPool();
+				await pool.query("UPDATE schema_migrations SET applied_at = '2026-01-01' WHERE version IN ('1.0.0', '1.1.0', '1.2.0', '1.3.0', '1.4.0')");
+				expect((await getSchemaVersionInfo()).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+		});
 });
