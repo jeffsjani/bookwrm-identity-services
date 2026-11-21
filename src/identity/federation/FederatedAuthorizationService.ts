@@ -20,13 +20,24 @@ export type FederatedAuthorizationErrorCode =
 		// The exchanged id_token failed signature/issuer/audience/nonce/expiry verification.
 		| "verification_failed";
 
+const APPLE_OAUTH_ERRORS = [
+		"invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+		"unsupported_grant_type", "invalid_scope"
+] as const;
+
+export type AppleExchangeDiagnostic =
+		| { category: "signing" }
+		| { category: "network" | "malformed_response" }
+		| { category: "provider_rejection"; status: number; oauthError?: typeof APPLE_OAUTH_ERRORS[number] };
+
 export class FederatedAuthorizationError extends Error {
 		constructor(
 				readonly code: FederatedAuthorizationErrorCode,
 				message: string,
 				// Present when the failing transaction could still be identified and consumed, so the
 				// caller can route the user back to their live login interaction.
-				readonly transaction?: FederationTransaction
+				readonly transaction?: FederationTransaction,
+				readonly appleExchangeDiagnostic?: AppleExchangeDiagnostic
 		) {
 				super(message);
 				this.name = "FederatedAuthorizationError";
@@ -42,7 +53,7 @@ export interface AuthorizationCodeExchanger {
 }
 
 export class AuthorizationCodeExchangeError extends Error {
-		constructor(message: string) {
+		constructor(message: string, readonly diagnostic: Exclude<AppleExchangeDiagnostic, { category: "signing" }>) {
 				super(message);
 				this.name = "AuthorizationCodeExchangeError";
 		}
@@ -62,20 +73,33 @@ export class HttpAuthorizationCodeExchanger implements AuthorizationCodeExchange
 								body: params.toString()
 						});
 				} catch {
-						throw new AuthorizationCodeExchangeError("Provider token endpoint is unreachable");
+						throw new AuthorizationCodeExchangeError("Provider token endpoint is unreachable", { category: "network" });
 				}
 				if (!response.ok) {
-						throw new AuthorizationCodeExchangeError(`Provider token endpoint rejected the exchange (${response.status})`);
+						let oauthError: typeof APPLE_OAUTH_ERRORS[number] | undefined;
+						if (tokenEndpoint === APPLE_TOKEN_ENDPOINT) {
+								try {
+										const body: unknown = await response.json();
+										const error = typeof body === "object" && body !== null && "error" in body ? body.error : undefined;
+										oauthError = APPLE_OAUTH_ERRORS.find((allowed) => allowed === error);
+								} catch {
+										// A non-JSON rejection still has a safe HTTP status.
+								}
+						}
+						throw new AuthorizationCodeExchangeError(`Provider token endpoint rejected the exchange (${response.status})`,
+								{ category: "provider_rejection", status: response.status, ...(oauthError ? { oauthError } : {}) });
 				}
 				let body: unknown;
 				try {
 						body = await response.json();
 				} catch {
-						throw new AuthorizationCodeExchangeError("Provider token endpoint returned a malformed response");
+						throw new AuthorizationCodeExchangeError("Provider token endpoint returned a malformed response",
+								{ category: "malformed_response" });
 				}
 				const idToken = (body as { id_token?: unknown })?.id_token;
 				if (typeof idToken !== "string" || idToken.length === 0) {
-						throw new AuthorizationCodeExchangeError("Provider token endpoint response is missing id_token");
+						throw new AuthorizationCodeExchangeError("Provider token endpoint response is missing id_token",
+								{ category: "malformed_response" });
 				}
 				return { idToken };
 		}
@@ -179,19 +203,25 @@ export class FederatedAuthorizationService {
 				}
 
 				let idToken: string;
+				let generatingSecret = true;
 				try {
+						const clientSecret = await this.config.clientSecret();
+						generatingSecret = false;
 						const params = new URLSearchParams({
 								grant_type: "authorization_code",
 								code: input.code,
 								redirect_uri: this.config.redirectUri,
 								client_id: this.config.clientId,
-								client_secret: await this.config.clientSecret()
+								client_secret: clientSecret
 						});
 						({ idToken } = await this.exchanger.exchange(this.config.tokenEndpoint, params));
-				} catch {
+				} catch (error) {
 						// Deliberately detail-free: exchange failures never echo codes, secrets, or bodies.
+						const diagnostic = this.config.provider !== "APPLE" ? undefined
+								: generatingSecret ? { category: "signing" as const }
+								: error instanceof AuthorizationCodeExchangeError ? error.diagnostic : undefined;
 						throw new FederatedAuthorizationError("code_exchange_failed",
-								"Provider authorization-code exchange failed", transaction);
+								"Provider authorization-code exchange failed", transaction, diagnostic);
 				}
 
 				try {

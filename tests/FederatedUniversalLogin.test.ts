@@ -1,5 +1,6 @@
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet } from "jose";
 import { randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import formbody from "@fastify/formbody";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -22,6 +23,7 @@ import {
 		FederatedAuthorizationService,
 		GOOGLE_AUTHORIZATION_ENDPOINT,
 		GOOGLE_TOKEN_ENDPOINT,
+		HttpAuthorizationCodeExchanger,
 		type AuthorizationCodeExchanger
 } from "../src/identity/federation/FederatedAuthorizationService.js";
 import { FederationTransactionStore } from "../src/identity/federation/FederationTransactionStore.js";
@@ -30,6 +32,7 @@ import { HapiSessionService, HAPI_SESSION_COOKIE, hashSessionToken } from "../sr
 import { InMemoryHapiSessionRepository } from "../src/identity/sessions/InMemoryHapiSessionRepository.js";
 import type { AuthenticationMethod } from "../src/models/Application.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
+import { serializeRequestForLog } from "../src/security/RequestLogging.js";
 
 // HAPI ID V2-D Phases 4/6: HAPI-hosted Apple/Google Universal Login certification. Every provider
 // artifact (keys, codes, tokens, endpoints) is synthetic; no live provider is ever contacted.
@@ -92,7 +95,12 @@ function form(payload: Record<string, string>, cookie?: string): { headers: Reco
 
 type ProviderIdentity = { sub: string; email?: string; emailVerified?: unknown; isPrivateEmail?: unknown };
 
-async function federatedFixture(options: { allowExternal?: boolean; flags?: Record<string, boolean | undefined> } = {}) {
+async function federatedFixture(options: {
+	allowExternal?: boolean;
+	flags?: Record<string, boolean | undefined>;
+	appleClientSecret?: () => Promise<string>;
+	appleExchanger?: AuthorizationCodeExchanger;
+} = {}) {
 	ensureOidcTestEnvironment();
 	setFlags({ ...DEFAULT_FLAGS, ...(options.flags ?? {}) });
 
@@ -154,9 +162,9 @@ async function federatedFixture(options: { allowExternal?: boolean; flags?: Reco
 	const apple = new FederatedAuthorizationService(
 		{ provider: "APPLE", clientId: APPLE_CLIENT, redirectUri: APPLE_CALLBACK, scope: "name email",
 			authorizationEndpoint: APPLE_AUTHORIZATION_ENDPOINT, tokenEndpoint: APPLE_TOKEN_ENDPOINT,
-			responseMode: "form_post", clientSecret: async () => "synthetic-apple-secret" },
+			responseMode: "form_post", clientSecret: options.appleClientSecret ?? (async () => "synthetic-apple-secret") },
 		new AppleIdentityTokenVerifier({ expectedAudiences: [APPLE_CLIENT], jwks: appleJwks }),
-		transactions, exchanger("APPLE"));
+		transactions, options.appleExchanger ?? exchanger("APPLE"));
 	const google = new FederatedAuthorizationService(
 		{ provider: "GOOGLE", clientId: GOOGLE_CLIENT, redirectUri: GOOGLE_CALLBACK, scope: "openid email profile",
 			authorizationEndpoint: GOOGLE_AUTHORIZATION_ENDPOINT, tokenEndpoint: GOOGLE_TOKEN_ENDPOINT,
@@ -173,7 +181,10 @@ async function federatedFixture(options: { allowExternal?: boolean; flags?: Reco
 	} as unknown as AuthenticationProvider;
 	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients,
 		clientAuthority: h1, federation: { apple, google, transactions, resolution, sessions } });
-	const app = Fastify();
+	const logs: string[] = [];
+	const app = Fastify({ logger: { level: "info",
+		stream: new Writable({ write(chunk, _encoding, done) { logs.push(String(chunk)); done(); } }),
+		serializers: { req: serializeRequestForLog } } });
 	await app.register(formbody);
 	await oidc.registerEndpoints(app);
 	await app.ready();
@@ -184,7 +195,7 @@ async function federatedFixture(options: { allowExternal?: boolean; flags?: Reco
 	vi.spyOn(identityRegistry, "findById").mockImplementation(id => subjects.findById(id));
 
 	return { app, subjects, registry, federation, externalRepository, transactions, sessions, sessionRepository,
-		identities, codes, tenantId, applicationId };
+		identities, codes, tenantId, applicationId, logs };
 }
 
 type Fixture = Awaited<ReturnType<typeof federatedFixture>>;
@@ -346,6 +357,10 @@ describe("V2-D federated Universal Login (synthetic providers)", () => {
 		expect(created?.id).not.toBe(existing.id);
 		const linkedIdentities = await f.federation.listExternalIdentities(created!.id);
 		expect(linkedIdentities[0]).toMatchObject({ provider: "GOOGLE", providerSubject: f.identities.GOOGLE.sub, status: "linked" });
+		const googleLog = f.logs.map(line => JSON.parse(line)).find(entry =>
+			entry.event === "APPLICATION_AUTHENTICATION" && entry.authenticationMethod === "GOOGLE" && entry.result === "success");
+		expect(googleLog).toBeDefined();
+		expect(googleLog).not.toHaveProperty("appleExchangeCategory");
 	});
 
 	it("lets the user switch to email sign-in instead, dropping the pending federated identity", async () => {
@@ -423,6 +438,60 @@ describe("V2-D federated Universal Login (synthetic providers)", () => {
 		// The interaction survives: the user can still sign in with email.
 		const chooser = await f.app.inject({ method: "GET", url: "/login", headers: { cookie: interaction.cookie } });
 		expect(chooser.statusCode).toBe(200);
+	});
+
+	it.each([
+		{ name: "signing", category: "signing", signingFails: true },
+		{ name: "network", category: "network", networkFails: true },
+		{ name: "Apple rejection", category: "provider_rejection", status: 400, oauthError: "invalid_client" },
+		{ name: "invalid grant", category: "provider_rejection", status: 400, oauthError: "invalid_grant" },
+		{ name: "unknown Apple error", category: "provider_rejection", status: 401, responseError: "private-response-value" },
+		{ name: "non-JSON rejection", category: "provider_rejection", status: 503, body: "private-response-value" },
+		{ name: "malformed JSON", category: "malformed_response", status: 200, body: "private-response-value" },
+		{ name: "missing id_token", category: "malformed_response", status: 200, body: "{}" }
+	])("logs sanitized Apple exchange diagnostics for $name", async (scenario) => {
+		const sensitive = ["private-key-value", "client-secret-value", "authorization-code-value",
+			"access-token-value", "id-token-value", "private-response-value", "private-user@example.com", "private-subject-value"];
+		const fetchImpl = vi.fn<typeof fetch>(async () => {
+			if (scenario.networkFails) throw new Error(sensitive.join(" "));
+			return new Response(scenario.body ?? JSON.stringify({
+				error: scenario.oauthError ?? scenario.responseError,
+				error_description: sensitive.join(" "),
+				access_token: "access-token-value",
+				id_token: "id-token-value",
+				email: "private-user@example.com",
+				sub: "private-subject-value"
+			}), { status: scenario.status ?? 200 });
+		});
+		const f = await federatedFixture({
+			appleClientSecret: async () => {
+				if (scenario.signingFails) throw new Error(sensitive.join(" "));
+				return "client-secret-value";
+			},
+			appleExchanger: new HttpAuthorizationCodeExchanger(fetchImpl)
+		});
+		const interaction = await beginInteraction(f, `verifier-diagnostic-${scenario.name}`);
+		const { state } = await launchProvider(f, interaction, "APPLE");
+		const logStart = f.logs.length;
+		const callback = await appleCallback(f, { state, code: "authorization-code-value" });
+		expect(callback.statusCode).toBe(400);
+		expect(callback.body).toContain("We couldn&#39;t complete that sign-in. Choose another way to continue.");
+		const callbackLogs = f.logs.slice(logStart);
+		const authenticationLog = callbackLogs.map(line => JSON.parse(line)).find(entry =>
+			entry.event === "APPLICATION_AUTHENTICATION" && entry.reasonCode === "code_exchange_failed");
+		expect(authenticationLog).toMatchObject({
+			event: "APPLICATION_AUTHENTICATION", authenticationMethod: "APPLE", result: "rejected",
+			reasonCode: "code_exchange_failed", appleExchangeCategory: scenario.category,
+			...(scenario.category === "provider_rejection" ? { appleExchangeStatus: scenario.status } : {}),
+			...(scenario.oauthError ? { appleOAuthError: scenario.oauthError } : {})
+		});
+		if (!scenario.oauthError) expect(authenticationLog).not.toHaveProperty("appleOAuthError");
+		for (const value of sensitive) {
+			expect(callbackLogs.join("")).not.toContain(value);
+			expect(callback.body).not.toContain(value);
+		}
+		expect(fetchImpl).toHaveBeenCalledTimes(scenario.signingFails ? 0 : 1);
+		expect((await appleCallback(f, { state, code: "authorization-code-value" })).statusCode).toBe(400);
 	});
 
 	it("refuses linked identities whose HAPI subject is locked or disabled", async () => {

@@ -73,7 +73,8 @@ import {
 		FederatedAuthorizationError,
 		FederatedAuthorizationService,
 		GOOGLE_AUTHORIZATION_ENDPOINT,
-		GOOGLE_TOKEN_ENDPOINT
+		GOOGLE_TOKEN_ENDPOINT,
+		type AppleExchangeDiagnostic
 } from "../identity/federation/FederatedAuthorizationService.js";
 import { FederationTransactionStore } from "../identity/federation/FederationTransactionStore.js";
 import {
@@ -1353,7 +1354,7 @@ export class OIDCService {
 				const statusOf = (error: unknown) => typeof (error as { statusCode?: unknown })?.statusCode === "number"
 						? (error as { statusCode: number }).statusCode : 500;
 				const logLogin = (request: FastifyRequest, flow: string, interaction: AuthorizationInteraction | null,
-						startedAt: number, success: boolean, error: string, user = "") => {
+						startedAt: number, success: boolean, error: string, user = "", appleExchange?: AppleExchangeDiagnostic) => {
 						const method = flow === "universal_login_face" ? "PRIVATEID_FACE"
 								: flow.includes("federated_apple") ? "APPLE"
 								: flow.includes("federated_google") ? "GOOGLE"
@@ -1361,7 +1362,12 @@ export class OIDCService {
 						app.log.info({ event: "APPLICATION_AUTHENTICATION", applicationId: interaction?.binding?.applicationId,
 								clientId: interaction?.clientId, identitySubjectId: user || undefined, requestId: request.id,
 								authenticationMethod: method,
-								result: success ? "success" : "rejected", reasonCode: error || undefined }, "Application authentication result");
+								result: success ? "success" : "rejected", reasonCode: error || undefined,
+								...(appleExchange ? { appleExchangeCategory: appleExchange.category } : {}),
+								...(appleExchange?.category === "provider_rejection"
+										? { appleExchangeStatus: appleExchange.status,
+												...(appleExchange.oauthError ? { appleOAuthError: appleExchange.oauthError } : {}) } : {})
+						}, "Application authentication result");
 						this.logOidcRequest(app, {
 						requestId: request.id, clientId: interaction?.clientId ?? "", flow, latency: Date.now() - startedAt,
 						success, error, user, pkce: interaction?.authorization.codeChallenge ? "S256" : "missing",
@@ -1714,7 +1720,7 @@ export class OIDCService {
 								outcome = await service.handleCallback(params);
 						} catch (error) {
 								if (!(error instanceof FederatedAuthorizationError)) throw error;
-								logLogin(request, flow, null, startedAt, false, error.code);
+								logLogin(request, flow, null, startedAt, false, error.code, "", error.appleExchangeDiagnostic);
 								// Recovery UX: when the failed transaction still maps to a live interaction, the
 								// user returns to their chooser with a friendly message instead of a dead end.
 								const handle = error.transaction?.interactionHandle;
