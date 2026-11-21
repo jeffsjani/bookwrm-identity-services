@@ -10,6 +10,37 @@ UserInfo handler. It does not call the production issuer. The browser only sees 
 not tokens. The normal OAuth redirect briefly carries a one-time authorization code in the browser
 URL; it is exchanged server-side and redirected to a clean results URL.
 
+For a returning passkey test, the console requires the signed `amr` to be `["passkey"]`,
+the ID-token and UserInfo subjects to match the active HAPI email subject for the test mailbox,
+and both responses to contain its verified email. The passkey manager's account label is not an
+identity claim. A failure still requires investigation; it does not establish which check failed.
+
+After separate approval to deploy the reviewed console fix to staging, start a new console test,
+choose **Continue with Passkey**, and use the previously enrolled passkey. Certification requires all
+four checks to pass, including `PASS: UserInfo matches the test mailbox (PASSKEY)`. The label comes
+from the verified ID token; it distinguishes a passkey result from a successful Email OTP or
+federated login. The server verifies the credential and resolves its stored owner, and the console
+compares that subject with the canonical HAPI email subject and UserInfo. No token, credential
+identifier, or account label needs to be extracted. A failure is not proof of a credential mismatch.
+The browser login is not read-only: successful authentication updates the credential's usage
+metadata and signature counter. Obtain separate approval for that staging test.
+
+Optionally, an operator with a read-only connection to the isolated staging database can bind the
+normalized test mailbox as `$1` in the following query. It returns only booleans and establishes
+whether that account currently has an active passkey; it cannot identify which credential was used
+in the historical test or replace the new browser test.
+
+```sql
+WITH account AS (
+  SELECT id FROM identity_subjects
+  WHERE primary_provider = 'HAPI_EMAIL' AND primary_provider_subject = $1::text
+    AND email = $1::text AND email_verified IS TRUE AND status = 'ACTIVE'
+)
+SELECT EXISTS (SELECT 1 FROM account) AS active_verified_account,
+       EXISTS (SELECT 1 FROM passkey_credentials c JOIN account a ON a.id = c.identity_subject_id
+               WHERE c.revoked_at IS NULL) AS has_active_passkey;
+```
+
 ## Required checks before activation
 
 - Confirm the staging service, staging PostgreSQL and staging Redis are isolated from Bookwrm

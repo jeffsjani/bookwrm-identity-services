@@ -38,7 +38,7 @@ import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.j
 import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
 import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
 import { RegistrationService } from "../src/registration/RegistrationService.js";
-import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
+import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER, validateStagingConsoleUserInfo } from "../src/oidc/StagingTestConsole.js";
 import { protectStagingConsoleInternalLogs } from "../src/oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "../src/security/RequestLogging.js";
 import { PostgresPasskeyCredentialRepository } from "../src/identity/PostgresPasskeyCredentialRepository.js";
@@ -1248,7 +1248,10 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		const t = await setup();
 		const a = await authenticator();
 		try {
-			await enroll(t, a.page);
+			const credential = await enroll(t, a.page);
+			const owner = await pool.query<{ identity_subject_id: string }>(
+				"SELECT identity_subject_id FROM passkey_credentials WHERE credential_id = $1", [credential.id]);
+			expect(owner.rows).toEqual([{ identity_subject_id: t.f.subject.id }]);
 			const emailCount = t.f.delivery.messages.length;
 			t.f.oidcClient.grant_types = ["authorization_code", "refresh_token"];
 			vi.stubEnv("HAPI_PERSISTENT_SESSIONS_ENABLED", "true");
@@ -1277,11 +1280,16 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 				const jwks = (await t.f.app.inject({ method: "GET", url: "/jwks" })).json().keys;
 				const jwk = jwks.find((key: { kid?: string }) => key.kid === decodeProtectedHeader(idToken).kid);
 				const verified = await jwtVerify(idToken, await importJWK(jwk, "RS256"), { issuer: stagingOrigin, audience: CLIENT_ID });
-				expect(verified.payload).toMatchObject({ sub: t.f.subject.oidcSubject, amr: ["passkey"] });
+				expect(verified.payload).toMatchObject({ sub: t.f.subject.oidcSubject, amr: ["passkey"],
+					email: KNOWN_EMAIL, email_verified: true });
 				const userinfo = await t.f.app.inject({ method: "GET", url: "/userinfo",
 					headers: { authorization: `Bearer ${token.json().access_token}` } });
 				expect(userinfo.statusCode, userinfo.body).toBe(200);
-				expect(userinfo.json().sub).toBe(verified.payload.sub);
+				const info = userinfo.json();
+				expect(info).toMatchObject({ sub: verified.payload.sub, email: KNOWN_EMAIL, email_verified: true });
+				expect(validateStagingConsoleUserInfo(verified.payload, info, KNOWN_EMAIL, t.f.subject.oidcSubject)).toBe(true);
+				expect(validateStagingConsoleUserInfo(verified.payload, { ...info, sub: randomUUID() },
+					KNOWN_EMAIL, t.f.subject.oidcSubject)).toBe(false);
 				expect((await login.verify(assertion)).statusCode).not.toBe(200);
 			}
 			expect(t.f.delivery.messages).toHaveLength(emailCount);

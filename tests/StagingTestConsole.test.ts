@@ -7,6 +7,7 @@ import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER, v
 import { requestLogPath } from "../src/security/RequestLogging.js";
 import { registerStagingConsoleCallbackAtBoot, STAGING_WEB_ORIGINAL_CALLBACK } from "../src/identity/StagingConsoleClientRegistration.js";
 import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
+import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import type { PostgresClient, TransactionRunner } from "../src/identity/infrastructure/PostgresInfrastructure.js";
 
 const password = "operator-password-".padEnd(40, "x");
@@ -33,14 +34,17 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 		const body = request.body as Record<string, string>;
 		const expected = createHash("sha256").update(body.code_verifier).digest("base64url");
 		if (scenario === "bad-pkce" || expected !== challenge) return reply.code(400).send({ error: "invalid_grant" });
-		const idToken = await new SignJWT({ nonce: scenario === "bad-nonce" ? "wrong" : nonce, amr: ["email"] })
+		const passkey = scenario.startsWith("passkey");
+		const idToken = await new SignJWT({ nonce: scenario === "bad-nonce" ? "wrong" : nonce,
+			amr: [passkey ? "passkey" : "email"],
+			...(passkey ? { email: "jeff@hapiinc.com", email_verified: true } : {}) })
 			.setProtectedHeader({ alg: "RS256", kid: "test" }).setIssuer(scenario === "bad-issuer" ? "https://identity.bookwrm.com" : STAGING_ISSUER)
 			.setAudience(scenario === "bad-audience" ? "other-client" : "staging-web").setSubject("test-subject").setIssuedAt()
 			.setExpirationTime(scenario === "expired" ? "1 second ago" : "5 minutes").sign(privateKey);
 		return { access_token: "test-access-token", id_token: scenario === "bad-signature" ? idToken + "bad" : idToken };
 	});
 	app.get("/jwks", async () => { jwksCalls++; return { keys: [jwk] }; });
-	app.get("/userinfo", async () => { userinfoCalls++; return { sub: scenario === "bad-userinfo" ? "other-subject" : "test-subject",
+	app.get("/userinfo", async () => { userinfoCalls++; return { sub: scenario === "bad-userinfo" || scenario === "passkey-bad-userinfo" ? "other-subject" : "test-subject",
 		email: "jeff@hapiinc.com", email_verified: true }; });
 	await registerStagingTestConsole(app, { issuer, env: config });
 	await app.ready();
@@ -62,6 +66,21 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 }
 
 describe("staging test console", () => {
+	it("requires the verified mailbox, canonical subject and exclusive passkey method", () => {
+		const claims = { sub: "subject", amr: ["passkey"], email: "jeff@hapiinc.com", email_verified: true };
+		const info = { sub: "subject", email: "jeff@hapiinc.com", email_verified: true };
+		const validate = (id: typeof claims, userinfo: typeof info, subject?: string) =>
+			validateStagingConsoleUserInfo(id, userinfo, "jeff@hapiinc.com", subject);
+		expect(validate(claims, info, "subject")).toBe(true);
+		expect(validate(claims, info)).toBe(false);
+		expect(validate(claims, info, "other-subject")).toBe(false);
+		expect(validate(claims, { ...info, sub: "other-subject" }, "subject")).toBe(false);
+		expect(validate(claims, { ...info, email: "other@example.com" }, "subject")).toBe(false);
+		expect(validate(claims, { ...info, email_verified: false }, "subject")).toBe(false);
+		expect(validate({ ...claims, email_verified: false }, info, "subject")).toBe(false);
+		expect(validate({ ...claims, amr: ["email", "passkey"] }, info, "subject")).toBe(false);
+	});
+
 	it("validates Email OTP, Google and Apple provider claims consistently", () => {
 		const emailSub = "email-subject";
 		expect(validateStagingConsoleUserInfo(
@@ -222,6 +241,41 @@ describe("staging test console", () => {
 			for (const value of ["secret-code", "test-access-token", secret, password]) expect(results.body).not.toContain(value);
 			if (scenario === "bad-pkce") expect(f.jwksCalls()).toBe(0);
 			if (scenario !== "bad-userinfo") expect(f.userinfoCalls()).toBe(0);
+		} finally { await f.app.close(); }
+	});
+
+	it.each([
+		{ scenario: "passkey", subject: "test-subject", status: "ACTIVE" as const, passed: true },
+		{ scenario: "passkey", subject: "other-subject", status: "ACTIVE" as const, passed: false },
+		{ scenario: "passkey", subject: "test-subject", status: "DISABLED" as const, passed: false },
+		{ scenario: "passkey-bad-userinfo", subject: "test-subject", status: "ACTIVE" as const, passed: false }
+	])("checks passkey callback against the canonical account: $scenario, $status, $subject", async ({ scenario, subject, status, passed }) => {
+		const lookup = vi.spyOn(identityRegistry, "findByProvider").mockResolvedValue({
+			id: "identity-id", oidcSubject: subject, primaryProvider: "HAPI_EMAIL",
+			primaryProviderSubject: "jeff@hapiinc.com", email: "jeff@hapiinc.com", emailVerified: true,
+			status, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+		});
+		const f = await fixture(scenario);
+		try {
+			const { cookie, state } = await f.start();
+			await f.app.inject({ method: "GET", url: `/staging-console/callback?code=secret-code&state=${state}`,
+				headers: { ...headers, cookie } });
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results", headers: { ...headers, cookie } });
+			expect(results.body).toContain(passed ? "Test passed" : "Test failed");
+			expect(results.body).toContain(`${passed ? "PASS" : "FAIL"}: UserInfo matches the test mailbox (PASSKEY)`);
+			expect(lookup).toHaveBeenCalledWith("HAPI_EMAIL", "jeff@hapiinc.com");
+		} finally { await f.app.close(); lookup.mockRestore(); }
+	});
+
+	it("does not label an Email OTP result as PASSKEY", async () => {
+		const f = await fixture();
+		try {
+			const { cookie, state } = await f.start();
+			await f.app.inject({ method: "GET", url: `/staging-console/callback?code=secret-code&state=${state}`,
+				headers: { ...headers, cookie } });
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results", headers: { ...headers, cookie } });
+			expect(results.body).toContain("PASS: UserInfo matches the test mailbox");
+			expect(results.body).not.toContain("(PASSKEY)");
 		} finally { await f.app.close(); }
 	});
 

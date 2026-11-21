@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
 import { renderHapiPage, csrfField } from "../presentation/HapiPagePresentation.js";
+import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 import { getRedisClient, oidcRedisKey, type RedisClient } from "./infrastructure/RedisInfrastructure.js";
 import { stagingConsoleInternalHeaders } from "./StagingConsoleInternal.js";
@@ -21,9 +22,14 @@ export type StagingConsoleUserInfo = { sub?: unknown; email?: unknown; email_ver
 export type StagingConsoleIdClaims = { sub?: unknown; amr?: unknown; email?: unknown; email_verified?: unknown };
 
 export function validateStagingConsoleUserInfo(claims: StagingConsoleIdClaims,
-	info: StagingConsoleUserInfo, emailOtpMailbox: string): boolean {
-	if (typeof claims.sub !== "string" || typeof info.sub !== "string" || info.sub !== claims.sub) return false;
+	info: StagingConsoleUserInfo, emailOtpMailbox: string, passkeySubject?: string): boolean {
+	if (typeof claims.sub !== "string" || !claims.sub || typeof info.sub !== "string" || info.sub !== claims.sub) return false;
 	const amr = Array.isArray(claims.amr) ? claims.amr.filter((value): value is string => typeof value === "string") : [];
+	if (amr.includes("passkey")) {
+		return Array.isArray(claims.amr) && claims.amr.length === 1 && claims.sub === passkeySubject
+			&& claims.email === emailOtpMailbox && claims.email_verified === true
+			&& info.email === emailOtpMailbox && info.email_verified === true;
+	}
 	if (amr.includes("email") && !amr.includes("google") && !amr.includes("apple") && !amr.includes("fed")) {
 		return info.email === emailOtpMailbox && info.email_verified === true;
 	}
@@ -170,7 +176,7 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 				if (jwksResponse.statusCode !== 200) throw new Error("JWKS unavailable");
 				const jwks = jwksResponse.json() as JSONWebKeySet;
 				let subject: string | undefined;
-			let idClaims: StagingConsoleIdClaims | undefined;
+				let idClaims: StagingConsoleIdClaims | undefined;
 				try {
 					const { payload } = await jwtVerify(tokens.id_token, createLocalJWKSet(jwks), {
 						issuer: STAGING_ISSUER, audience: CLIENT, algorithms: ["RS256"],
@@ -191,9 +197,14 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 					const response = await app.inject({ method: "GET", url: "/userinfo",
 						headers: { ...stagingConsoleInternalHeaders(), authorization: `Bearer ${tokens.access_token}` } });
 					const info: StagingConsoleUserInfo = response.json();
+					const expected = Array.isArray(idClaims?.amr) && idClaims.amr.includes("passkey")
+						? await identityRegistry.findByProvider("HAPI_EMAIL", EMAIL) : undefined;
 					const matched = response.statusCode === 200 && idClaims !== undefined
-						&& validateStagingConsoleUserInfo(idClaims, info, EMAIL);
-					results.push({ name: "UserInfo matches the test mailbox", passed: matched });
+						&& validateStagingConsoleUserInfo(idClaims, info, EMAIL,
+							expected?.status === "ACTIVE" && expected.email === EMAIL && expected.emailVerified === true
+								? expected.oidcSubject : undefined);
+					const passkey = Array.isArray(idClaims?.amr) && idClaims.amr.length === 1 && idClaims.amr[0] === "passkey";
+					results.push({ name: `UserInfo matches the test mailbox${passkey ? " (PASSKEY)" : ""}`, passed: matched });
 					if (!matched) request.log.warn({ event: "STAGING_CONSOLE_USERINFO_FAILED" }, "Staging console UserInfo verification failed");
 				}
 			}

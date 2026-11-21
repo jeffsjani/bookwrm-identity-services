@@ -53,7 +53,7 @@ describe("staging console browser authentication", () => {
 				if (createHash("sha256").update(body.code_verifier).digest("base64url") !== challenge) {
 					return reply.code(400).send({ error: "invalid_grant" });
 				}
-				const token = await new SignJWT({ nonce }).setProtectedHeader({ alg: "RS256", kid: "test" })
+				const token = await new SignJWT({ nonce, amr: ["email"] }).setProtectedHeader({ alg: "RS256", kid: "test" })
 					.setIssuer(STAGING_ISSUER).setAudience("staging-web").setSubject("synthetic-subject")
 					.setIssuedAt().setExpirationTime("5 minutes").sign(privateKey);
 				return { id_token: token, access_token: "synthetic-access-token" };
