@@ -63,7 +63,7 @@ type EnrollmentAuthority = {
 	browserProofHash: string;
 	csrfHash: string;
 	expiresAt: number;
-	state: "OFFERED" | "ENROLLING" | "VERIFYING" | "SKIPPED" | "ENROLLED" | "FAILED";
+	state: "OFFERED" | "ENROLLING" | "VERIFYING" | "MANAGING" | "SKIPPED" | "ENROLLED" | "FAILED";
 	registration?: { challenge: string; userHandle: string };
 };
 
@@ -111,6 +111,21 @@ local ttl = math.min(tonumber(ARGV[3]), redis.call('PTTL', KEYS[1]), redis.call(
 if ttl <= 0 then return 0 end
 redis.call('SET', KEYS[2], '1', 'PX', ttl, 'NX')
 redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])
+return 1`;
+
+const AUTHENTICATION_START_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('EXISTS', KEYS[3]) ~= 0 then return 0 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local ttl = math.min(tonumber(ARGV[3]), redis.call('PTTL', KEYS[1]))
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[4], ARGV[2], 'PX', ttl)
+return 1`;
+
+const AUTHENTICATION_CLAIM_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('EXISTS', KEYS[3]) ~= 0 then return 0 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] or redis.call('GET', KEYS[4]) ~= ARGV[2] then return 0 end
+if redis.call('PTTL', KEYS[4]) <= 0 or redis.call('PTTL', KEYS[1]) <= 0 then return 0 end
+redis.call('DEL', KEYS[4])
 return 1`;
 
 // Opaque, short-lived, single-use server-side record of a validated interactive authorization request.
@@ -177,18 +192,48 @@ export class AuthorizationInteractionStore {
 	async consume(handle: string | undefined): Promise<AuthorizationInteraction | null> {
 		const interaction = await this.find(handle);
 		if (!interaction || !handle) return null;
+		return await this.consumeExpected(handle, interaction) ? interaction : null;
+	}
+
+	async consumeExpected(handle: string, interaction: AuthorizationInteraction): Promise<boolean> {
+		if (!HANDLE_PATTERN.test(handle)) return false;
 		const remaining = interaction.expiresAt - this.clock();
-		if (remaining <= 0) return null;
+		if (remaining <= 0) return false;
 		const won = await this.redis.eval(CONSUME_SCRIPT, 3, this.key(handle), this.consumedKey(handle),
 			this.enrollmentKey(handle), JSON.stringify(interaction), Math.floor(remaining));
-		return won === 1 ? interaction : null;
+		return won === 1;
+	}
+
+	async beginPasskeyAuthentication(handle: string, interaction: AuthorizationInteraction, challenge: string,
+		purpose: "login" | "manage" = "login"): Promise<boolean> {
+		if (!HANDLE_PATTERN.test(handle) || !HANDLE_PATTERN.test(challenge)) return false;
+		const ttl = Math.min(120_000, interaction.expiresAt - this.clock());
+		if (ttl <= 0) return false;
+		const raw = JSON.stringify(interaction);
+		const authority = JSON.stringify({ challenge, interactionHash: digest(raw), expiresAt: this.clock() + ttl, purpose });
+		return await this.redis.eval(AUTHENTICATION_START_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.authenticationKey(handle), raw, authority, Math.floor(ttl)) === 1;
+	}
+
+	async claimPasskeyAuthentication(handle: string, interaction: AuthorizationInteraction):
+		Promise<{ challenge: string; expiresAt: number; purpose: "login" | "manage" } | null> {
+		if (!HANDLE_PATTERN.test(handle) || interaction.expiresAt <= this.clock()) return null;
+		const raw = JSON.stringify(interaction);
+		const authorityRaw = await this.redis.get(this.authenticationKey(handle));
+		if (!authorityRaw) return null;
+		const authority = JSON.parse(authorityRaw) as { challenge: string; interactionHash: string; expiresAt: number; purpose: "login" | "manage" };
+		if (!HANDLE_PATTERN.test(authority.challenge) || authority.interactionHash !== digest(raw) ||
+			authority.expiresAt <= this.clock() || !["login", "manage"].includes(authority.purpose)) return null;
+		const result = await this.redis.eval(AUTHENTICATION_CLAIM_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.authenticationKey(handle), raw, authorityRaw);
+		return result === 1 ? { challenge: authority.challenge, expiresAt: authority.expiresAt, purpose: authority.purpose } : null;
 	}
 
 	// Locks the original interaction while a separately browser-bound enrollment authority exists.
 	async offerPasskeyEnrollment(handle: string, interaction: AuthorizationInteraction, principal: AuthenticatedUser):
 		Promise<{ browserProof: string } | null> {
 		if (!HANDLE_PATTERN.test(handle) || !principal.id || !principal.sub ||
-			!["HAPI_EMAIL", "APPLE", "GOOGLE"].includes(principal.authenticationMethod ?? "")) return null;
+			!["HAPI_EMAIL", "APPLE", "GOOGLE", "PASSKEY"].includes(principal.authenticationMethod ?? "")) return null;
 		const remaining = interaction.expiresAt - this.clock();
 		if (remaining <= 0) return null;
 		const browserProof = randomBytes(32).toString("base64url");
@@ -209,7 +254,8 @@ export class AuthorizationInteractionStore {
 		if (!subjectId) return false;
 		const allowed = (from === "OFFERED" && (to === "SKIPPED" || to === "ENROLLING")) ||
 			(from === "ENROLLING" && (to === "ENROLLED" || to === "FAILED")) ||
-			(from === "VERIFYING" && (to === "ENROLLED" || to === "FAILED"));
+			(from === "VERIFYING" && (to === "ENROLLED" || to === "FAILED")) ||
+			(from === "OFFERED" && to === "MANAGING") || (from === "MANAGING" && to === "OFFERED");
 		if (!allowed) return false;
 		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId, to === "FAILED");
 		if (!loaded || loaded.authority.state !== from) return false;
@@ -273,7 +319,7 @@ export class AuthorizationInteractionStore {
 		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, undefined, true);
 		if (!loaded) return null;
 		return { principal: loaded.authority.principal, state: loaded.authority.state,
-			expired: loaded.authority.expiresAt <= this.clock() };
+			expiresAt: loaded.authority.expiresAt, expired: loaded.authority.expiresAt <= this.clock() };
 	}
 
 	private async loadEnrollmentAuthority(handle: string, browserProof: string, csrf: string, subjectId?: string,
@@ -312,5 +358,9 @@ export class AuthorizationInteractionStore {
 
 	private enrollmentLiveKey(handle: string): string {
 		return oidcRedisKey(`interaction_passkey_enrollment_live:${digest(handle)}`);
+	}
+
+	private authenticationKey(handle: string): string {
+		return oidcRedisKey(`interaction_passkey_authentication:${digest(handle)}`);
 	}
 }

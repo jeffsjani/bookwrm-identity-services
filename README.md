@@ -50,7 +50,7 @@ button opens the existing Email screen without creating a challenge. Face is not
 to Bookwrm users merely because H5 or legacy Face code exists. Other clients keep their
 existing choices; H2/H3/H4, OTP, H5, and OIDC semantics are unchanged.
 
-## Passkey enrollment
+## Passkeys
 
 After an Email, Apple, or Google sign-in, Universal Login can offer an existing HAPI
 subject passkey registration when `HAPI_PASSKEY_AUTHENTICATION_ENABLED=true` and
@@ -62,8 +62,21 @@ stable user handle; Redis holds the short-lived, single-use enrollment authority
 If completion fails after the database commit, the credential remains associated
 with its subject and the user must start sign-in again.
 
-This milestone does not implement passkey login or credential management. Do not
-enable it for users expecting to sign in with a passkey yet.
+Returning users can sign in with a discoverable passkey through the existing
+authorization-code and PKCE flow. Redis holds a browser- and interaction-bound,
+single-use authentication challenge; PostgreSQL resolves the verified credential
+to its existing subject and rejects revoked credentials. User verification is
+required. Passkey-authenticated logins do not create persistent sessions or
+refresh tokens.
+
+Users can list, add, or revoke passkeys after a fresh email OTP or a
+user-verified passkey reauthentication. A new Apple or Google callback alone is
+not proof that the upstream authentication was recent; users can manage their
+passkeys by reauthenticating with an existing passkey or email OTP. Revoking the
+passkey used for management requires starting sign-in again. Renaming is not
+supported. The guarded staging permission update in
+`scripts/update-staging-passkey-permissions.sql` requires separate review and
+execution; it is not applied automatically.
 
 ## Overview
 

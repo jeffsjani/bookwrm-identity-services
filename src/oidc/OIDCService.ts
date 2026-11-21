@@ -10,7 +10,7 @@ import {
 } from "node:crypto";
 import Provider from "oidc-provider";
 import { z } from "zod";
-import { generateRegistrationOptions, verifyRegistrationResponse } from "@simplewebauthn/server";
+import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { EmailOIDCHandoff } from "../authentication/EmailOIDCHandoff.js";
 import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
 import { VerificationError } from "../email/VerificationChallenge.js";
@@ -23,7 +23,7 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
-import { PostgresPasskeyCredentialRepository } from "../identity/PostgresPasskeyCredentialRepository.js";
+import { PasskeyAuthenticationRejected, PostgresPasskeyCredentialRepository } from "../identity/PostgresPasskeyCredentialRepository.js";
 import { resolveRegisteredClient, requireApplicationMethod, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
 import { inMemoryApplicationRepository } from "../identity/InMemoryApplicationRepository.js";
 import { inMemoryTenantRepository } from "../identity/InMemoryTenantRepository.js";
@@ -66,7 +66,7 @@ import {
 		type AuthorizationInteraction,
 		type AuthorizationInteractionBinding
 } from "./AuthorizationInteractionStore.js";
-import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, passkeyOfferPage, type RenderedLoginPage } from "./UniversalLoginPages.js";
+import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, passkeyManagePage, passkeyOfferPage, type RenderedLoginPage } from "./UniversalLoginPages.js";
 import type { InteractiveEmailAuthority, InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
 import {
@@ -107,6 +107,13 @@ const registrationResponseSchema = z.object({
 				clientDataJSON: base64url, attestationObject: base64url,
 				transports: z.array(z.enum(["ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb"])).max(7).optional()
 		}).passthrough()
+});
+const authenticationResponseSchema = z.object({
+		id: base64url, rawId: base64url, type: z.literal("public-key"),
+		authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
+		clientExtensionResults: z.object({}).passthrough(),
+		response: z.object({ clientDataJSON: base64url, authenticatorData: base64url,
+				signature: base64url, userHandle: base64url }).passthrough()
 });
 
 export type OIDCClient = Record<string, unknown>;
@@ -844,6 +851,13 @@ export class OIDCService {
 												return reply.code(400).send({ error: "invalid_grant" });
 										}
 								}
+								if (codeRecord.authenticationMethod === "PASSKEY") {
+										if (!featureFlags.isPasskeyAuthenticationEnabled() || !codeRecord.passkeyCredentialId ||
+											!await this.passkeyCredentials.isActive(codeRecord.passkeyCredentialId, codeRecord.userId, codeRecord.userSub)) {
+												error = "passkey_identity_not_eligible";
+												return reply.code(400).send({ error: "invalid_grant" });
+										}
+								}
 								// Release Patch 6.1: the code only carries userId/userSub -- mutable claims are re-resolved live from the
 								// Identity Registry here, so an Identity Registry update after code issuance is never missed.
 							const currentClaims = await this.resolveCurrentClaims(codeRecord.userSub);
@@ -868,7 +882,7 @@ export class OIDCService {
 							// legacy Bookwrm behavior). V2-C: when the default-off refresh grant gate is ON,
 							// issuance moves to rotating refresh-token families (PostgreSQL, hashed, one-time
 							// use); with the gate OFF the legacy Redis-stored token behavior is unchanged.
-							const issueRefreshToken = this.clientAllowsRefreshTokenGrant(client);
+							const issueRefreshToken = codeRecord.authenticationMethod !== "PASSKEY" && this.clientAllowsRefreshTokenGrant(client);
 							const accessToken = this.createOpaqueToken();
 							let refreshToken: string | undefined;
 							let legacyRefreshToken: string | undefined;
@@ -1221,7 +1235,8 @@ export class OIDCService {
 						...(user.authenticationMethod ? {
 							authenticationMethod: user.authenticationMethod,
 							authenticatedAt: user.authenticatedAt
-						} : {})
+						} : {}),
+						...(user.passkeyCredentialId ? { passkeyCredentialId: user.passkeyCredentialId } : {})
 				});
 
 				const redirectTarget = new URL(context.redirectUri);
@@ -1239,6 +1254,7 @@ export class OIDCService {
 		private applicationMethodFor(method?: AuthenticatedUser["authenticationMethod"]): AuthenticationMethod {
 				if (method === "HAPI_EMAIL") return "HAPI_EMAIL";
 				if (method === "APPLE" || method === "GOOGLE") return "EXTERNAL_OIDC";
+				if (method === "PASSKEY") return "PASSKEY";
 				return "PRIVATEID_FACE";
 		}
 
@@ -1448,6 +1464,8 @@ export class OIDCService {
 										registration.application.allowedAuthenticationMethods.includes("HAPI_EMAIL")),
 								appleAvailable: externalAllowed && Boolean(this.federatedService("APPLE")),
 								googleAvailable: externalAllowed && Boolean(this.federatedService("GOOGLE")),
+								passkeyAvailable: featureFlags.isPasskeyAuthenticationEnabled() &&
+										registration.application.allowedAuthenticationMethods.includes("PASSKEY"),
 								...(continuation ? { continueAs: continuation.subject.email ?? continuation.subject.displayName ?? "your account" } : {}),
 								...(errorMessage !== undefined ? { error: errorMessage } : {}) }));
 				};
@@ -1463,6 +1481,103 @@ export class OIDCService {
 						.redirect("/login/passkey", 303);
 				const browserProof = (request: FastifyRequest) => request.headers.cookie?.split(";").map(value => value.trim())
 						.find(value => value.startsWith(`${PASSKEY_ENROLLMENT_COOKIE}=`))?.slice(PASSKEY_ENROLLMENT_COOKIE.length + 1);
+				const freshManagementDeadline = (principal: AuthenticatedUser): number => {
+						if (principal.authenticationMethod !== "HAPI_EMAIL" && principal.authenticationMethod !== "PASSKEY") return 0;
+						const authenticatedAt = Date.parse(principal.authenticatedAt ?? "");
+						if (!Number.isFinite(authenticatedAt) || authenticatedAt > Date.now()) return 0;
+						return authenticatedAt + 300_000;
+				};
+				const activeManagementCredential = async (principal: AuthenticatedUser): Promise<boolean> =>
+						principal.authenticationMethod !== "PASSKEY" || Boolean(principal.passkeyCredentialId &&
+								await this.passkeyCredentials.isActive(principal.passkeyCredentialId, principal.id, principal.sub));
+				app.post("/login/passkey/auth/options", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/auth/options");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								if (!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) {
+										return reply.code(403).send({ error: "passkey_not_allowed" });
+								}
+								if (loaded.body.purpose !== undefined && loaded.body.purpose !== "manage") {
+										return reply.code(400).send({ error: "invalid_request" });
+								}
+								const options = await generateAuthenticationOptions({
+										rpID: new URL(this.resolveIssuer()).hostname, userVerification: "required"
+								});
+								if (!await this.interactions.beginPasskeyAuthentication(loaded.handle, loaded.interaction, options.challenge,
+										loaded.body.purpose === "manage" ? "manage" : "login")) {
+										return expired(reply);
+								}
+								return reply.header("Cache-Control", "no-store").send(options);
+						} catch {
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_AUTH_OPTIONS_UNAVAILABLE" }, "Passkey authentication options failed");
+								return reply.code(503).send({ error: "passkey_unavailable" });
+						}
+				});
+				app.post("/login/passkey/auth/verify", { bodyLimit: 131072 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/auth/verify");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								if (!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) {
+										return reply.code(403).send({ error: "passkey_not_allowed" });
+								}
+								const parsed = authenticationResponseSchema.safeParse(loaded.body.credential);
+								if (!parsed.success || parsed.data.id !== parsed.data.rawId) return reply.code(400).send({ error: "invalid_credential" });
+								const claimed = await this.interactions.claimPasskeyAuthentication(loaded.handle, loaded.interaction);
+								if (!claimed) return reply.code(400).send({ error: "invalid_challenge" });
+								const credential = parsed.data;
+								const resolved = await this.passkeyCredentials.authenticate(credential.id, credential.response.userHandle,
+										claimed.expiresAt, async stored => {
+												let verified;
+												try {
+														verified = await verifyAuthenticationResponse({
+																response: credential, expectedChallenge: claimed.challenge,
+																expectedOrigin: this.resolveIssuer(), expectedRPID: new URL(this.resolveIssuer()).hostname,
+																requireUserVerification: true,
+																// Synchronized credentials may report zero or non-monotonic counters.
+																credential: { id: stored.id, publicKey: stored.publicKey,
+																		counter: stored.backupEligible ? 0 : stored.counter }
+														});
+												} catch {
+														throw new PasskeyAuthenticationRejected();
+												}
+												if (!verified.verified) throw new PasskeyAuthenticationRejected();
+												return { counter: verified.authenticationInfo.newCounter,
+														backupEligible: verified.authenticationInfo.credentialDeviceType === "multiDevice",
+														backupState: verified.authenticationInfo.credentialBackedUp };
+										});
+								const subject = await identityRegistry.findById(resolved.subjectId);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== resolved.oidcSubject ||
+										claimed.expiresAt <= Date.now()) return reply.code(401).send({ error: "invalid_credential" });
+								const principal: AuthenticatedUser = {
+										id: subject.id, sub: subject.oidcSubject, authenticationMethod: "PASSKEY",
+										authenticatedAt: new Date().toISOString(), passkeyCredentialId: credential.id
+								};
+								if (claimed.purpose === "manage") {
+										const offered = await this.interactions.offerPasskeyEnrollment(loaded.handle, loaded.interaction, principal);
+										if (!offered) return reply.code(400).send({ error: "invalid_challenge" });
+										return reply.header("Set-Cookie", `${PASSKEY_ENROLLMENT_COOKIE}=${offered.browserProof}; Path=/; Max-Age=${AUTHORIZATION_INTERACTION_TTL_MS / 1000}; HttpOnly; Secure; SameSite=Lax`)
+												.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer")
+												.send({ redirect: "/login/passkey/manage" });
+								}
+								if (!await this.interactions.consumeExpected(loaded.handle, loaded.interaction)) {
+										return reply.code(400).send({ error: "invalid_challenge" });
+								}
+								const redirect = await this.issueAuthorizationRedirect(principal, loaded.interaction.authorization);
+								const cookies = [this.interactionCookie(null)];
+								return reply.header("Set-Cookie", cookies).header("Cache-Control", "no-store")
+										.header("Referrer-Policy", "no-referrer").send({ redirect });
+						} catch (error) {
+								if (error instanceof PasskeyAuthenticationRejected) {
+										app.log.warn({ event: "UNIVERSAL_LOGIN_PASSKEY_AUTH_REJECTED" }, "Passkey assertion rejected");
+										return reply.code(401).send({ error: "invalid_credential" });
+								}
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_AUTH_UNAVAILABLE" }, "Passkey authentication failed");
+								return reply.code(503).send({ error: "passkey_unavailable" });
+						}
+				});
 				app.get("/login/passkey", async (request, reply) => {
 						const loaded = await load(request, reply, false, "GET /login/passkey");
 						if (!loaded) return reply;
@@ -1471,7 +1586,70 @@ export class OIDCService {
 						if (!enrollment || enrollment.state !== "OFFERED") return expired(reply);
 						return send(reply, 200, passkeyOfferPage({ tenantName: loaded.interaction.binding?.tenantName,
 								clientId: loaded.interaction.clientId, csrf: loaded.interaction.csrf,
+								managementAvailable: freshManagementDeadline(enrollment.principal) > Date.now(),
 								available: !enrollment.expired && await passkeyOffered(loaded.interaction) }));
+				});
+				app.get("/login/passkey/manage", async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, false, "GET /login/passkey/manage");
+								if (!loaded) return reply;
+								const proof = browserProof(request);
+								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED" ||
+										!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) return expired(reply);
+								if (freshManagementDeadline(enrollment.principal) <= Date.now()) return reply.code(403).send({ error: "fresh_authentication_required" });
+								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
+								const subject = await identityRegistry.findById(enrollment.principal.id);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
+								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(enrollment.principal.authenticationMethod));
+								const credentials = await this.passkeyCredentials.list(subject.id, subject.oidcSubject,
+										Math.min(enrollment.expiresAt, freshManagementDeadline(enrollment.principal)), enrollment.principal.passkeyCredentialId);
+								return send(reply, 200, passkeyManagePage({ tenantName: loaded.interaction.binding?.tenantName,
+										clientId: loaded.interaction.clientId, csrf: loaded.interaction.csrf, credentials }));
+						} catch (error) {
+								if (error instanceof PasskeyAuthenticationRejected) return reply.code(403).send({ error: "fresh_authentication_required" });
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_MANAGE_UNAVAILABLE" }, "Passkey management unavailable");
+								return unavailable(reply);
+						}
+				});
+				app.post("/login/passkey/revoke", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/revoke");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								const credentialId = base64url.safeParse(loaded.body.credential_id);
+								if (!credentialId.success) return reply.code(400).send({ error: "invalid_credential" });
+								const proof = browserProof(request);
+								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED" ||
+										!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) return expired(reply);
+								const freshUntil = freshManagementDeadline(enrollment.principal);
+								if (freshUntil <= Date.now()) return reply.code(403).send({ error: "fresh_authentication_required" });
+								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
+								const subject = await identityRegistry.findById(enrollment.principal.id);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
+								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(enrollment.principal.authenticationMethod));
+								if (!await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+										subject.id, "OFFERED", "MANAGING")) return expired(reply);
+								const revoked = await this.passkeyCredentials.revoke(subject.id, subject.oidcSubject, credentialId.data,
+										Math.min(enrollment.expiresAt, freshUntil), enrollment.principal.passkeyCredentialId);
+								if (!await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+										subject.id, "MANAGING", "OFFERED")) return unavailable(reply);
+								if (!revoked) return reply.code(404).send({ error: "credential_not_found" });
+								if (credentialId.data === enrollment.principal.passkeyCredentialId) {
+										return send(reply, 200, messagePage({ title: "Passkey revoked",
+												message: "Your passkey was revoked. Start sign-in again using another method." }));
+								}
+								return reply.header("Cache-Control", "no-store").redirect("/login/passkey/manage", 303);
+						} catch (error) {
+								if (error instanceof PasskeyAuthenticationRejected) return reply.code(403).send({ error: "fresh_authentication_required" });
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_REVOKE_UNAVAILABLE" }, "Passkey revocation failed");
+								return unavailable(reply);
+						}
 				});
 				app.post("/login/passkey/options", { bodyLimit: 4096 }, async (request, reply) => {
 						try {
@@ -1490,6 +1668,10 @@ export class OIDCService {
 										this.applicationMethodFor(enrollment.principal.authenticationMethod));
 								const userHandle = await this.passkeyCredentials.userHandle(subject.id);
 								const excludeCredentials = await this.passkeyCredentials.activeCredentials(subject.id);
+								if (excludeCredentials.length && freshManagementDeadline(enrollment.principal) <= Date.now()) {
+										return reply.code(403).send({ error: "fresh_authentication_required" });
+								}
+								if (!await activeManagementCredential(enrollment.principal)) return reply.code(403).send({ error: "fresh_authentication_required" });
 								const issuer = this.resolveIssuer();
 								const options = await generateRegistrationOptions({
 										rpName: issuer === "https://id-staging.hapiinc.com" ? "HAPI ID Staging" : "HAPI ID",
@@ -1548,7 +1730,9 @@ export class OIDCService {
 										await this.passkeyCredentials.insert({
 												subjectId: subject.id, oidcSubject: subject.oidcSubject,
 												userHandle: Buffer.from(claimed.userHandle, "base64url"), authorityRef: claimed.authorityRef,
-												expiresAt: claimed.expiresAt, credential: verified.registrationInfo.credential,
+												expiresAt: claimed.expiresAt, additionalEnrollmentExpiresAt: freshManagementDeadline(claimed.principal),
+												authorizingCredentialId: claimed.principal.passkeyCredentialId,
+												credential: verified.registrationInfo.credential,
 												backupEligible: verified.registrationInfo.credentialDeviceType === "multiDevice",
 												backupState: verified.registrationInfo.credentialBackedUp
 										});
@@ -2431,7 +2615,7 @@ export class OIDCService {
 		// already held is revoked by establishSession before the new one exists.
 		private async maybeEstablishSession(request: FastifyRequest, principal: AuthenticatedUser,
 				clientId: string): Promise<string | undefined> {
-				if (!featureFlags.isPersistentSessionsEnabled() || !principal.authenticationMethod) {
+				if (!featureFlags.isPersistentSessionsEnabled() || !principal.authenticationMethod || principal.authenticationMethod === "PASSKEY") {
 						return undefined;
 				}
 				try {
@@ -2570,7 +2754,7 @@ export class OIDCService {
 						scope: rotated.family.scope,
 						issuer: this.resolveIssuer(),
 						...(rotated.family.authenticationMethod ? {
-								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE",
+								authenticationMethod: rotated.family.authenticationMethod as "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE" | "PASSKEY",
 								...(rotated.family.authenticatedAt
 										? { authenticatedAt: rotated.family.authenticatedAt } : {})
 						} : {})
@@ -2613,7 +2797,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
+			authenticationMethod?: AuthenticatedUser["authenticationMethod"];
 			authenticatedAt?: string;
 		}): Record<string, unknown> {
 			return {
@@ -2636,11 +2820,12 @@ export class OIDCService {
 
 		// Honest amr values: the actual authentication the HAPI subject performed, including the
 		// upstream provider for federated sign-ins.
-		private amrFor(method: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE"): string[] {
+		private amrFor(method: NonNullable<AuthenticatedUser["authenticationMethod"]>): string[] {
 			switch (method) {
 				case "HAPI_EMAIL": return ["email"];
 				case "APPLE": return ["apple", "fed"];
 				case "GOOGLE": return ["google", "fed"];
+				case "PASSKEY": return ["passkey"];
 				default: return ["face", "privateid"];
 			}
 		}
@@ -2656,7 +2841,7 @@ export class OIDCService {
 			name?: string;
 			iat: number;
 			exp: number;
-			authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
+			authenticationMethod?: AuthenticatedUser["authenticationMethod"];
 			authenticatedAt?: string;
 		}): Promise<string> {
 			const signing = await this.getSigningMaterial();

@@ -14,6 +14,7 @@ export type OIDCAuthorizationCode = {
 		// HAPI ID V2-E Stage 0: issuer binding. Codes minted before Stage 0 carry no issuer and
 		// are honored only by the default Bookwrm issuer.
 		issuer?: string;
-		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
+		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE" | "PASSKEY";
+		passkeyCredentialId?: string;
 		authenticatedAt?: string;
 };

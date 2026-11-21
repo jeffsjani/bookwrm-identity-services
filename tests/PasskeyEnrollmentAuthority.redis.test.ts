@@ -19,6 +19,33 @@ describe.skipIf(!port)("passkey enrollment authority (isolated Redis)", () => {
 
 	afterAll(async () => { await redis.quit(); });
 
+	it("claims a browser-bound authentication challenge once under concurrency and rejects stale interactions", async () => {
+		for (let iteration = 0; iteration < 20; iteration++) {
+			const { handle, interaction } = await store.create(base());
+			const challenge = randomBytes(32).toString("base64url");
+			expect(await store.beginPasskeyAuthentication(handle, interaction, challenge, "manage")).toBe(true);
+			const claims = await Promise.all(Array.from({ length: 20 }, () => store.claimPasskeyAuthentication(handle, interaction)));
+			expect(claims.filter(Boolean)).toHaveLength(1);
+			expect(claims.find(Boolean)).toMatchObject({ challenge, purpose: "manage" });
+			expect(await store.claimPasskeyAuthentication(handle, interaction)).toBeNull();
+			expect((await Promise.all(Array.from({ length: 20 }, () => store.consumeExpected(handle, interaction)))).filter(Boolean)).toHaveLength(1);
+		}
+		const { handle, interaction } = await store.create(base());
+		expect(await store.beginPasskeyAuthentication(handle, interaction, randomBytes(32).toString("base64url"))).toBe(true);
+		expect(await store.save(handle, { ...interaction, email: { challengeId: "changed", mode: "AUTHENTICATION" } })).toBe(true);
+		expect(await store.claimPasskeyAuthentication(handle, interaction)).toBeNull();
+		expect(await store.claimPasskeyAuthentication(handle, (await store.find(handle))!)).toBeNull();
+	});
+
+	it("rejects authentication challenges after their short-lived authority expires", async () => {
+		let now = Date.now();
+		const timedStore = new AuthorizationInteractionStore(redis, 600_000, () => now);
+		const { handle, interaction } = await timedStore.create(base());
+		expect(await timedStore.beginPasskeyAuthentication(handle, interaction, randomBytes(32).toString("base64url"))).toBe(true);
+		now += 120_001;
+		expect(await timedStore.claimPasskeyAuthentication(handle, interaction)).toBeNull();
+	});
+
 	it("allows only one offer, skip-or-enroll claim, and authorization completion under concurrency", async () => {
 		for (let iteration = 0; iteration < 20; iteration++) {
 			const { handle, interaction } = await store.create(base());

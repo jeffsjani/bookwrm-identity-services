@@ -9,13 +9,18 @@ export type RenderedLoginPage = RenderedHapiPage;
 
 const OTP_SUBMIT_SCRIPT = otpSubmitScript();
 
+function webauthnBrowserBundle(): string {
+	const browserPath = createRequire(import.meta.url).resolve("@simplewebauthn/browser");
+	return readFileSync(join(dirname(browserPath), "../dist/bundle/index.umd.min.js"), "utf8");
+}
+
 function render(title: string, heading: string, body: string, script?: string, brand?: ClientBrand): RenderedLoginPage {
 	return renderHapiPage({ title, heading, body, script, brand });
 }
 
 const heading = (tenantName?: string) => tenantName ? `Sign in to ${tenantName}` : "Sign in";
 
-export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; faceAvailable?: boolean; appleAvailable?: boolean; googleAvailable?: boolean; continueAs?: string; error?: string }): RenderedLoginPage {
+export function chooserPage(input: { tenantName?: string; clientId?: string; csrf: string; emailAvailable: boolean; faceAvailable?: boolean; appleAvailable?: boolean; googleAvailable?: boolean; passkeyAvailable?: boolean; continueAs?: string; error?: string }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
 	// Bookwrm Face is not certified for this release. A future caller must establish
 	// client/release capability and returning-user enrollment before opting in.
@@ -24,7 +29,7 @@ export function chooserPage(input: { tenantName?: string; clientId?: string; csr
 	const continueAs = input.continueAs
 		? `<form method="post" action="/login/continue">${csrfField(input.csrf)}<button type="submit">Continue as ${escapeHtml(input.continueAs)}</button></form>` : "";
 	const email = input.emailAvailable
-		? `<form method="get" action="/login/email"><button type="submit"${continueAs ? ' class="secondary"' : ""}>${brand && !faceAvailable && !input.appleAvailable && !input.googleAvailable && !continueAs ? "Continue" : "Continue with Email"}</button></form>` : "";
+		? `<form method="get" action="/login/email"><button type="submit"${continueAs ? ' class="secondary"' : ""}>${brand && !faceAvailable && !input.appleAvailable && !input.googleAvailable && !input.passkeyAvailable && !continueAs ? "Continue" : "Continue with Email"}</button></form>` : "";
 	// V2-D federated sign-in launches: server-side POSTs that mint the provider transaction; the
 	// browser never sees or chooses state/nonce values.
 	const apple = input.appleAvailable
@@ -33,6 +38,39 @@ export function chooserPage(input: { tenantName?: string; clientId?: string; csr
 		? `<form method="post" action="/login/federated/google">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Google</button></form>` : "";
 	const face = faceAvailable
 		? `<form method="post" action="/login/face">${csrfField(input.csrf)}<button type="submit" class="secondary">Continue with Face</button></form>` : "";
+	if (input.passkeyAvailable) {
+		const script = `${webauthnBrowserBundle()}
+(() => {
+	const button = document.getElementById("passkey-login-button");
+	const manage = document.getElementById("passkey-manage-button");
+	const status = document.getElementById("passkey-login-status");
+	const csrf = document.querySelector('#passkey-login input[name="csrf"]').value;
+	const authenticate = async (purpose) => {
+		button.disabled = true;
+		manage.disabled = true;
+		try {
+			const headers = { "Content-Type": "application/json" };
+			const options = await fetch("/login/passkey/auth/options", { method: "POST", headers, body: JSON.stringify({ csrf, ...(purpose ? { purpose } : {}) }) });
+			if (!options.ok) throw new Error("options failed");
+			const credential = await SimpleWebAuthnBrowser.startAuthentication({ optionsJSON: await options.json() });
+			const verification = await fetch("/login/passkey/auth/verify", { method: "POST", headers, body: JSON.stringify({ csrf, credential }) });
+			if (!verification.ok) throw new Error("verification failed");
+			window.location.assign((await verification.json()).redirect);
+		} catch {
+			status.textContent = "Passkey sign-in could not be completed. Choose another method or try again.";
+			button.disabled = false;
+			manage.disabled = false;
+		}
+	};
+	button.addEventListener("click", () => authenticate());
+	manage.addEventListener("click", () => authenticate("manage"));
+})();`;
+		return renderHapiPage({ title: heading(input.tenantName), heading: brand ? `Welcome to ${brand.brandName}` : heading(input.tenantName),
+			body: `${alert(input.error)}<p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>
+${continueAs}${email}<form id="passkey-login">${csrfField(input.csrf)}<button id="passkey-login-button" type="button" class="secondary">Continue with Passkey</button>
+<button id="passkey-manage-button" type="button" class="secondary">Manage passkeys</button></form>
+<p id="passkey-login-status" role="status" aria-live="polite"></p>${apple}${google}${face}`, script, brand, connectSelf: true });
+	}
 	return render(heading(input.tenantName), brand ? `Welcome to ${brand.brandName}` : heading(input.tenantName), `${alert(input.error)}
 <p>${brand ? "Let's get you securely into your account." : "Choose how you want to sign in."}</p>${continueAs}${email}${apple}${google}${face}`,
 		undefined, brand);
@@ -108,7 +146,7 @@ export function messagePage(input: { tenantName?: string; title: string; message
 	return render(input.title, input.title, `<p>${escapeHtml(input.message)}</p>`);
 }
 
-export function passkeyOfferPage(input: { tenantName?: string; clientId?: string; csrf: string; available?: boolean }): RenderedLoginPage {
+export function passkeyOfferPage(input: { tenantName?: string; clientId?: string; csrf: string; available?: boolean; managementAvailable?: boolean }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
 	if (input.available === false) {
 		return render(heading(input.tenantName), "Add a passkey", `
@@ -116,9 +154,7 @@ export function passkeyOfferPage(input: { tenantName?: string; clientId?: string
 <form id="passkey-skip" method="post" action="/login/passkey/skip">${csrfField(input.csrf)}
 <button type="submit" class="secondary">Not Now</button></form>`, undefined, brand);
 	}
-	const browserPath = createRequire(import.meta.url).resolve("@simplewebauthn/browser");
-	const browser = readFileSync(join(dirname(browserPath), "../dist/bundle/index.umd.min.js"), "utf8");
-	const script = `${browser}
+	const script = `${webauthnBrowserBundle()}
 (() => {
 	const button = document.getElementById("passkey-add");
 	const status = document.getElementById("passkey-status");
@@ -149,6 +185,19 @@ export function passkeyOfferPage(input: { tenantName?: string; clientId?: string
 <p>Add a passkey for future sign-in.</p>
 <button id="passkey-add" type="button">Add Passkey</button>
 <p id="passkey-status" role="status" aria-live="polite"></p>
+${input.managementAvailable ? '<p><a href="/login/passkey/manage">Manage passkeys</a></p>' :
+	'<p>To manage existing passkeys or add another, sign in with email or an existing passkey.</p>'}
 <form id="passkey-skip" method="post" action="/login/passkey/skip">${csrfField(input.csrf)}
 <button type="submit" class="secondary">Not Now</button></form>`, script, brand, connectSelf: true });
+}
+
+export function passkeyManagePage(input: { tenantName?: string; clientId?: string; csrf: string;
+	credentials: { id: string; createdAt: Date }[] }): RenderedLoginPage {
+	const items = input.credentials.map((credential, index) => `<li>Passkey ${index + 1} - added ${escapeHtml(credential.createdAt.toISOString().slice(0, 10))}
+<form method="post" action="/login/passkey/revoke">${csrfField(input.csrf)}
+<input type="hidden" name="credential_id" value="${escapeHtml(credential.id)}">
+<button type="submit" class="secondary">Revoke passkey ${index + 1}</button></form></li>`).join("");
+	return render(heading(input.tenantName), "Manage passkeys",
+		`${items ? `<ul>${items}</ul>` : "<p>No passkeys registered.</p>"}<p><a href="/login/passkey">Back</a></p>`,
+		undefined, brandForClient(input.clientId));
 }

@@ -3,6 +3,7 @@ import { Writable } from "node:stream";
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { chromium, type Browser, type Page } from "playwright";
+import { decodeProtectedHeader, importJWK, jwtVerify } from "jose";
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import formbody from "@fastify/formbody";
 import { JSDOM } from "jsdom";
@@ -40,7 +41,8 @@ import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } 
 import { protectStagingConsoleInternalLogs } from "../src/oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "../src/security/RequestLogging.js";
 import { PostgresPasskeyCredentialRepository } from "../src/identity/PostgresPasskeyCredentialRepository.js";
-import type { PublicKeyCredentialCreationOptionsJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
+import type { AuthenticationResponseJSON, PublicKeyCredentialCreationOptionsJSON,
+	PublicKeyCredentialRequestOptionsJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 
 const REDIRECT = "https://rp.example/callback";
 const CLIENT_ID = "ul-client";
@@ -1185,7 +1187,7 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		return { f, redis, store, credentials, interaction, headers, options, verify, close };
 	}
 
-	async function authenticator(): Promise<{ page: Page; close: () => Promise<void> }> {
+	async function authenticator(synchronized = false): Promise<{ page: Page; close: () => Promise<void> }> {
 		const context = await browser.newContext();
 		const page = await context.newPage();
 		await page.route(`${stagingOrigin}/**`, route => route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" }));
@@ -1194,7 +1196,7 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		await cdp.send("WebAuthn.enable");
 		await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
 			protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true,
-			isUserVerified: true, automaticPresenceSimulation: true
+			isUserVerified: true, automaticPresenceSimulation: true, defaultBackupEligibility: synchronized
 		} });
 		await page.addScriptTag({ path: "node_modules/@simplewebauthn/browser/dist/bundle/index.umd.min.js" });
 		return { page, close: () => context.close() };
@@ -1208,6 +1210,378 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			return webauthn.startRegistration({ optionsJSON: opts });
 		}, options);
 	}
+
+	async function createAssertion(page: Page, options: PublicKeyCredentialRequestOptionsJSON): Promise<AuthenticationResponseJSON> {
+		return page.evaluate(async opts => {
+			const webauthn = (globalThis as typeof globalThis & {
+				SimpleWebAuthnBrowser: { startAuthentication(input: { optionsJSON: typeof opts }): Promise<AuthenticationResponseJSON> }
+			}).SimpleWebAuthnBrowser;
+			return webauthn.startAuthentication({ optionsJSON: opts });
+		}, options);
+	}
+
+	async function enroll(t: Awaited<ReturnType<typeof setup>>, page: Page) {
+		const options = await t.options();
+		expect(options.statusCode, options.body).toBe(200);
+		const credential = await createCredential(page, options.json());
+		expect((await t.verify(credential)).statusCode).toBe(200);
+		return credential;
+	}
+
+	async function beginPasskeyLogin(t: Awaited<ReturnType<typeof setup>>) {
+		const interaction = await beginInteraction(t.f, "p".repeat(43));
+		const headers = { ...interaction.cookie, origin: stagingOrigin };
+		const options = (purpose?: "manage") => t.f.app.inject({ method: "POST", url: "/login/passkey/auth/options",
+			headers, payload: { csrf: interaction.csrf, ...(purpose ? { purpose } : {}) } });
+		const verify = (credential: AuthenticationResponseJSON) => t.f.app.inject({ method: "POST", url: "/login/passkey/auth/verify",
+			headers, payload: { csrf: interaction.csrf, credential } });
+		return { interaction, headers, options, verify };
+	}
+
+	it("enrolls and signs in twice with a passkey, PKCE, a signed ID token and matching UserInfo", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			await enroll(t, a.page);
+			const emailCount = t.f.delivery.messages.length;
+			t.f.oidcClient.grant_types = ["authorization_code", "refresh_token"];
+			vi.stubEnv("HAPI_PERSISTENT_SESSIONS_ENABLED", "true");
+			vi.stubEnv("HAPI_REFRESH_GRANT_ENABLED", "true");
+			configuration.reload();
+			for (let attempt = 0; attempt < 2; attempt++) {
+				const login = await beginPasskeyLogin(t);
+				expect(login.interaction.chooser.body).toContain("Continue with Passkey");
+				const response = await login.options();
+				expect(response.statusCode, response.body).toBe(200);
+				const options = response.json<PublicKeyCredentialRequestOptionsJSON>();
+				expect(options.userVerification).toBe("required");
+				expect(options.allowCredentials ?? []).toHaveLength(0);
+				const assertion = await createAssertion(a.page, options);
+				const results = await Promise.all(Array.from({ length: 8 }, () => login.verify(assertion)));
+				const success = results.filter(result => result.statusCode === 200);
+				expect(success).toHaveLength(1);
+				expect(setCookies(success[0]).some(value => value.startsWith("__Host-hapi_session="))).toBe(false);
+				const callback = new URL(success[0].json().redirect);
+				const token = await t.f.app.inject({ method: "POST", url: "/token", headers: t.f.basic,
+					payload: { grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+						redirect_uri: REDIRECT, code_verifier: "p".repeat(43) } });
+				expect(token.statusCode, token.body).toBe(200);
+				expect(token.json().refresh_token).toBeUndefined();
+				const idToken = token.json().id_token;
+				const jwks = (await t.f.app.inject({ method: "GET", url: "/jwks" })).json().keys;
+				const jwk = jwks.find((key: { kid?: string }) => key.kid === decodeProtectedHeader(idToken).kid);
+				const verified = await jwtVerify(idToken, await importJWK(jwk, "RS256"), { issuer: stagingOrigin, audience: CLIENT_ID });
+				expect(verified.payload).toMatchObject({ sub: t.f.subject.oidcSubject, amr: ["passkey"] });
+				const userinfo = await t.f.app.inject({ method: "GET", url: "/userinfo",
+					headers: { authorization: `Bearer ${token.json().access_token}` } });
+				expect(userinfo.statusCode, userinfo.body).toBe(200);
+				expect(userinfo.json().sub).toBe(verified.payload.sub);
+				expect((await login.verify(assertion)).statusCode).not.toBe(200);
+			}
+			expect(t.f.delivery.messages).toHaveLength(emailCount);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it.each(["challenge", "origin", "rp", "signature", "user verification", "unknown", "user handle"] as const)(
+		"rejects an assertion with invalid %s", async kind => {
+			const t = await setup();
+			const a = await authenticator();
+			try {
+				await enroll(t, a.page);
+				const login = await beginPasskeyLogin(t);
+				const opts = await login.options();
+				const assertion = await createAssertion(a.page, opts.json());
+				if (kind === "origin" || kind === "challenge") {
+					const data = JSON.parse(Buffer.from(assertion.response.clientDataJSON, "base64url").toString("utf8"));
+					if (kind === "origin") data.origin = "https://evil.example";
+					else data.challenge = randomBytes(32).toString("base64url");
+					assertion.response.clientDataJSON = Buffer.from(JSON.stringify(data)).toString("base64url");
+				} else if (kind === "rp" || kind === "user verification") {
+					const data = Buffer.from(assertion.response.authenticatorData, "base64url");
+					if (kind === "rp") data[0] ^= 1;
+					else data[32] &= ~0x04;
+					assertion.response.authenticatorData = data.toString("base64url");
+				} else if (kind === "signature") {
+					const data = Buffer.from(assertion.response.signature, "base64url");
+					data[data.length - 1] ^= 1;
+					assertion.response.signature = data.toString("base64url");
+				} else if (kind === "unknown") {
+					assertion.id = randomBytes(32).toString("base64url");
+					assertion.rawId = assertion.id;
+				} else {
+					assertion.response.userHandle = randomBytes(32).toString("base64url");
+				}
+				expect((await login.verify(assertion)).statusCode).toBe(401);
+				expect((await login.verify(assertion)).statusCode).not.toBe(200);
+			} finally { await a.close(); await t.close(); }
+		}, 30_000);
+
+	it("enforces single-device counters while allowing non-monotonic synchronized passkey counters", async () => {
+		for (const synced of [false, true]) {
+			const t = await setup();
+			const a = await authenticator(synced);
+			try {
+				const credential = await enroll(t, a.page);
+				await pool.query("UPDATE passkey_credentials SET signature_counter = 100 WHERE credential_id = $1", [credential.id]);
+				const login = await beginPasskeyLogin(t);
+				const assertion = await createAssertion(a.page, (await login.options()).json());
+				const result = await login.verify(assertion);
+				expect(result.statusCode, result.body).toBe(synced ? 200 : 401);
+				const row = (await pool.query("SELECT signature_counter, backup_eligible FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0];
+				expect(Number(row.signature_counter)).toBe(100);
+				expect(row.backup_eligible).toBe(synced);
+			} finally { await a.close(); await t.close(); vi.restoreAllMocks(); }
+		}
+	}, 30_000);
+
+	it("runs the actual passkey login chooser and browser ceremony", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			await enroll(t, a.page);
+			const login = await beginPasskeyLogin(t);
+			await a.page.unroute(`${stagingOrigin}/**`);
+			await a.page.context().addCookies([{ name: "__Host-hapi_login", value: login.interaction.handle, url: stagingOrigin, secure: true }]);
+			await a.page.route(`${stagingOrigin}/**`, async route => {
+				const request = route.request();
+				const url = new URL(request.url());
+				const response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
+					url: `${url.pathname}${url.search}`, headers: await request.allHeaders(),
+					...(request.postData() ? { payload: request.postData()! } : {}) });
+				const headers: Record<string, string> = {};
+				for (const name of ["content-type", "content-security-policy", "cache-control"]) {
+					const value = response.headers[name];
+					if (typeof value === "string") headers[name] = value;
+				}
+				await route.fulfill({ status: response.statusCode, headers, body: response.body });
+			});
+			await a.page.route("https://rp.example/**", route => route.fulfill({ status: 200, body: "completed" }));
+			await a.page.goto(`${stagingOrigin}/login`);
+			await a.page.getByRole("button", { name: "Continue with Passkey" }).click();
+			await a.page.waitForURL("https://rp.example/**", { timeout: 10_000 });
+			expect(new URL(a.page.url()).searchParams.has("code")).toBe(true);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("requires fresh subject-bound management and rejects revoked or foreign credentials", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const credential = await enroll(t, a.page);
+			const other = randomUUID();
+			const otherSub = randomUUID();
+			await pool.query(`INSERT INTO identity_subjects
+				(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
+				VALUES ($1, $2, 'HAPI_EMAIL', $3, 'ACTIVE', now(), now())`, [other, otherSub, `test-${other}`]);
+			const foreign = randomBytes(32).toString("base64url");
+			await t.credentials.insert({ subjectId: other, oidcSubject: otherSub, userHandle: await t.credentials.userHandle(other),
+				authorityRef: randomUUID(), expiresAt: Date.now() + 60_000,
+				credential: { id: foreign, publicKey: Uint8Array.from([1]), counter: 0 }, backupEligible: false, backupState: false });
+			const login = await beginPasskeyLogin(t);
+			expect((await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers: login.headers })).statusCode).not.toBe(200);
+			const opts = await login.options("manage");
+			const assertion = await createAssertion(a.page, opts.json());
+			const verified = await login.verify(assertion);
+			expect(verified.statusCode, verified.body).toBe(200);
+			expect(verified.json().redirect).toBe("/login/passkey/manage");
+			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
+			const management = await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers });
+			expect(management.statusCode, management.body).toBe(200);
+			expect(management.body).toContain(credential.id);
+			expect(management.body).not.toContain(foreign);
+			const revoke = (id: string, csrf = login.interaction.csrf, origin = stagingOrigin) =>
+				t.f.app.inject({ method: "POST", url: "/login/passkey/revoke", headers: { ...headers, origin },
+					payload: { csrf, credential_id: id } });
+			expect((await revoke(foreign, "wrong")).statusCode).toBe(400);
+			expect((await revoke(foreign, login.interaction.csrf, "https://evil.example")).statusCode).toBe(403);
+			expect((await revoke(foreign)).statusCode).toBe(404);
+			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [foreign])).rows[0].revoked_at).toBeNull();
+			expect((await revoke(credential.id)).statusCode).toBe(200);
+			expect((await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers })).statusCode).toBe(403);
+			const retry = await beginPasskeyLogin(t);
+			const retryAssertion = await createAssertion(a.page, (await retry.options()).json());
+			expect((await retry.verify(retryAssertion)).statusCode).toBe(401);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it.each(["GOOGLE", "HAPI_EMAIL"] as const)("rejects management and additional enrollment without fresh %s authentication", async method => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			await enroll(t, a.page);
+			const login = await beginPasskeyLogin(t);
+			const interaction = (await t.store.find(login.interaction.handle))!;
+			const offered = await t.store.offerPasskeyEnrollment(login.interaction.handle, interaction, {
+				id: t.f.subject.id, sub: t.f.subject.oidcSubject, authenticationMethod: method,
+				authenticatedAt: new Date(Date.now() - (method === "HAPI_EMAIL" ? 300_001 : 0)).toISOString()
+			});
+			const headers = { ...login.headers, cookie: `${login.headers.cookie}; __Host-hapi_passkey=${offered!.browserProof}` };
+			expect((await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers })).statusCode).toBe(403);
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+				headers, payload: { csrf: login.interaction.csrf } })).statusCode).toBe(403);
+			const handle = await t.credentials.userHandle(t.f.subject.id);
+			await expect(t.credentials.insert({ subjectId: t.f.subject.id, oidcSubject: t.f.subject.oidcSubject,
+				userHandle: handle, authorityRef: randomUUID(), expiresAt: Date.now() + 60_000,
+				credential: { id: randomBytes(32).toString("base64url"), publicKey: Uint8Array.from([1]), counter: 0 },
+				backupEligible: false, backupState: false })).rejects.toThrow("Fresh authentication required");
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("runs passkey reauthentication and self-revocation from the browser", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const credential = await enroll(t, a.page);
+			const login = await beginPasskeyLogin(t);
+			await a.page.unroute(`${stagingOrigin}/**`);
+			await a.page.context().addCookies([{ name: "__Host-hapi_login", value: login.interaction.handle, url: stagingOrigin, secure: true }]);
+			await a.page.route(`${stagingOrigin}/**`, async route => {
+				const request = route.request();
+				const url = new URL(request.url());
+				const response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
+					url: `${url.pathname}${url.search}`, headers: await request.allHeaders(),
+					...(request.postData() ? { payload: request.postData()! } : {}) });
+				const headers: Record<string, string> = {};
+				for (const name of ["content-type", "content-security-policy", "cache-control", "location", "set-cookie"]) {
+					const value = response.headers[name];
+					if (typeof value === "string") headers[name] = value;
+				}
+				await route.fulfill({ status: response.statusCode, headers, body: response.body });
+			});
+			await a.page.goto(`${stagingOrigin}/login`);
+			await a.page.getByRole("button", { name: "Manage passkeys" }).click();
+			await a.page.waitForURL(`${stagingOrigin}/login/passkey/manage`, { timeout: 10_000 });
+			await a.page.getByRole("button", { name: "Revoke passkey 1" }).click();
+			await a.page.getByText("Your passkey was revoked. Start sign-in again using another method.").waitFor();
+			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0].revoked_at).not.toBeNull();
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("rejects incorrect PKCE and a credential revoked before code redemption", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const credential = await enroll(t, a.page);
+			for (const failure of ["pkce", "revoked"] as const) {
+				const login = await beginPasskeyLogin(t);
+				const assertion = await createAssertion(a.page, (await login.options()).json());
+				const verified = await login.verify(assertion);
+				expect(verified.statusCode).toBe(200);
+				const code = new URL(verified.json().redirect).searchParams.get("code")!;
+				if (failure === "revoked") {
+					expect(await t.credentials.revoke(t.f.subject.id, t.f.subject.oidcSubject, credential.id, Date.now() + 60_000)).toBe(true);
+				}
+				const token = await t.f.app.inject({ method: "POST", url: "/token", headers: t.f.basic,
+					payload: { grant_type: "authorization_code", code, redirect_uri: REDIRECT,
+						code_verifier: failure === "pkce" ? "x".repeat(43) : "p".repeat(43) } });
+				expect(token.statusCode).toBe(400);
+			}
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("adds a second credential after passkey reauthentication and preserves its owner", async () => {
+		const t = await setup();
+		const first = await authenticator();
+		const second = await authenticator();
+		try {
+			const initial = await enroll(t, first.page);
+			const login = await beginPasskeyLogin(t);
+			const assertion = await createAssertion(first.page, (await login.options("manage")).json());
+			const verified = await login.verify(assertion);
+			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
+			const options = await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+				headers, payload: { csrf: login.interaction.csrf } });
+			expect(options.statusCode, options.body).toBe(200);
+			const additional = await createCredential(second.page, options.json());
+			const result = await t.f.app.inject({ method: "POST", url: "/login/passkey/verify",
+				headers, payload: { csrf: login.interaction.csrf, credential: additional } });
+			expect(result.statusCode, result.body).toBe(200);
+			const rows = await pool.query("SELECT credential_id, identity_subject_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(2);
+			expect(rows.rows.map(row => row.credential_id)).toEqual(expect.arrayContaining([initial.id, additional.id]));
+			expect(rows.rows.every(row => row.identity_subject_id === t.f.subject.id)).toBe(true);
+		} finally { await second.close(); await first.close(); await t.close(); }
+	}, 30_000);
+
+	it("fails closed for expired challenges and Redis or PostgreSQL assertion failures", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			await enroll(t, a.page);
+			const before = (await pool.query("SELECT signature_counter, last_used_at FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id])).rows[0];
+			for (const failure of ["expired", "redis", "database"] as const) {
+				const login = await beginPasskeyLogin(t);
+				const assertion = await createAssertion(a.page, (await login.options()).json());
+				if (failure === "expired") {
+					const hash = createHash("sha256").update(login.interaction.handle).digest("base64url");
+					await t.redis.pexpire(oidcRedisKey(`interaction_passkey_authentication:${hash}`), 1);
+					await new Promise(resolve => setTimeout(resolve, 20));
+				} else if (failure === "redis") {
+					vi.spyOn(t.store, "claimPasskeyAuthentication").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+				} else {
+					await pool.query(`CREATE FUNCTION reject_test_assertion() RETURNS trigger LANGUAGE plpgsql AS $$
+						BEGIN RAISE EXCEPTION 'synthetic assertion failure'; END $$`);
+					await pool.query(`CREATE TRIGGER reject_test_assertion AFTER UPDATE ON passkey_credentials
+						FOR EACH ROW EXECUTE FUNCTION reject_test_assertion()`);
+				}
+				const result = await login.verify(assertion);
+				expect(result.statusCode, result.body).toBe(failure === "expired" ? 400 : 503);
+			}
+			const rows = await pool.query("SELECT signature_counter, last_used_at FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows[0]).toEqual(before);
+		} finally {
+			await pool.query("DROP TRIGGER IF EXISTS reject_test_assertion ON passkey_credentials");
+			await pool.query("DROP FUNCTION IF EXISTS reject_test_assertion()");
+			await a.close(); await t.close();
+		}
+	}, 30_000);
+
+	it("fails closed on Redis and PostgreSQL errors while revoking", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const credential = await enroll(t, a.page);
+			const login = await beginPasskeyLogin(t);
+			const assertion = await createAssertion(a.page, (await login.options("manage")).json());
+			const verified = await login.verify(assertion);
+			const proof = setCookies(verified).find(value => value.startsWith("__Host-hapi_passkey="))!.split(";")[0];
+			const headers = { ...login.headers, cookie: `${login.headers.cookie}; ${proof}` };
+			const revoke = () => t.f.app.inject({ method: "POST", url: "/login/passkey/revoke",
+				headers, payload: { csrf: login.interaction.csrf, credential_id: credential.id } });
+			vi.spyOn(t.store, "transitionPasskeyEnrollment").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+			expect((await revoke()).statusCode).toBe(503);
+			await pool.query(`CREATE FUNCTION reject_test_revoke() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'synthetic revocation failure'; END $$`);
+			await pool.query(`CREATE TRIGGER reject_test_revoke AFTER UPDATE ON passkey_credentials
+				FOR EACH ROW EXECUTE FUNCTION reject_test_revoke()`);
+			expect((await revoke()).statusCode).toBe(503);
+			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0].revoked_at).toBeNull();
+		} finally {
+			await pool.query("DROP TRIGGER IF EXISTS reject_test_revoke ON passkey_credentials");
+			await pool.query("DROP FUNCTION IF EXISTS reject_test_revoke()");
+			await a.close(); await t.close();
+		}
+	}, 30_000);
+
+	it("hides and rejects passkey login when the feature or application capability is disabled", async () => {
+		const t = await setup();
+		try {
+			vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "false");
+			configuration.reload();
+			const disabled = await beginPasskeyLogin(t);
+			expect(disabled.interaction.chooser.body).not.toContain("Continue with Passkey");
+			expect((await disabled.options()).statusCode).toBe(403);
+			vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "true");
+			configuration.reload();
+			const app = (await t.f.h1.applications.findById(t.f.applicationId))!;
+			await t.f.h1.applications.upsert({ ...app, allowedAuthenticationMethods: app.allowedAuthenticationMethods.filter(method => method !== "PASSKEY") });
+			const forbidden = await beginPasskeyLogin(t);
+			expect(forbidden.interaction.chooser.body).not.toContain("Continue with Passkey");
+			expect((await forbidden.options()).statusCode).toBe(403);
+		} finally { await t.close(); }
+	}, 30_000);
 
 	it("persists a verified browser credential for the exact subject and completes OIDC once", async () => {
 		const t = await setup();
@@ -1450,15 +1824,18 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			const row = (await pool.query("SELECT identity_subject_id, enrollment_authority_ref FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0];
 			const winner = inputs.find(input => input.subjectId === row.identity_subject_id)!;
 			await expect(t.credentials.insert({ ...winner, authorityRef: row.enrollment_authority_ref,
-				expiresAt: Date.now() + 60_000, credential: { ...credential, id: randomBytes(32).toString("base64url") },
+				expiresAt: Date.now() + 60_000, additionalEnrollmentExpiresAt: Date.now() + 60_000,
+				credential: { ...credential, id: randomBytes(32).toString("base64url") },
 				backupEligible: false, backupState: false })).rejects.toMatchObject({ code: "23505" });
 			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE enrollment_authority_ref = $1",
 				[row.enrollment_authority_ref])).rows).toHaveLength(1);
 			await t.credentials.insert({ ...winner, authorityRef: randomUUID(), expiresAt: Date.now() + 60_000,
+				additionalEnrollmentExpiresAt: Date.now() + 60_000,
 				credential: { ...credential, id: randomBytes(32).toString("base64url") }, backupEligible: false, backupState: false });
 			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [winner.subjectId])).rows).toHaveLength(2);
 			const expiredId = randomBytes(32).toString("base64url");
 			await expect(t.credentials.insert({ ...winner, authorityRef: randomUUID(), expiresAt: Date.now() - 1,
+				additionalEnrollmentExpiresAt: Date.now() + 60_000,
 				credential: { ...credential, id: expiredId }, backupEligible: false, backupState: false }))
 				.rejects.toThrow("authority expired");
 			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE credential_id = $1", [expiredId])).rows).toHaveLength(0);

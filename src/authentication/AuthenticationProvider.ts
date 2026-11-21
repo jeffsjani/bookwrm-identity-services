@@ -4,7 +4,8 @@ export type AuthenticatedUser = {
 		email?: string;
 		emailVerified?: boolean;
 		name?: string;
-		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE";
+		authenticationMethod?: "HAPI_EMAIL" | "PRIVATEID_FACE" | "APPLE" | "GOOGLE" | "PASSKEY";
+		passkeyCredentialId?: string;
 		authenticatedAt?: string;
 		assurance?: "email_otp" | "face" | "federated";
 };
