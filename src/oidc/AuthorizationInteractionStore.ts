@@ -47,6 +47,7 @@ export type AuthorizationInteraction = {
 		isPrivateRelayEmail: boolean;
 		evidenceReference: string;
 		verifiedAt: number;
+		linkExisting?: boolean;
 	};
 };
 

@@ -48,7 +48,7 @@ export function federatedAccountChoicePage(input: { tenantName?: string; clientI
 <button type="submit">Create a new account</button></form>
 <form method="post" action="/login/federated/complete">${csrfField(input.csrf)}<input type="hidden" name="choice" value="email">
 <button type="submit" class="secondary">I already have an account — sign in with email</button></form>
-<p>After signing in with email you can connect ${providerName} from your account's sign-in settings.</p>`,
+<p>${input.provider === "APPLE" ? "Verify your existing account by email, then confirm that you want to connect Apple." : "After signing in with email you can connect Google from your account's sign-in settings."}</p>`,
 		undefined, brand);
 }
 
@@ -71,14 +71,18 @@ export function emailPage(input: { tenantName?: string; clientId?: string; csrf:
 	return render(heading(input.tenantName), brand ? `Welcome to ${brand.brandName}` : heading(input.tenantName), content, undefined, brand);
 }
 
-export function codePage(input: { tenantName?: string; clientId?: string; csrf: string; error?: string; notice?: string }): RenderedLoginPage {
+export function codePage(input: { tenantName?: string; clientId?: string; csrf: string; error?: string; notice?: string; connectApple?: boolean }): RenderedLoginPage {
 	const brand = brandForClient(input.clientId);
+	const consent = input.connectApple
+		? `<label><input type="checkbox" name="connect_apple" value="yes" required> I authorize connecting this Apple sign-in to my existing HAPI account.</label>`
+		: "";
 	const content = brand
 		? `${alert(input.error)}${alert(input.notice, "notice")}
 <p class="progress">STEP 2 OF 2</p><p>We sent a verification code to the email address you entered.</p>
 <form id="otp-form" method="post" action="/login/email/code" aria-busy="false">${csrfField(input.csrf)}
 <label class="visually-hidden" for="code">Six-digit verification code</label>
 <input class="otp-code" id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,9}" maxlength="9" aria-label="Six-digit verification code" required autofocus>
+${consent}
 <button id="otp-submit" type="submit">Verify &amp; Continue</button></form>
 <p>Didn't receive it?</p>
 <form id="resend-form" method="post" action="/login/email/resend" aria-busy="false">${csrfField(input.csrf)}<button id="resend-submit" type="submit" class="secondary">Resend code</button></form>
@@ -88,6 +92,7 @@ export function codePage(input: { tenantName?: string; clientId?: string; csrf: 
 <form id="otp-form" method="post" action="/login/email/code" aria-busy="false">${csrfField(input.csrf)}
 <label for="code">Verification code</label>
 <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,9}" maxlength="9" required autofocus>
+${consent}
 <button id="otp-submit" type="submit">Continue</button></form>
 <form id="resend-form" method="post" action="/login/email/resend" aria-busy="false">${csrfField(input.csrf)}<button id="resend-submit" type="submit" class="secondary">Send a new code</button></form>
 <p id="otp-status" role="status" aria-live="polite"></p>

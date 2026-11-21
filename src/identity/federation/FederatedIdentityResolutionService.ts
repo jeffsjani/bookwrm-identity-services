@@ -54,9 +54,19 @@ export class FederatedIdentityResolutionService {
 				return { status: "linked", subject, externalIdentity };
 		}
 
+		linkExisting(identitySubjectId: string, verified: VerifiedFederatedIdentity) {
+				return this.federation.linkExternalIdentity({
+						identitySubjectId,
+						provider: verified.provider,
+						providerIssuer: verified.providerIssuer,
+						providerSubject: verified.providerSubject,
+						providerClientContext: verified.audience,
+						evidenceReference: verified.evidenceReference
+				});
+		}
+
 		// Safe first-time registration: mints a brand-new HAPI subject for an unknown provider
-		// identity and links it explicitly. Never attaches to any existing subject -- explicit
-		// linking of existing accounts happens only through the authenticated account-linking API.
+		// identity and links it explicitly. Never attaches to any existing subject.
 		async registerFirstTime(verified: VerifiedFederatedIdentity, correlationId?: string): Promise<FederatedRegistrationResult> {
 				const subject = await this.registry.resolveOrCreate({
 						provider: REGISTRY_PROVIDER[verified.provider],

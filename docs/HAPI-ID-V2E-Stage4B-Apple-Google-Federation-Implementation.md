@@ -28,7 +28,7 @@ The repository already contains:
 - Apple private-relay metadata handling
 - Stable external-identity binding by exact issuer and subject
 - Explicit first-time registration choice
-- Existing-account linking only through the authenticated account-linking API
+- Existing-account linking through email OTP and explicit confirmation in Universal Login
 
 Minimal gap closed in this build:
 
@@ -76,8 +76,29 @@ Both providers reuse:
 - Revocation/link checks before authorization-code redemption
 
 Unknown provider identities do not automatically resolve or merge with an existing email subject.
-The implementation presents an explicit create-versus-email choice; authenticated account linking is
-handled by the separate account-linking API.
+The implementation presents an explicit create-versus-email choice. For Apple, choosing an existing
+account requires email OTP and an explicit connection confirmation; the verified Apple identity is
+linked transactionally to the authenticated subject before the authorization flow completes.
+Unknown email addresses cannot register a new account in this path. Google retains its existing
+separate account-linking behavior.
+
+### Read-only staging binding check
+
+The staging binding was not inspected: no explicitly identified read-only staging database connection
+was available. An authorized operator can run the following parameterized query in a read-only
+transaction, supplying the verified Apple issuer, verified Apple subject, and expected HAPI
+`identity_subjects.id` as `$1`, `$2`, and `$3`. Disable parameter logging and do not display or
+record those values. The output contains only a classification, not identity values.
+
+```sql
+BEGIN READ ONLY;
+SELECT CASE WHEN count(*) = 0 THEN 'not_linked'
+            WHEN bool_and(identity_subject_id = $3::uuid) THEN 'linked_to_expected_account'
+            ELSE 'linked_to_different_account' END AS binding_state
+FROM external_identities
+WHERE provider = 'APPLE' AND provider_issuer = $1 AND provider_subject = $2 AND status = 'linked';
+ROLLBACK;
+```
 
 ## 4. Universal Login UI
 

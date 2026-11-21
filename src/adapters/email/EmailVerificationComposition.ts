@@ -94,7 +94,7 @@ export function interactiveEmailAuthentication(authentication: EmailAuthenticati
 	const h1 = ({ context, clientId }: InteractiveEmailAuthority) => ({ context, clientId });
 	return {
 		authority: clientId => resolveH1ClientAuthority(clientId, authority),
-		async start(authorized, email) {
+		async start(authorized, email, options) {
 			const normalizedEmail = normalizeEmail(email);
 			let mode: "AUTHENTICATION" | "REGISTRATION" | "INELIGIBLE" = "AUTHENTICATION";
 			if (registrationFlow?.registration) {
@@ -105,7 +105,7 @@ export function interactiveEmailAuthentication(authentication: EmailAuthenticati
 				const claimed = [...new Map([...byEmail, ...(byProviderSubject ? [byProviderSubject] : [])]
 					.map(subject => [subject.id, subject])).values()];
 				if (claimed.length === 0) {
-					mode = "REGISTRATION";
+					mode = options?.authenticationOnly ? "INELIGIBLE" : "REGISTRATION";
 				} else if (claimed.length !== 1 || !isEligibleEmailSubject(claimed[0], normalizedEmail)) {
 					mode = "INELIGIBLE";
 				}

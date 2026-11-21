@@ -1,5 +1,5 @@
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet } from "jose";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import formbody from "@fastify/formbody";
@@ -33,6 +33,20 @@ import { InMemoryHapiSessionRepository } from "../src/identity/sessions/InMemory
 import type { AuthenticationMethod } from "../src/models/Application.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { serializeRequestForLog } from "../src/security/RequestLogging.js";
+import { AuthorizationInteractionStore } from "../src/oidc/AuthorizationInteractionStore.js";
+import { EmailVerificationService } from "../src/email/EmailVerificationService.js";
+import { InMemoryVerificationChallengeRepository } from "../src/email/InMemoryVerificationChallengeRepository.js";
+import { InMemoryEmailDeliveryProvider } from "../src/email/EmailDeliveryProvider.js";
+import { VerificationSecrets } from "../src/email/VerificationSecrets.js";
+import { defaultVerificationPolicy } from "../src/email/VerificationPolicy.js";
+import { EmailAuthenticationService } from "../src/authentication/email/EmailAuthenticationService.js";
+import { EmailAuthenticationError, type EmailAuthenticationRepository, type EmailPrincipal } from "../src/authentication/email/EmailAuthenticationTypes.js";
+import { interactiveEmailAuthentication } from "../src/adapters/email/EmailVerificationComposition.js";
+import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
+import { RegistrationService } from "../src/registration/RegistrationService.js";
+import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
+import pg from "pg";
+import { PostgresExternalIdentityRepository } from "../src/identity/PostgresExternalIdentityRepository.js";
 
 // HAPI ID V2-D Phases 4/6: HAPI-hosted Apple/Google Universal Login certification. Every provider
 // artifact (keys, codes, tokens, endpoints) is synthetic; no live provider is ever contacted.
@@ -103,6 +117,7 @@ async function federatedFixture(options: {
 } = {}) {
 	ensureOidcTestEnvironment();
 	setFlags({ ...DEFAULT_FLAGS, ...(options.flags ?? {}) });
+	await getRedisClient().del(oidcRedisKey("ratelimit:ip:127.0.0.1"), oidcRedisKey(`ratelimit:client:${CLIENT_ID}`));
 
 	const tenantId = randomUUID();
 	const applicationId = randomUUID();
@@ -194,11 +209,73 @@ async function federatedFixture(options: {
 	vi.spyOn(identityRegistry, "findByOidcSubject").mockImplementation(sub => subjects.findByOidcSubject(sub));
 	vi.spyOn(identityRegistry, "findById").mockImplementation(id => subjects.findById(id));
 
-	return { app, subjects, registry, federation, externalRepository, transactions, sessions, sessionRepository,
+	return { app, oidc, h1, subjects, registry, federation, externalRepository, transactions, sessions, sessionRepository,
 		identities, codes, tenantId, applicationId, logs };
 }
 
 type Fixture = Awaited<ReturnType<typeof federatedFixture>>;
+
+async function enableEmail(f: Fixture) {
+	const email = "existing@example.test";
+	const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(), applicationId: f.applicationId,
+		primaryProvider: "HAPI_EMAIL", primaryProviderSubject: email, email, emailVerified: true, status: "ACTIVE" });
+	const challenges = new InMemoryVerificationChallengeRepository();
+	const delivery = new InMemoryEmailDeliveryProvider();
+	const verification = new EmailVerificationService(challenges, delivery,
+		new VerificationSecrets("synthetic-secret".repeat(4)), defaultVerificationPolicy);
+	const results = new Map<string, EmailPrincipal>();
+	const repository: EmailAuthenticationRepository = {
+		audit: async () => {},
+		async establish(_authority, challengeId) {
+			const challenge = await challenges.findById(challengeId);
+			if (challenge?.destinationNormalized !== email) throw new EmailAuthenticationError();
+			const authenticatedAt = new Date().toISOString();
+			const authenticationResult = randomBytes(32).toString("base64url");
+			results.set(authenticationResult, { id: subject.id, sub: subject.oidcSubject, email, emailVerified: true,
+				authenticationMethod: "HAPI_EMAIL", authenticatedAt, assurance: "email_otp" });
+			return { authenticated: true, subject: subject.oidcSubject, authenticationResult, expiresIn: 60,
+				authenticationMethod: "HAPI_EMAIL", authenticatedAt, assurance: "email_otp" };
+		},
+		async consumeResult(_authority, result) {
+			const principal = results.get(result);
+			results.delete(result);
+			if (!principal) throw new EmailAuthenticationError();
+			return principal;
+		}
+	};
+	const authentication = new EmailAuthenticationService(verification, challenges, repository);
+	const registration = new RegistrationService(new InMemoryRegistrationRepository(challenges, f.subjects));
+	const interactive = interactiveEmailAuthentication(authentication, f.h1, {
+		verification, challenges, registration, subjects: f.registry
+	});
+	f.oidc.configureEmailAuthentication({
+		interactive,
+		consume: async () => { throw new Error("unexpected legacy email flow"); }
+	});
+	return { email, subject, delivery, interactive };
+}
+
+async function chooseAppleEmail(f: Fixture, interaction: Awaited<ReturnType<typeof beginInteraction>>) {
+	const { state, code } = await launchProvider(f, interaction, "APPLE");
+	const choice = await appleCallback(f, { state, code });
+	expect(choice.statusCode).toBe(200);
+	expect(choice.body).toContain("Finish setting up your account");
+	expect(choice.body).toContain("confirm that you want to connect Apple");
+	const selected = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+		...form({ csrf: interaction.csrf, choice: "email" }, interaction.cookie) });
+	expect(selected.statusCode).toBe(303);
+}
+
+async function startLinkEmail(f: Fixture, interaction: Awaited<ReturnType<typeof beginInteraction>>, email: string) {
+	return f.app.inject({ method: "POST", url: "/login/email",
+		...form({ csrf: interaction.csrf, email }, interaction.cookie) });
+}
+
+async function submitLinkCode(f: Fixture, interaction: Awaited<ReturnType<typeof beginInteraction>>,
+	code: string, consent = true) {
+	return f.app.inject({ method: "POST", url: "/login/email/code",
+		...form({ csrf: interaction.csrf, code, ...(consent ? { connect_apple: "yes" } : {}) }, interaction.cookie) });
+}
 
 async function beginInteraction(f: Pick<Fixture, "app">, verifier: string, extraCookies = "") {
 	const query = new URLSearchParams({
@@ -253,6 +330,167 @@ afterEach(() => {
 });
 
 describe("V2-D federated Universal Login (synthetic providers)", () => {
+	it("links Apple only after email OTP and explicit consent, and returns the same subject on later Apple login", async () => {
+		const f = await federatedFixture();
+		const email = await enableEmail(f);
+		const verifier = "verifier-apple-existing";
+		const interaction = await beginInteraction(f, verifier);
+		await chooseAppleEmail(f, interaction);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+		expect((await startLinkEmail(f, interaction, email.email)).statusCode).toBe(303);
+		const page = await f.app.inject({ method: "GET", url: "/login/email/code", headers: { cookie: interaction.cookie } });
+		expect(page.body).toContain("I authorize connecting this Apple sign-in");
+		const missing = await submitLinkCode(f, interaction, email.delivery.messages[0].code, false);
+		expect(missing.statusCode).toBe(400);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+		const completed = await submitLinkCode(f, interaction, email.delivery.messages[0].code);
+		expect(completed.statusCode).toBe(303);
+		const token = await exchangeCode(f, completed.headers.location as string, verifier);
+		expect(token.statusCode).toBe(200);
+		expect(decodeJwt(token.json().id_token).sub).toBe(email.subject.oidcSubject);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toMatchObject([{
+			provider: "APPLE", providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub, status: "linked"
+		}]);
+		expect((await submitLinkCode(f, interaction, email.delivery.messages[0].code)).statusCode).toBe(400);
+		const returning = await beginInteraction(f, "verifier-apple-return");
+		const next = await launchProvider(f, returning, "APPLE");
+		const callback = await appleCallback(f, { state: next.state, code: next.code });
+		expect(callback.statusCode).toBe(303);
+		expect(callback.body).not.toContain("Finish setting up your account");
+		const repeat = await exchangeCode(f, callback.headers.location as string, "verifier-apple-return");
+		expect(repeat.statusCode).toBe(200);
+		expect(decodeJwt(repeat.json().id_token).sub).toBe(email.subject.oidcSubject);
+		expect(email.delivery.messages).toHaveLength(1);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(1);
+	});
+
+	it("rejects bad OTP and does not create an account for an unknown email", async () => {
+		const f = await federatedFixture();
+		const email = await enableEmail(f);
+		const interaction = await beginInteraction(f, "verifier-bad-otp");
+		await chooseAppleEmail(f, interaction);
+		await startLinkEmail(f, interaction, email.email);
+		const wrongCode = email.delivery.messages[0].code === "000000" ? "999999" : "000000";
+		expect((await submitLinkCode(f, interaction, wrongCode)).statusCode).toBe(401);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+
+		const unknown = await beginInteraction(f, "verifier-unknown-email");
+		await chooseAppleEmail(f, unknown);
+		await startLinkEmail(f, unknown, "unknown@example.test");
+		expect(email.delivery.messages.at(-1)?.purpose).toBe("AUTHENTICATION");
+		expect((await submitLinkCode(f, unknown, email.delivery.messages.at(-1)!.code)).statusCode).toBe(401);
+		expect(await f.registry.findByProvider("HAPI_EMAIL", "unknown@example.test")).toBeUndefined();
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+	});
+
+	it("rejects a conflicting binding and never reports success on a database failure", async () => {
+		for (const scenario of ["conflict", "failure"] as const) {
+			const f = await federatedFixture();
+			const email = await enableEmail(f);
+			const interaction = await beginInteraction(f, `verifier-${scenario}`);
+			await chooseAppleEmail(f, interaction);
+			await startLinkEmail(f, interaction, email.email);
+			if (scenario === "conflict") {
+				const other = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+					primaryProvider: "PrivateID", primaryProviderSubject: randomUUID(), status: "ACTIVE" });
+				await f.federation.linkExternalIdentity({ identitySubjectId: other.id, provider: "APPLE",
+					providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+			} else {
+				vi.spyOn(f.externalRepository, "link").mockRejectedValue(new Error("synthetic database failure"));
+			}
+			const result = await submitLinkCode(f, interaction, email.delivery.messages[0].code);
+			expect(result.statusCode).toBe(scenario === "conflict" ? 409 : 503);
+			expect(result.headers.location).toBeUndefined();
+			expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+			expect((await submitLinkCode(f, interaction, email.delivery.messages[0].code)).statusCode).toBe(400);
+		}
+	});
+
+	it("accepts an identical binding committed by the same subject during verification without duplicating it", async () => {
+		const f = await federatedFixture();
+		const email = await enableEmail(f);
+		const interaction = await beginInteraction(f, "verifier-idempotent-link");
+		await chooseAppleEmail(f, interaction);
+		await startLinkEmail(f, interaction, email.email);
+		await f.federation.linkExternalIdentity({ identitySubjectId: email.subject.id, provider: "APPLE",
+			providerIssuer: APPLE_ISSUER, providerSubject: f.identities.APPLE.sub });
+		expect((await submitLinkCode(f, interaction, email.delivery.messages[0].code)).statusCode).toBe(303);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(1);
+	});
+
+	it.each(["commit", "rollback"] as const)("waits for PostgreSQL %s before responding", async outcome => {
+		const f = await federatedFixture();
+		const email = await enableEmail(f);
+		const interaction = await beginInteraction(f, `verifier-transaction-${outcome}`);
+		await chooseAppleEmail(f, interaction);
+		await startLinkEmail(f, interaction, email.email);
+		const pool = new pg.Pool();
+		const client = Object.assign(new pg.Client(), { release: vi.fn() });
+		const statements: string[] = [];
+		let commitStarted!: () => void;
+		const atCommit = new Promise<void>(resolve => { commitStarted = resolve; });
+		let finishCommit!: () => void;
+		const commitGate = new Promise<void>(resolve => { finishCommit = resolve; });
+		vi.spyOn(pool, "connect").mockResolvedValue(client);
+		vi.spyOn(client, "query").mockImplementation(async (text, values) => {
+			if (typeof text !== "string") throw new Error("unexpected query");
+			const statement = text.trim();
+			statements.push(statement);
+			if (statement === "COMMIT") {
+				commitStarted();
+				await commitGate;
+				if (outcome === "rollback") throw new Error("synthetic commit failure");
+			}
+			if (statement.includes("FROM identity_subjects")) {
+				return { rows: [{ id: email.subject.id, status: "ACTIVE", primary_provider: "HAPI_EMAIL", email_verified: true }] };
+			}
+			if (statement.startsWith("INSERT INTO external_identities")) {
+				const now = new Date();
+				return { rows: [{ id: values![0], identity_subject_id: values![1], provider: values![2],
+					provider_issuer: values![3], provider_subject: values![4], provider_client_context: values![5],
+					status: "linked", linked_at: now, revoked_at: null, last_authenticated_at: null, created_at: now, updated_at: now }] };
+			}
+			return { rows: [] };
+		});
+		const postgres = new PostgresExternalIdentityRepository(pool);
+		vi.spyOn(f.externalRepository, "link").mockImplementation(command => postgres.link(command));
+		let responded = false;
+		const response = submitLinkCode(f, interaction, email.delivery.messages[0].code).then(result => {
+			responded = true;
+			return result;
+		});
+		await atCommit;
+		expect(responded).toBe(false);
+		expect(statements.some(sql => sql.startsWith("INSERT INTO identity_authentication_methods"))).toBe(true);
+		expect(statements.some(sql => sql.startsWith("INSERT INTO identity_link_audit"))).toBe(true);
+		finishCommit();
+		const result = await response;
+		expect(result.statusCode).toBe(outcome === "commit" ? 303 : 503);
+		expect(statements.includes("ROLLBACK")).toBe(outcome === "rollback");
+		expect(client.release).toHaveBeenCalledOnce();
+		await pool.end();
+	});
+
+	it("rejects forged CSRF, expired interactions and creation after choosing an existing account", async () => {
+		const f = await federatedFixture();
+		const email = await enableEmail(f);
+		const interaction = await beginInteraction(f, "verifier-expired-link");
+		await chooseAppleEmail(f, interaction);
+		const forged = await f.app.inject({ method: "POST", url: "/login/email",
+			...form({ csrf: "forged", email: email.email }, interaction.cookie) });
+		expect(forged.statusCode).toBe(400);
+		const create = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: interaction.csrf, choice: "create" }, interaction.cookie) });
+		expect(create.statusCode).toBe(400);
+		await startLinkEmail(f, interaction, email.email);
+		const store = new AuthorizationInteractionStore();
+		const saved = await store.find(interaction.handle);
+		expect(saved).not.toBeNull();
+		vi.spyOn(Date, "now").mockReturnValue(saved!.expiresAt + 1);
+		expect((await submitLinkCode(f, interaction, email.delivery.messages[0].code)).statusCode).toBe(400);
+		expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(0);
+	});
+
 	it("keeps federation invisible and inert while the default-off flags are off", async () => {
 		const f = await federatedFixture({ flags: {
 			HAPI_APPLE_FEDERATION_ENABLED: undefined, HAPI_GOOGLE_FEDERATION_ENABLED: undefined } });
@@ -363,11 +601,12 @@ describe("V2-D federated Universal Login (synthetic providers)", () => {
 		expect(googleLog).not.toHaveProperty("appleExchangeCategory");
 	});
 
-	it("lets the user switch to email sign-in instead, dropping the pending federated identity", async () => {
+	it("keeps the Google switch to email sign-in unchanged", async () => {
 		const f = await federatedFixture();
 		const interaction = await beginInteraction(f, "verifier-switch-email");
-		const { state, code } = await launchProvider(f, interaction, "APPLE");
-		await appleCallback(f, { state, code });
+		const { state, code } = await launchProvider(f, interaction, "GOOGLE");
+		await f.app.inject({ method: "GET",
+			url: `/federation/google/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}` });
 		const completed = await f.app.inject({ method: "POST", url: "/login/federated/complete",
 			...form({ csrf: interaction.csrf, choice: "email" }, interaction.cookie) });
 		expect(completed.statusCode).toBe(303);

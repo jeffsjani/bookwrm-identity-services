@@ -11,7 +11,7 @@ export type InteractiveEmailVerification =
 // authority bound to the Authorization Interaction; the H4 authentication result never reaches the browser.
 export interface InteractiveEmailAuthentication {
 	authority(clientId: string): Promise<InteractiveEmailAuthority>;
-	start(authority: InteractiveEmailAuthority, email: string): Promise<{
+	start(authority: InteractiveEmailAuthority, email: string, options?: { authenticationOnly?: boolean }): Promise<{
 		challengeId: string; expiresIn: number; resendAfter: number; mode: InteractiveEmailMode
 	}>;
 	resend(authority: InteractiveEmailAuthority, challengeId: string, mode: InteractiveEmailMode): Promise<{

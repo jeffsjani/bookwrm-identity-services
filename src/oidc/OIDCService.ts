@@ -1346,9 +1346,11 @@ export class OIDCService {
 				const unavailable = (reply: FastifyReply) => send(reply, 503, messagePage({
 						title: "Sign-in is temporarily unavailable", message: "Please try again in a few minutes."
 				}));
+				const connectingApple = (interaction: AuthorizationInteraction) =>
+						interaction.federation?.provider === "APPLE" && interaction.federation.linkExisting === true;
 				const tooMany = (reply: FastifyReply, interaction: AuthorizationInteraction, page: "email" | "code") => send(reply, 429,
 						(page === "email" ? emailPage : codePage)({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
-								csrf: interaction.csrf,
+								csrf: interaction.csrf, ...(page === "code" ? { connectApple: connectingApple(interaction) } : {}),
 								error: "Too many attempts. Please wait a few minutes and try again." }));
 				const emailFailed = "We couldn't sign you in with that code. Check the code, request a new one, or use a different email.";
 				const statusOf = (error: unknown) => typeof (error as { statusCode?: unknown })?.statusCode === "number"
@@ -1470,7 +1472,8 @@ export class OIDCService {
 												csrf: interaction.csrf,
 												error: "Enter a valid email address." }));
 								}
-								const started = await this.emailAuthentication!.interactive!.start(authority, email.data);
+								const started = await this.emailAuthentication!.interactive!.start(authority, email.data,
+										connectingApple(interaction) ? { authenticationOnly: true } : undefined);
 								if (!await this.interactions.save(loaded.handle, { ...interaction,
 									email: { challengeId: started.challengeId, mode: started.mode } })) {
 										logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_FAILED", route: "POST /login/email",
@@ -1506,7 +1509,7 @@ export class OIDCService {
 						const { interaction } = loaded;
 						if (!interaction.email) return reply.redirect("/login/email", 303);
 						return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
-								csrf: interaction.csrf }));
+								csrf: interaction.csrf, connectApple: connectingApple(interaction) }));
 				});
 
 				app.post("/login/email/resend", { bodyLimit: 4096 }, async (request, reply) => {
@@ -1521,7 +1524,7 @@ export class OIDCService {
 								await this.emailAuthentication!.interactive!.resend(authority, interaction.email.challengeId, interaction.email.mode);
 								logLogin(request, "universal_login_email_resend", interaction, startedAt, true, "");
 								return send(reply, 200, codePage({ tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
-										csrf: interaction.csrf,
+										csrf: interaction.csrf, connectApple: connectingApple(interaction),
 										notice: "We sent a new code. Earlier codes no longer work." }));
 						} catch (error) {
 								logUniversalLoginDiagnostic(app, { event: "EMAIL_FLOW_FAILED", route: "POST /login/email/resend",
@@ -1532,7 +1535,7 @@ export class OIDCService {
 								if (interaction && error instanceof VerificationError && error.statusCode < 500) {
 										return send(reply, statusOf(error) === 429 ? 429 : 400, codePage({ tenantName: interaction.binding?.tenantName,
 												clientId: interaction.clientId,
-												csrf: interaction.csrf, error: statusOf(error) === 429
+												csrf: interaction.csrf, connectApple: connectingApple(interaction), error: statusOf(error) === 429
 														? "Please wait before requesting another code."
 														: "A new code can't be sent for this request. Use a different email or start again." }));
 								}
@@ -1559,6 +1562,12 @@ export class OIDCService {
 												reasonCode: !authority ? "AUTHORITY_INVALID" : !clientValid ? "CLIENT_INVALID" : "AUTHORITY_INVALID" });
 										return expired(reply);
 								}
+								if (connectingApple(interaction) && loaded.body.connect_apple !== "yes") {
+										return send(reply, 400, codePage({ tenantName: interaction.binding?.tenantName,
+												clientId: interaction.clientId, csrf: interaction.csrf, connectApple: true,
+												error: "Confirm that you want to connect Apple to continue." }));
+								}
+								if (connectingApple(interaction) && mode === "REGISTRATION") throw new EmailAuthenticationError();
 								const code = typeof loaded.body.code === "string" && loaded.body.code.length <= 128 ? loaded.body.code.trim() : "";
 								const interactive = this.emailAuthentication!.interactive!;
 								const verification = await interactive.verify(authority, interaction.email.challengeId, code, mode);
@@ -1572,10 +1581,30 @@ export class OIDCService {
 												clientId: interaction.clientId, correlationId, reasonCode: "INTERACTION_ALREADY_CONSUMED" });
 										return expired(reply);
 								}
+								if (consumed.email?.challengeId !== interaction.email.challengeId ||
+										consumed.email.mode !== mode || connectingApple(consumed) !== connectingApple(interaction) ||
+										(connectingApple(consumed) && (consumed.federation?.providerIssuer !== interaction.federation?.providerIssuer ||
+												consumed.federation?.providerSubject !== interaction.federation?.providerSubject))) return expired(reply);
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_INTERACTION_CONSUMED", route: "POST /login/email/code",
 										clientId: interaction.clientId, correlationId });
 								const principal = verification.mode === "REGISTRATION" ? verification.principal
 									: await interactive.consumeResult(authority, verification.authenticationResult);
+								if (connectingApple(consumed)) {
+										const federation = consumed.federation!;
+										if (verification.mode !== "AUTHENTICATION") throw new EmailAuthenticationError();
+										await requireApplicationMethod(consumed.clientId, this.clientAuthority, "EXTERNAL_OIDC");
+										const linked = await this.getFederationResolution().linkExisting(principal.id, {
+												provider: federation.provider, providerIssuer: federation.providerIssuer,
+												providerSubject: federation.providerSubject, audience: federation.audience,
+												isPrivateRelayEmail: federation.isPrivateRelayEmail,
+												evidenceReference: federation.evidenceReference, expiresAt: 0
+										});
+										if (linked.status !== "linked" && linked.status !== "already_linked") {
+												logLogin(request, "universal_login_federated_apple_link", consumed, startedAt, false, linked.status);
+												return send(reply, 409, messagePage({ title: "Apple sign-in could not be connected",
+														message: "This sign-in could not be connected to your account. Start again or contact support." }));
+										}
+								}
 								logUniversalLoginDiagnostic(app, {
 									event: verification.mode === "REGISTRATION" ? "EMAIL_REGISTRATION_COMPLETED" : "EMAIL_AUTHENTICATION_COMPLETED",
 									route: "POST /login/email/code", clientId: interaction.clientId, correlationId,
@@ -1600,7 +1629,8 @@ export class OIDCService {
 								if (interaction && statusOf(error) === 429 && !failed) return tooMany(reply, interaction, "code");
 								if (interaction && failed) {
 										return send(reply, 401, codePage({ tenantName: interaction.binding?.tenantName,
-												clientId: interaction.clientId, csrf: interaction.csrf, error: emailFailed }));
+												clientId: interaction.clientId, csrf: interaction.csrf,
+												connectApple: connectingApple(interaction), error: emailFailed }));
 								}
 								app.log.error({ event: "UNIVERSAL_LOGIN_EMAIL_UNAVAILABLE" }, "Universal Login email verification failed");
 								return unavailable(reply);
@@ -1819,12 +1849,19 @@ export class OIDCService {
 								const flow = `universal_login_federated_${federation.provider.toLowerCase()}_register`;
 								const choice = loaded.body.choice;
 								if (choice === "email") {
-										// Explicit switch to the existing-account path: the pending federated
-										// identity is dropped; linking happens later via the authenticated API.
+										if (federation.provider === "APPLE") {
+												if (!await this.interactiveEmailAuthority(interaction)) return expired(reply);
+												const { email: _email, ...rest } = interaction;
+												if (!await this.interactions.save(loaded.handle, {
+														...rest, federation: { ...federation, linkExisting: true }
+												})) return expired(reply);
+												return reply.header("Cache-Control", "no-store").redirect("/login/email", 303);
+										}
 										const { federation: _federation, ...rest } = interaction;
-										await this.interactions.save(loaded.handle, rest as AuthorizationInteraction);
+										if (!await this.interactions.save(loaded.handle, rest)) return expired(reply);
 										return reply.header("Cache-Control", "no-store").redirect("/login/email", 303);
 								}
+								if (connectingApple(interaction)) return expired(reply);
 								if (choice !== "create") {
 										return send(reply, 400, federatedAccountChoicePage({
 												tenantName: interaction.binding?.tenantName, clientId: interaction.clientId,
