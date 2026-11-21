@@ -1367,9 +1367,10 @@ export class OIDCService {
 		}
 
 		private registerUniversalLogin(app: FastifyInstance): void {
-				const send = (reply: FastifyReply, status: number, page: RenderedLoginPage) => reply.code(status)
+				const send = (reply: FastifyReply, status: number, page: RenderedLoginPage,
+						referrerPolicy: "no-referrer" | "same-origin" = "no-referrer") => reply.code(status)
 						.header("Cache-Control", "no-store").header("Pragma", "no-cache")
-						.header("Referrer-Policy", "no-referrer").header("X-Frame-Options", "DENY")
+						.header("Referrer-Policy", referrerPolicy).header("X-Frame-Options", "DENY")
 						.header("Content-Security-Policy", page.contentSecurityPolicy)
 						.type("text/html; charset=utf-8").send(page.html);
 				const expired = (reply: FastifyReply) => {
@@ -1587,10 +1588,11 @@ export class OIDCService {
 						const proof = browserProof(request);
 						const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
 						if (!enrollment || enrollment.state !== "OFFERED") return expired(reply);
+						// Form POSTs need the browser's real Origin; no-referrer makes it "null".
 						return send(reply, 200, passkeyOfferPage({ tenantName: loaded.interaction.binding?.tenantName,
 								clientId: loaded.interaction.clientId, csrf: loaded.interaction.csrf,
 								managementAvailable: freshManagementDeadline(enrollment.principal) > Date.now(),
-								available: !enrollment.expired && await passkeyOffered(loaded.interaction) }));
+								available: !enrollment.expired && await passkeyOffered(loaded.interaction) }), "same-origin");
 				});
 				const loadManagement = async (request: FastifyRequest, reply: FastifyReply, mutation: boolean, route: string) => {
 						const loaded = await load(request, reply, mutation, route);
@@ -1639,7 +1641,7 @@ export class OIDCService {
 												usedToAuthenticate: credential.id === enrollment.principal.passkeyCredentialId,
 												canRename: Boolean(credential.displayName) || credentials.length === 1 ||
 														credential.id === enrollment.principal.passkeyCredentialId
-										})) }));
+										})) }), "same-origin");
 						} catch (error) { return managementError(reply, error); }
 				});
 				app.post("/login/passkey/rename", { bodyLimit: 4096 }, async (request, reply) => {
@@ -1691,7 +1693,7 @@ export class OIDCService {
 										"confirm", { credentialId: credential.id, name: credential.displayName });
 								if (!confirmation) return unavailable(reply);
 								return send(reply, 200, passkeyRevokeConfirmationPage({ tenantName: interaction.binding?.tenantName,
-										clientId: interaction.clientId, csrf: interaction.csrf, nonce: confirmation, name: credential.displayName }));
+										clientId: interaction.clientId, csrf: interaction.csrf, nonce: confirmation, name: credential.displayName }), "same-origin");
 						} catch (error) { return managementError(reply, error); }
 				});
 				app.post("/login/passkey/revoke", { bodyLimit: 4096 }, async (request, reply) => {

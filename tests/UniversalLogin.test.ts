@@ -1471,6 +1471,19 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			expect(management.statusCode, management.body).toBe(200);
 			expect(management.body).not.toContain(credential.id);
 			expect(management.body).not.toContain(foreign);
+			const renameAction = { ...passkeyAction(management.body, "/login/passkey/rename"), displayName: "Renamed" };
+			const rename = (origin: string | undefined, csrf = login.interaction.csrf) => t.f.app.inject({
+				method: "POST", url: "/login/passkey/rename",
+				headers: { cookie: headers.cookie, ...(origin === undefined ? {} : { origin }),
+					"x-forwarded-host": new URL(stagingOrigin).host, "x-forwarded-proto": "https" },
+				payload: { ...renameAction, csrf }
+			});
+			expect((await rename(undefined)).statusCode).toBe(403);
+			expect((await rename("null")).statusCode).toBe(403);
+			expect((await rename("https://evil.example")).statusCode).toBe(403);
+			expect((await rename(stagingOrigin, "wrong")).statusCode).toBe(400);
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/rename",
+				headers: login.headers, payload: renameAction })).statusCode).toBe(400);
 			const action = passkeyAction(management.body, "/login/passkey/confirm");
 			const confirm = (fields: Record<string, string>, origin = stagingOrigin) =>
 				t.f.app.inject({ method: "POST", url: "/login/passkey/confirm", headers: { ...headers, origin }, payload: fields });
@@ -1513,6 +1526,9 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			});
 			const headers = { ...login.headers, cookie: `${login.headers.cookie}; __Host-hapi_passkey=${offered!.browserProof}` };
 			expect((await t.f.app.inject({ method: "GET", url: "/login/passkey/manage", headers })).statusCode).toBe(403);
+			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/rename",
+				headers, payload: { csrf: login.interaction.csrf, nonce: randomBytes(32).toString("base64url"),
+					ref: randomBytes(32).toString("base64url"), displayName: "Stale" } })).statusCode).toBe(403);
 			expect((await t.f.app.inject({ method: "POST", url: "/login/passkey/options",
 				headers, payload: { csrf: login.interaction.csrf } })).statusCode).toBe(403);
 			const handle = await t.credentials.userHandle(t.f.subject.id);
@@ -1529,16 +1545,28 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 		try {
 			const credential = await enroll(t, a.page);
 			const login = await beginPasskeyLogin(t);
+			const origins: { path: string; origin: string | undefined }[] = [];
+			const renameStatuses: number[] = [];
 			await a.page.unroute(`${stagingOrigin}/**`);
 			await a.page.context().addCookies([{ name: "__Host-hapi_login", value: login.interaction.handle, url: stagingOrigin, secure: true }]);
 			await a.page.route(`${stagingOrigin}/**`, async route => {
 				const request = route.request();
 				const url = new URL(request.url());
-				const response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
-					url: `${url.pathname}${url.search}`, headers: await request.allHeaders(),
+				const requestHeaders = await request.allHeaders();
+				if (request.method() === "POST" && ["/login/passkey/rename", "/login/passkey/confirm", "/login/passkey/revoke"].includes(url.pathname)) {
+					origins.push({ path: url.pathname, origin: requestHeaders.origin });
+				}
+				let response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
+					url: `${url.pathname}${url.search}`, headers: requestHeaders,
 					...(request.postData() ? { payload: request.postData()! } : {}) });
+				if (url.pathname === "/login/passkey/rename") {
+					renameStatuses.push(response.statusCode);
+					if (response.statusCode === 303 && response.headers.location === "/login/passkey/manage") {
+						response = await t.f.app.inject({ method: "GET", url: response.headers.location, headers: requestHeaders });
+					}
+				}
 				const headers: Record<string, string> = {};
-				for (const name of ["content-type", "content-security-policy", "cache-control", "location", "set-cookie"]) {
+				for (const name of ["content-type", "content-security-policy", "cache-control", "referrer-policy", "location", "set-cookie"]) {
 					const value = response.headers[name];
 					if (typeof value === "string") headers[name] = value;
 				}
@@ -1547,11 +1575,58 @@ describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (P
 			await a.page.goto(`${stagingOrigin}/login`);
 			await a.page.getByRole("button", { name: "Manage passkeys" }).click();
 			await a.page.waitForURL(`${stagingOrigin}/login/passkey/manage`, { timeout: 10_000 });
-			await a.page.getByRole("button", { name: "Revoke Primary device" }).click();
-			await a.page.getByText("Revoke Primary device? This passkey will no longer work for sign-in.").waitFor();
+			await a.page.getByLabel("Name for Primary device").fill("Renamed device");
+			await a.page.getByRole("button", { name: "Save name" }).click();
+			await a.page.getByRole("button", { name: "Revoke Renamed device" }).waitFor({ timeout: 5000 });
+			expect(renameStatuses).toEqual([303]);
+			await a.page.getByRole("button", { name: "Revoke Renamed device" }).click();
+			await a.page.getByText("Revoke Renamed device? This passkey will no longer work for sign-in.").waitFor({ timeout: 5000 });
 			await a.page.getByRole("button", { name: "Confirm revocation" }).click();
-			await a.page.getByText("Your passkey was revoked. Start sign-in again using another method.").waitFor();
+			await a.page.getByText("Your passkey was revoked. Start sign-in again using another method.").waitFor({ timeout: 5000 });
+			expect(origins).toEqual(["rename", "confirm", "revoke"].map(action => ({
+				path: `/login/passkey/${action}`, origin: stagingOrigin
+			})));
 			expect((await pool.query("SELECT revoked_at FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0].revoked_at).not.toBeNull();
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("submits Not Now with the issuer origin from the passkey offer page", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const proof = t.headers.cookie.split("; ").find(value => value.startsWith("__Host-hapi_passkey="))!.split("=")[1];
+			await a.page.unroute(`${stagingOrigin}/**`);
+			await a.page.context().addCookies([
+				{ name: "__Host-hapi_login", value: t.interaction.handle, url: stagingOrigin, secure: true },
+				{ name: "__Host-hapi_passkey", value: proof, url: stagingOrigin, secure: true }
+			]);
+			let origin: string | undefined;
+			let redirect: string | undefined;
+			await a.page.route(`${stagingOrigin}/**`, async route => {
+				const request = route.request();
+				const url = new URL(request.url());
+				const headers = await request.allHeaders();
+				if (url.pathname === "/login/passkey/skip") origin = headers.origin;
+				const response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
+					url: `${url.pathname}${url.search}`, headers,
+					...(request.postData() ? { payload: request.postData()! } : {}) });
+				if (url.pathname === "/login/passkey/skip") {
+					expect(response.statusCode).toBe(303);
+					redirect = String(response.headers.location);
+					return route.fulfill({ status: 200, body: "completed" });
+				}
+				const output: Record<string, string> = {};
+				for (const name of ["content-type", "content-security-policy", "referrer-policy"]) {
+					const value = response.headers[name];
+					if (typeof value === "string") output[name] = value;
+				}
+				await route.fulfill({ status: response.statusCode, headers: output, body: response.body });
+			});
+			await a.page.goto(`${stagingOrigin}/login/passkey`);
+			await a.page.getByRole("button", { name: "Not Now" }).click();
+			await a.page.getByText("completed").waitFor({ timeout: 5000 });
+			expect(origin).toBe(stagingOrigin);
+			expect(new URL(redirect!).origin).toBe(new URL(REDIRECT).origin);
 		} finally { await a.close(); await t.close(); }
 	}, 30_000);
 

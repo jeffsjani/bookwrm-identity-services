@@ -78,6 +78,8 @@ when there is more than one, select **Manage passkeys** at sign-in and verify wi
 the passkey to identify and name it. An unnamed passkey must be named before it can
 be revoked. Revocation displays the selected name and requires a separate confirmation;
 revoking the passkey used for management requires starting sign-in again.
+Passkey offer and management pages use a same-origin referrer policy so browser form
+POSTs carry the issuer origin while referrers remain hidden from other origins.
 Schema version 1.4.0 adds a nullable display name and an active-name uniqueness index
 without changing existing credentials. The guarded staging permission update in
 `scripts/update-staging-passkey-permissions.sql` requires separate review and
