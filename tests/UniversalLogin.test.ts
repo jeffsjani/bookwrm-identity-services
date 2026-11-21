@@ -1,10 +1,15 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
+import { readFileSync } from "node:fs";
+import pg from "pg";
+import { chromium, type Browser, type Page } from "playwright";
 import Fastify, { type FastifyInstance, type LightMyRequestResponse } from "fastify";
 import formbody from "@fastify/formbody";
 import { JSDOM } from "jsdom";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { Redis } from "ioredis";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { configuration } from "../src/config/ConfigurationService.js";
+import { resolveConfiguredIssuer } from "../src/config/IssuerPolicy.js";
 import { OIDCService, type OIDCClient } from "../src/oidc/OIDCService.js";
 import { AuthorizationInteractionStore, AUTHORIZATION_INTERACTION_TTL_MS } from "../src/oidc/AuthorizationInteractionStore.js";
 import type { AuthenticationProvider, PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
@@ -25,6 +30,7 @@ import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUse
 import { getCurrentPrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { HapiFaceEnrollmentService } from "../src/authenticators/HapiFaceEnrollmentService.js";
 import { getRedisClient, oidcRedisKey } from "../src/oidc/infrastructure/RedisInfrastructure.js";
+import { OIDCRateLimiter } from "../src/oidc/infrastructure/OIDCRateLimiter.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 import { diagnosticCorrelationId } from "../src/oidc/UniversalLoginDiagnostics.js";
 import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
@@ -33,6 +39,8 @@ import { RegistrationService } from "../src/registration/RegistrationService.js"
 import { registerStagingTestConsole, STAGING_CONSOLE_CALLBACK, STAGING_ISSUER } from "../src/oidc/StagingTestConsole.js";
 import { protectStagingConsoleInternalLogs } from "../src/oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "../src/security/RequestLogging.js";
+import { PostgresPasskeyCredentialRepository } from "../src/identity/PostgresPasskeyCredentialRepository.js";
+import type { PublicKeyCredentialCreationOptionsJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 
 const REDIRECT = "https://rp.example/callback";
 const CLIENT_ID = "ul-client";
@@ -92,7 +100,8 @@ function diagnosticEvents(logs: string[]): Array<Record<string, unknown>> {
 				|| (entry!.event as string).startsWith("EMAIL_AUTHENTICATION_") || (entry!.event as string).startsWith("EMAIL_REGISTRATION_")));
 }
 
-async function emailFixture(options: { emailInteractive?: boolean; clientId?: string; redirectUri?: string; console?: boolean; knownEmail?: string } = {}) {
+async function emailFixture(options: { emailInteractive?: boolean; clientId?: string; redirectUri?: string; console?: boolean; knownEmail?: string;
+	interactionStore?: AuthorizationInteractionStore; passkeyCredentials?: PostgresPasskeyCredentialRepository } = {}) {
 	ensureOidcTestEnvironment();
 	const clientId = options.clientId ?? CLIENT_ID;
 	const redirectUri = options.redirectUri ?? REDIRECT;
@@ -162,7 +171,8 @@ async function emailFixture(options: { emailInteractive?: boolean; clientId?: st
 			sessionId: `face-session-${correlationId}`, launchUrl: "https://privateid.example.com/launch?session=opaque"
 		}))
 	} as unknown as AuthenticationProvider;
-	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients, clientAuthority: h1 });
+	const oidc = new OIDCService({ authenticationProvider: provider, clients: [oidcClient], oidcClients: clients, clientAuthority: h1,
+		interactionStore: options.interactionStore, passkeyCredentials: options.passkeyCredentials });
 	oidc.configureEmailAuthentication({
 		async consume(request, token, expectedClient) {
 			const client = await authorizeH1Client(request, h1);
@@ -269,6 +279,70 @@ describe("H6 AuthorizationInteractionStore", () => {
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, interaction.csrf)).toBe(true);
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, "x")).toBe(false);
 		expect(AuthorizationInteractionStore.csrfMatches(interaction, undefined)).toBe(false);
+	});
+
+	it("atomically arbitrates enrollment and skip, protects the interaction and finishes once", async () => {
+		const store = new AuthorizationInteractionStore();
+		const { handle, interaction } = await store.create(base());
+		const principal = { id: randomUUID(), sub: randomUUID(), authenticationMethod: "HAPI_EMAIL" as const };
+		const offer = await store.offerPasskeyEnrollment(handle, interaction, principal);
+		expect(offer).not.toBeNull();
+		const proof = offer!.browserProof;
+		expect(await store.save(handle, { ...interaction, email: { challengeId: "stale", mode: "AUTHENTICATION" } })).toBe(false);
+		expect(await store.consume(handle)).toBeNull();
+		const [enroll, skip] = await Promise.all([
+			store.transitionPasskeyEnrollment(handle, proof, interaction.csrf, principal.id, "OFFERED", "ENROLLING"),
+			store.transitionPasskeyEnrollment(handle, proof, interaction.csrf, principal.id, "OFFERED", "SKIPPED")
+		]);
+		expect([enroll, skip].filter(Boolean)).toHaveLength(1);
+		if (enroll) {
+			expect(await store.finishPasskeyEnrollment(handle, proof, interaction.csrf, principal.id)).toBeNull();
+			expect(await store.transitionPasskeyEnrollment(handle, proof, interaction.csrf, principal.id,
+				"ENROLLING", "ENROLLED")).toBe(true);
+		}
+		const finished = await Promise.all(Array.from({ length: 8 }, () =>
+			store.finishPasskeyEnrollment(handle, proof, interaction.csrf, principal.id)));
+		expect(finished.filter(Boolean)).toHaveLength(1);
+		expect(finished.find(Boolean)?.principal).toEqual(principal);
+		expect(await store.save(handle, interaction)).toBe(false);
+		expect(await store.consume(handle)).toBeNull();
+	});
+
+	it("rejects stale offers, wrong browser, CSRF, subject and interaction, and expiry", async () => {
+		let now = Date.now();
+		const store = new AuthorizationInteractionStore(getRedisClient(), 600_000, () => now);
+		const { handle, interaction } = await store.create(base());
+		const other = await store.create(base());
+		const principal = { id: randomUUID(), sub: randomUUID(), authenticationMethod: "APPLE" as const };
+		expect(await store.save(handle, { ...interaction, email: { challengeId: "new", mode: "AUTHENTICATION" } })).toBe(true);
+		expect(await store.offerPasskeyEnrollment(handle, interaction, principal)).toBeNull();
+		const current = await store.find(handle);
+		const offer = await store.offerPasskeyEnrollment(handle, current!, principal);
+		expect(offer).not.toBeNull();
+		const proof = offer!.browserProof;
+		expect(await store.transitionPasskeyEnrollment(handle, randomBytes(32).toString("base64url"), current!.csrf,
+			principal.id, "OFFERED", "SKIPPED")).toBe(false);
+		expect(await store.transitionPasskeyEnrollment(handle, proof, "wrong", principal.id, "OFFERED", "SKIPPED")).toBe(false);
+		expect(await store.transitionPasskeyEnrollment(handle, proof, current!.csrf, randomUUID(), "OFFERED", "SKIPPED")).toBe(false);
+		expect(await store.transitionPasskeyEnrollment(other.handle, proof, other.interaction.csrf,
+			principal.id, "OFFERED", "SKIPPED")).toBe(false);
+		now += 300_001;
+		expect(await store.transitionPasskeyEnrollment(handle, proof, current!.csrf, principal.id, "OFFERED", "SKIPPED")).toBe(false);
+		expect(await store.transitionPasskeyEnrollment(handle, proof, current!.csrf, principal.id, "OFFERED", "ENROLLING")).toBe(false);
+		expect(await store.consume(handle)).toBeNull();
+		expect(await store.expirePasskeyEnrollment(handle, proof, current!.csrf, principal.id)).toBe(true);
+		expect((await store.finishPasskeyEnrollment(handle, proof, current!.csrf, principal.id))?.principal).toEqual(principal);
+	});
+
+	it("fails closed when Redis cannot create an enrollment authority", async () => {
+		const redis = getRedisClient();
+		const store = new AuthorizationInteractionStore(redis);
+		const { handle, interaction } = await store.create(base());
+		const principal = { id: randomUUID(), sub: randomUUID(), authenticationMethod: "HAPI_EMAIL" as const };
+		const failure = vi.spyOn(redis, "eval").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+		await expect(store.offerPasskeyEnrollment(handle, interaction, principal)).rejects.toThrow("synthetic Redis failure");
+		failure.mockRestore();
+		expect(await store.find(handle)).toEqual(interaction);
 	});
 });
 
@@ -968,6 +1042,428 @@ describe("H6 Universal Login", () => {
 			expect(f.provider.beginAsyncAuthentication).not.toHaveBeenCalled();
 		} finally { f.lookup.mockRestore(); await f.app.close(); }
 	});
+});
+
+describe("post-authentication passkey offer", () => {
+	afterEach(() => {
+		setFlag(undefined);
+		vi.unstubAllEnvs();
+		configuration.reload();
+		vi.restoreAllMocks();
+	});
+
+	it.each([
+		{ enabled: false, allowed: true },
+		{ enabled: true, allowed: false }
+	])("keeps email completion unchanged with enabled=$enabled and allowed=$allowed", async ({ enabled, allowed }) => {
+		setFlag(true);
+		vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", String(enabled));
+		configuration.reload();
+		const f = await emailFixture();
+		try {
+			if (allowed) {
+				const application = (await f.h1.applications.findById(f.applicationId))!;
+				await f.h1.applications.upsert({ ...application, allowedAuthenticationMethods: [...application.allowedAuthenticationMethods, "PASSKEY"] });
+			}
+			const interaction = await beginInteraction(f, "v".repeat(43));
+			await startEmail(f, interaction, KNOWN_EMAIL);
+			const done = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(done.statusCode, done.body).toBe(303);
+			expect(new URL(done.headers.location as string).origin).toBe(new URL(REDIRECT).origin);
+		} finally { await f.app.close(); }
+	});
+
+	it("requires both browser cookies, CSRF and origin, and issues only one code on concurrent skips", async () => {
+		setFlag(true);
+		vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "true");
+		configuration.reload();
+		const redisPort = process.env.HAPI_PASSKEY_TEST_REDIS_PORT;
+		const redis = redisPort ? new Redis({ host: "127.0.0.1", port: Number(redisPort) }) : undefined;
+		const f = await emailFixture({ interactionStore: redis ? new AuthorizationInteractionStore(redis) : undefined });
+		vi.spyOn(identityRegistry, "findById").mockImplementation(id => f.subjects.findById(id));
+		try {
+			const application = (await f.h1.applications.findById(f.applicationId))!;
+			await f.h1.applications.upsert({ ...application, allowedAuthenticationMethods: [...application.allowedAuthenticationMethods, "PASSKEY"] });
+			const verifier = "v".repeat(43);
+			const interaction = await beginInteraction(f, verifier);
+			await startEmail(f, interaction, KNOWN_EMAIL);
+			const offered = await submitCode(f, interaction, f.delivery.messages[0].code);
+			expect(offered.statusCode, offered.body).toBe(303);
+			expect(offered.headers.location).toBe("/login/passkey");
+			const proofCookie = setCookies(offered).find(value => value.startsWith("__Host-hapi_passkey="))!;
+			expect(proofCookie).toMatch(/HttpOnly; Secure; SameSite=Lax/);
+			const cookie = `${interaction.cookie.cookie}; ${proofCookie.split(";")[0]}`;
+			expect((await f.app.inject({ method: "GET", url: "/login/passkey", headers: interaction.cookie })).statusCode).toBe(400);
+			const page = await f.app.inject({ method: "GET", url: "/login/passkey", headers: { cookie } });
+			expect(page.statusCode).toBe(200);
+			expect(page.body).toContain("Not Now");
+			const sendSkip = (csrf: string, origin: string, cookies = cookie) => f.app.inject({
+				method: "POST", url: "/login/passkey/skip", ...form({ csrf }),
+				headers: { ...form({}).headers, cookie: cookies, origin }
+			});
+			expect((await sendSkip(interaction.csrf, "https://evil.example")).statusCode).toBe(403);
+			expect((await sendSkip("wrong", resolveConfiguredIssuer())).statusCode).toBe(400);
+			expect((await sendSkip(interaction.csrf, resolveConfiguredIssuer(), interaction.cookie.cookie)).statusCode).toBe(400);
+			const results = await Promise.all(Array.from({ length: 5 }, () => sendSkip(interaction.csrf, resolveConfiguredIssuer())));
+			const successes = results.filter(result => result.statusCode === 303);
+			expect(successes).toHaveLength(1);
+			expect(results.filter(result => result.statusCode !== 303)).toHaveLength(4);
+			const callback = new URL(successes[0].headers.location as string);
+			const token = await f.app.inject({ method: "POST", url: "/token", headers: f.basic,
+				payload: { grant_type: "authorization_code", code: callback.searchParams.get("code")!,
+					redirect_uri: REDIRECT, code_verifier: verifier } });
+			expect(token.statusCode, token.body).toBe(200);
+			expect(decodeJwt(token.json().id_token).sub).toBe(f.subject.oidcSubject);
+			expect((await sendSkip(interaction.csrf, resolveConfiguredIssuer())).statusCode).toBe(400);
+		} finally { await f.app.close(); if (redis) await redis.quit(); }
+	});
+});
+
+const passkeyDatabaseUrl = process.env.HAPI_PASSKEY_TEST_DATABASE_URL;
+const passkeyRedisPort = process.env.HAPI_PASSKEY_TEST_REDIS_PORT;
+const stagingOrigin = "https://id-staging.hapiinc.com";
+
+describe.skipIf(!passkeyDatabaseUrl || !passkeyRedisPort)("passkey enrollment (PostgreSQL, Redis and Chromium)", () => {
+	const schema = `passkey_${randomUUID().replaceAll("-", "")}`;
+	const admin = new pg.Pool({ connectionString: passkeyDatabaseUrl });
+	const pool = new pg.Pool({ connectionString: passkeyDatabaseUrl, options: `-c search_path=${schema}` });
+	let browser: Browser;
+
+	beforeAll(async () => {
+		await admin.query(`CREATE SCHEMA ${schema}`);
+		await pool.query(readFileSync(new URL("../src/identity/schema.sql", import.meta.url), "utf8"));
+		const ddl = readFileSync(new URL("../src/identity/schema-passkeys.sql", import.meta.url), "utf8");
+		await pool.query(ddl);
+		await pool.query(ddl);
+		browser = await chromium.launch({ headless: true });
+	});
+
+	afterAll(async () => {
+		await browser?.close();
+		await pool.end();
+		await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+		await admin.end();
+	});
+
+	afterEach(() => {
+		setFlag(undefined);
+		vi.unstubAllEnvs();
+		configuration.reload();
+		vi.restoreAllMocks();
+	});
+
+	async function setup() {
+		vi.spyOn(OIDCRateLimiter.prototype, "assertWithinLimits").mockResolvedValue();
+		setFlag(true);
+		vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "true");
+		vi.stubEnv("OIDC_ISSUER", stagingOrigin);
+		vi.stubEnv("OIDC_ALLOWED_ISSUERS", stagingOrigin);
+		configuration.reload();
+		const redis = new Redis({ host: "127.0.0.1", port: Number(passkeyRedisPort) });
+		const store = new AuthorizationInteractionStore(redis);
+		const credentials = new PostgresPasskeyCredentialRepository(pool);
+		const f = await emailFixture({ interactionStore: store, passkeyCredentials: credentials });
+		vi.spyOn(identityRegistry, "findById").mockImplementation(id => f.subjects.findById(id));
+		await pool.query(`INSERT INTO identity_subjects
+			(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
+			VALUES ($1, $2, 'HAPI_EMAIL', $3, 'ACTIVE', now(), now())`,
+			[f.subject.id, f.subject.oidcSubject, `test-${f.subject.id}`]);
+		const application = (await f.h1.applications.findById(f.applicationId))!;
+		await f.h1.applications.upsert({ ...application, allowedAuthenticationMethods: [...application.allowedAuthenticationMethods, "PASSKEY"] });
+		const interaction = await beginInteraction(f, "v".repeat(43));
+		await startEmail(f, interaction, KNOWN_EMAIL);
+		const offered = await submitCode(f, interaction, f.delivery.messages[0].code);
+		expect(offered.headers.location).toBe("/login/passkey");
+		const proofCookie = setCookies(offered).find(value => value.startsWith("__Host-hapi_passkey="))!;
+		const cookie = `${interaction.cookie.cookie}; ${proofCookie.split(";")[0]}`;
+		const headers = { cookie, origin: stagingOrigin };
+		const options = () => f.app.inject({ method: "POST", url: "/login/passkey/options",
+			headers, payload: { csrf: interaction.csrf } });
+		const verify = (credential: RegistrationResponseJSON) => f.app.inject({ method: "POST", url: "/login/passkey/verify",
+			headers, payload: { csrf: interaction.csrf, credential } });
+		const close = async () => { await f.app.close(); await redis.quit(); };
+		return { f, redis, store, credentials, interaction, headers, options, verify, close };
+	}
+
+	async function authenticator(): Promise<{ page: Page; close: () => Promise<void> }> {
+		const context = await browser.newContext();
+		const page = await context.newPage();
+		await page.route(`${stagingOrigin}/**`, route => route.fulfill({ status: 200, contentType: "text/html", body: "<html></html>" }));
+		await page.goto(stagingOrigin);
+		const cdp = await context.newCDPSession(page);
+		await cdp.send("WebAuthn.enable");
+		await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
+			protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true,
+			isUserVerified: true, automaticPresenceSimulation: true
+		} });
+		await page.addScriptTag({ path: "node_modules/@simplewebauthn/browser/dist/bundle/index.umd.min.js" });
+		return { page, close: () => context.close() };
+	}
+
+	async function createCredential(page: Page, options: PublicKeyCredentialCreationOptionsJSON): Promise<RegistrationResponseJSON> {
+		return page.evaluate(async opts => {
+			const webauthn = (globalThis as typeof globalThis & {
+				SimpleWebAuthnBrowser: { startRegistration(input: { optionsJSON: typeof opts }): Promise<RegistrationResponseJSON> }
+			}).SimpleWebAuthnBrowser;
+			return webauthn.startRegistration({ optionsJSON: opts });
+		}, options);
+	}
+
+	it("persists a verified browser credential for the exact subject and completes OIDC once", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const offers = await Promise.all(Array.from({ length: 8 }, () => t.options()));
+			const winner = offers.filter(result => result.statusCode === 200);
+			expect(winner).toHaveLength(1);
+			const options = winner[0].json<PublicKeyCredentialCreationOptionsJSON>();
+			expect(options.rp).toEqual({ id: "id-staging.hapiinc.com", name: "HAPI ID Staging" });
+			expect(options.user.id).not.toContain(KNOWN_EMAIL);
+			expect(options.authenticatorSelection?.userVerification).toBe("required");
+			const credential = await createCredential(a.page, options);
+			const results = await Promise.all(Array.from({ length: 8 }, () => t.verify(credential)));
+			const success = results.filter(result => result.statusCode === 200);
+			expect(success).toHaveLength(1);
+			const rows = await pool.query(`SELECT credential_id, identity_subject_id, user_handle, public_key, revoked_at
+				FROM passkey_credentials WHERE identity_subject_id = $1`, [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(1);
+			expect(rows.rows[0]).toMatchObject({ credential_id: credential.id, identity_subject_id: t.f.subject.id, revoked_at: null });
+			expect(rows.rows[0].user_handle.toString("base64url")).toBe(options.user.id);
+			expect(rows.rows[0].public_key.length).toBeGreaterThan(0);
+			const callback = new URL(success[0].json().redirect);
+			const code = callback.searchParams.get("code")!;
+			const token = await t.f.app.inject({ method: "POST", url: "/token", headers: t.f.basic,
+				payload: { grant_type: "authorization_code", code, redirect_uri: REDIRECT, code_verifier: "v".repeat(43) } });
+			expect(token.statusCode, token.body).toBe(200);
+			expect(decodeJwt(token.json().id_token).sub).toBe(t.f.subject.oidcSubject);
+			expect((await t.verify(credential)).statusCode).not.toBe(200);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("runs the actual Add Passkey page and native browser ceremony", async () => {
+		const t = await setup();
+		const context = await browser.newContext();
+		const page = await context.newPage();
+		const proof = t.headers.cookie.split("; ").find(value => value.startsWith("__Host-hapi_passkey="))!.split("=")[1];
+		try {
+			await context.addCookies([
+				{ name: "__Host-hapi_login", value: t.interaction.handle, url: stagingOrigin, secure: true },
+				{ name: "__Host-hapi_passkey", value: proof, url: stagingOrigin, secure: true }
+			]);
+			await page.route(`${stagingOrigin}/**`, async route => {
+				const request = route.request();
+				const url = new URL(request.url());
+				const response = await t.f.app.inject({ method: request.method() as "GET" | "POST",
+					url: `${url.pathname}${url.search}`, headers: await request.allHeaders(),
+					...(request.postData() ? { payload: request.postData()! } : {}) });
+				const headers: Record<string, string> = {};
+				for (const name of ["content-type", "content-security-policy", "cache-control"]) {
+					const value = response.headers[name];
+					if (typeof value === "string") headers[name] = value;
+				}
+				await route.fulfill({ status: response.statusCode, headers, body: response.body });
+			});
+			await page.route("https://rp.example/**", route => route.fulfill({ status: 200, body: "completed" }));
+			const cdp = await context.newCDPSession(page);
+			await cdp.send("WebAuthn.enable");
+			await cdp.send("WebAuthn.addVirtualAuthenticator", { options: {
+				protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true,
+				isUserVerified: true, automaticPresenceSimulation: true
+			} });
+			await page.goto(`${stagingOrigin}/login/passkey`);
+			await page.getByRole("button", { name: "Add Passkey" }).click();
+			await page.waitForURL("https://rp.example/**", { timeout: 10_000 });
+			expect(new URL(page.url()).searchParams.has("code")).toBe(true);
+			const rows = await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(1);
+		} finally { await context.close(); await t.close(); }
+	}, 30_000);
+
+	it.each(["challenge", "origin", "rp", "user verification"] as const)("rejects an invalid %s", async kind => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			expect(response.statusCode).toBe(200);
+			const credential = await createCredential(a.page, response.json());
+			if (kind === "challenge" || kind === "origin") {
+				const data = JSON.parse(Buffer.from(credential.response.clientDataJSON, "base64url").toString("utf8"));
+				if (kind === "challenge") data.challenge = randomBytes(32).toString("base64url");
+				else data.origin = "https://other.example";
+				credential.response.clientDataJSON = Buffer.from(JSON.stringify(data)).toString("base64url");
+			} else {
+				const attestation = Buffer.from(credential.response.attestationObject, "base64url");
+				const index = attestation.indexOf(createHash("sha256").update("id-staging.hapiinc.com").digest());
+				expect(index).toBeGreaterThan(-1);
+				if (kind === "rp") attestation[index] ^= 1;
+				else attestation[index + 32] &= ~0x04;
+				credential.response.attestationObject = attestation.toString("base64url");
+			}
+			expect((await t.verify(credential)).statusCode).toBe(400);
+			const rows = await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(0);
+			const skip = await t.f.app.inject({ method: "POST", url: "/login/passkey/skip",
+				...form({ csrf: t.interaction.csrf }), headers: { ...form({}).headers, ...t.headers } });
+			expect(skip.statusCode).toBe(303);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("rolls back a failed PostgreSQL insert and never reports enrollment success", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			await pool.query(`CREATE FUNCTION reject_test_passkey() RETURNS trigger LANGUAGE plpgsql AS $$
+				BEGIN RAISE EXCEPTION 'synthetic insert failure'; END $$`);
+			await pool.query(`CREATE TRIGGER reject_test_passkey AFTER INSERT ON passkey_credentials
+				FOR EACH ROW EXECUTE FUNCTION reject_test_passkey()`);
+			expect((await t.verify(credential)).statusCode).toBe(503);
+			const rows = await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(0);
+			const skip = await t.f.app.inject({ method: "POST", url: "/login/passkey/skip",
+				...form({ csrf: t.interaction.csrf }), headers: { ...form({}).headers, ...t.headers } });
+			expect(skip.statusCode).toBe(303);
+		} finally {
+			await pool.query("DROP TRIGGER IF EXISTS reject_test_passkey ON passkey_credentials");
+			await pool.query("DROP FUNCTION IF EXISTS reject_test_passkey()");
+			await a.close();
+			await t.close();
+		}
+	}, 30_000);
+
+	it("requires the flag, client capability, CSRF, origin, and matching authenticated subject", async () => {
+		const t = await setup();
+		try {
+			const call = (csrf: string, origin: string) => t.f.app.inject({ method: "POST", url: "/login/passkey/options",
+				headers: { ...t.headers, origin }, payload: { csrf } });
+			expect((await call("wrong", stagingOrigin)).statusCode).toBe(400);
+			expect((await call(t.interaction.csrf, "https://evil.example")).statusCode).toBe(403);
+			vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "false");
+			configuration.reload();
+			expect((await t.options()).statusCode).toBe(403);
+			const disabledPage = await t.f.app.inject({ method: "GET", url: "/login/passkey", headers: t.headers });
+			expect(disabledPage.body).not.toContain('id="passkey-add"');
+			expect(disabledPage.body).toContain("Not Now");
+			vi.stubEnv("HAPI_PASSKEY_AUTHENTICATION_ENABLED", "true");
+			configuration.reload();
+			const app = (await t.f.h1.applications.findById(t.f.applicationId))!;
+			await t.f.h1.applications.upsert({ ...app, allowedAuthenticationMethods: app.allowedAuthenticationMethods.filter(method => method !== "PASSKEY") });
+			expect((await t.options()).statusCode).toBe(403);
+			await t.f.h1.applications.upsert(app);
+			vi.mocked(identityRegistry.findById).mockResolvedValueOnce({ ...t.f.subject, oidcSubject: randomUUID() });
+			expect((await t.options()).statusCode).toBe(400);
+			expect((await pool.query("SELECT user_handle FROM passkey_user_handles WHERE identity_subject_id = $1", [t.f.subject.id])).rows).toHaveLength(0);
+			const skip = await t.f.app.inject({ method: "POST", url: "/login/passkey/skip",
+				...form({ csrf: t.interaction.csrf }), headers: { ...form({}).headers, ...t.headers } });
+			expect(skip.statusCode).toBe(303);
+		} finally { await t.close(); }
+	}, 30_000);
+
+	it("fails closed when Redis cannot claim verification", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			vi.spyOn(t.redis, "eval").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+			expect((await t.verify(credential)).statusCode).toBe(503);
+			const rows = await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id]);
+			expect(rows.rows).toHaveLength(0);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("does not commit when the PostgreSQL subject becomes inactive", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			await pool.query("UPDATE identity_subjects SET status = 'LOCKED' WHERE id = $1", [t.f.subject.id]);
+			expect((await t.verify(credential)).statusCode).toBe(503);
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id])).rows).toHaveLength(0);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("retains the correct committed credential if Redis fails before completion", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			vi.spyOn(t.store, "transitionPasskeyEnrollment").mockRejectedValueOnce(new Error("synthetic Redis failure"));
+			expect((await t.verify(credential)).statusCode).toBe(503);
+			const rows = await pool.query("SELECT credential_id, identity_subject_id FROM passkey_credentials WHERE credential_id = $1", [credential.id]);
+			expect(rows.rows).toEqual([{ credential_id: credential.id, identity_subject_id: t.f.subject.id }]);
+			expect((await t.verify(credential)).statusCode).not.toBe(200);
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows).toHaveLength(1);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("retains a committed credential when the browser never follows the completion redirect", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			expect((await t.verify(credential)).statusCode).toBe(200);
+			const rows = await pool.query("SELECT credential_id, identity_subject_id FROM passkey_credentials WHERE credential_id = $1", [credential.id]);
+			expect(rows.rows).toEqual([{ credential_id: credential.id, identity_subject_id: t.f.subject.id }]);
+			expect((await t.verify(credential)).statusCode).not.toBe(200);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("rejects an authority whose Redis lifetime expires before verification", async () => {
+		const t = await setup();
+		const a = await authenticator();
+		try {
+			const response = await t.options();
+			const credential = await createCredential(a.page, response.json());
+			const hash = createHash("sha256").update(t.interaction.handle).digest("base64url");
+			await t.redis.pexpire(oidcRedisKey(`interaction_passkey_enrollment_live:${hash}`), 1);
+			await new Promise(resolve => setTimeout(resolve, 20));
+			expect((await t.verify(credential)).statusCode).not.toBe(200);
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [t.f.subject.id])).rows).toHaveLength(0);
+		} finally { await a.close(); await t.close(); }
+	}, 30_000);
+
+	it("enforces credential and authority uniqueness under real PostgreSQL races", async () => {
+		const t = await setup();
+		try {
+			const other = randomUUID();
+			const otherSub = randomUUID();
+			await pool.query(`INSERT INTO identity_subjects
+				(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
+				VALUES ($1, $2, 'HAPI_EMAIL', $3, 'ACTIVE', now(), now())`, [other, otherSub, `test-${other}`]);
+			const handles = await Promise.all(Array.from({ length: 5 }, () => t.credentials.userHandle(t.f.subject.id)));
+			expect(new Set(handles.map(handle => handle.toString("base64url"))).size).toBe(1);
+			const otherHandle = await t.credentials.userHandle(other);
+			const credential = { id: randomBytes(32).toString("base64url"), publicKey: Uint8Array.from([1]), counter: 0 };
+			const inputs = [
+				{ subjectId: t.f.subject.id, oidcSubject: t.f.subject.oidcSubject, userHandle: handles[0], authorityRef: randomUUID() },
+				{ subjectId: other, oidcSubject: otherSub, userHandle: otherHandle, authorityRef: randomUUID() }
+			];
+			const results = await Promise.allSettled(inputs.map(input => t.credentials.insert({ ...input,
+				expiresAt: Date.now() + 60_000, credential, backupEligible: false, backupState: false })));
+			expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+			expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+			const row = (await pool.query("SELECT identity_subject_id, enrollment_authority_ref FROM passkey_credentials WHERE credential_id = $1", [credential.id])).rows[0];
+			const winner = inputs.find(input => input.subjectId === row.identity_subject_id)!;
+			await expect(t.credentials.insert({ ...winner, authorityRef: row.enrollment_authority_ref,
+				expiresAt: Date.now() + 60_000, credential: { ...credential, id: randomBytes(32).toString("base64url") },
+				backupEligible: false, backupState: false })).rejects.toMatchObject({ code: "23505" });
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE enrollment_authority_ref = $1",
+				[row.enrollment_authority_ref])).rows).toHaveLength(1);
+			await t.credentials.insert({ ...winner, authorityRef: randomUUID(), expiresAt: Date.now() + 60_000,
+				credential: { ...credential, id: randomBytes(32).toString("base64url") }, backupEligible: false, backupState: false });
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE identity_subject_id = $1", [winner.subjectId])).rows).toHaveLength(2);
+			const expiredId = randomBytes(32).toString("base64url");
+			await expect(t.credentials.insert({ ...winner, authorityRef: randomUUID(), expiresAt: Date.now() - 1,
+				credential: { ...credential, id: expiredId }, backupEligible: false, backupState: false }))
+				.rejects.toThrow("authority expired");
+			expect((await pool.query("SELECT credential_id FROM passkey_credentials WHERE credential_id = $1", [expiredId])).rows).toHaveLength(0);
+		} finally { await t.close(); }
+	}, 30_000);
 });
 
 describe("H6 Universal Login → existing PrivateID Face", () => {

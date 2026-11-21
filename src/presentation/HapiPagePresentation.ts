@@ -128,6 +128,7 @@ export type HapiPageInput = {
 	eyebrow?: string;
 	fallbackFooter?: string;
 	formActionSelf?: boolean;
+	connectSelf?: boolean;
 };
 
 // Shared HAPI hosted-page shell (Universal Login and Face Setup). Inline styles/scripts are nonce-bound.
@@ -145,7 +146,7 @@ export function renderHapiPage(input: HapiPageInput): RenderedHapiPage {
 <footer>${escapeHtml(brand?.supportCopy ?? input.fallbackFooter ?? "Secured by HAPI ID")}</footer></main>${script ? `<script nonce="${scriptNonce}">${script}</script>` : ""}</body></html>`;
 	return {
 		html,
-		contentSecurityPolicy: `default-src 'none'; style-src 'nonce-${nonce}';${scriptNonce ? ` script-src 'nonce-${scriptNonce}';` : ""} base-uri 'none';${input.formActionSelf ? " form-action 'self';" : ""} frame-ancestors 'none'`
+		contentSecurityPolicy: `default-src 'none'; style-src 'nonce-${nonce}';${scriptNonce ? ` script-src 'nonce-${scriptNonce}';` : ""}${input.connectSelf ? " connect-src 'self';" : ""} base-uri 'none';${input.formActionSelf ? " form-action 'self';" : ""} frame-ancestors 'none'`
 	};
 }
 

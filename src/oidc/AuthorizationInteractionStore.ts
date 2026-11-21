@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import type { PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
+import type { AuthenticatedUser, PendingAuthorizationContext } from "../authentication/AuthenticationProvider.js";
 import type { InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { getRedisClient, oidcRedisKey, type RedisClient } from "./infrastructure/RedisInfrastructure.js";
 
@@ -54,6 +54,64 @@ export type AuthorizationInteraction = {
 export type NewAuthorizationInteraction = Pick<AuthorizationInteraction, "clientId" | "binding" | "authorization" | "request">;
 
 const digest = (value: string) => createHash("sha256").update(value).digest("base64url");
+const ENROLLMENT_AUTHORITY_TTL_MS = 300_000;
+
+type EnrollmentAuthority = {
+	version: 1;
+	purpose: "PASSKEY_ENROLLMENT";
+	principal: AuthenticatedUser;
+	browserProofHash: string;
+	csrfHash: string;
+	expiresAt: number;
+	state: "OFFERED" | "ENROLLING" | "VERIFYING" | "SKIPPED" | "ENROLLED" | "FAILED";
+	registration?: { challenge: string; userHandle: string };
+};
+
+const SAVE_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('EXISTS', KEYS[3]) ~= 0 then return 0 end
+local ttl = math.min(tonumber(ARGV[2]), redis.call('PTTL', KEYS[1]))
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ttl, 'XX')
+return 1`;
+
+const CONSUME_SCRIPT = `
+if redis.call('EXISTS', KEYS[3]) ~= 0 or redis.call('EXISTS', KEYS[2]) ~= 0 then return 0 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local ttl = math.min(tonumber(ARGV[2]), redis.call('PTTL', KEYS[1]))
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[2], '1', 'PX', ttl, 'NX')
+redis.call('DEL', KEYS[1])
+return 1`;
+
+// Keep the authority for skip/failure recovery, but enforce its shorter lifetime atomically.
+const OFFER_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('EXISTS', KEYS[3]) ~= 0 or redis.call('EXISTS', KEYS[4]) ~= 0 then return 0 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local ttl = math.min(tonumber(ARGV[3]), redis.call('PTTL', KEYS[1]))
+local liveTtl = math.min(ttl, tonumber(ARGV[4]))
+if liveTtl <= 0 then return 0 end
+redis.call('SET', KEYS[3], ARGV[2], 'PX', ttl, 'NX')
+redis.call('SET', KEYS[4], '1', 'PX', liveTtl, 'NX')
+return 1`;
+
+const TRANSITION_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('GET', KEYS[3]) ~= ARGV[2] then return 0 end
+if ARGV[5] == '1' and redis.call('EXISTS', KEYS[4]) == 0 then return 0 end
+local ttl = math.min(tonumber(ARGV[4]), redis.call('PTTL', KEYS[1]), redis.call('PTTL', KEYS[3]))
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[3], ARGV[3], 'PX', ttl, 'XX')
+return 1`;
+
+const FINISH_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('GET', KEYS[3]) ~= ARGV[2] then return 0 end
+if ARGV[4] == '1' and redis.call('EXISTS', KEYS[4]) == 0 then return 0 end
+local ttl = math.min(tonumber(ARGV[3]), redis.call('PTTL', KEYS[1]), redis.call('PTTL', KEYS[3]))
+if ttl <= 0 then return 0 end
+redis.call('SET', KEYS[2], '1', 'PX', ttl, 'NX')
+redis.call('DEL', KEYS[1], KEYS[3], KEYS[4])
+return 1`;
 
 // Opaque, short-lived, single-use server-side record of a validated interactive authorization request.
 // Only a SHA-256 of the browser handle is used as the storage key.
@@ -111,7 +169,8 @@ export class AuthorizationInteractionStore {
 	async save(handle: string, interaction: AuthorizationInteraction): Promise<boolean> {
 		const remaining = interaction.expiresAt - this.clock();
 		if (remaining <= 0) return false;
-		return await this.redis.set(this.key(handle), JSON.stringify(interaction), "PX", remaining, "XX") === "OK";
+		return await this.redis.eval(SAVE_SCRIPT, 3, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), JSON.stringify(interaction), Math.floor(remaining)) === 1;
 	}
 
 	// Atomic single-use: exactly one caller can win the consumed marker for a handle.
@@ -120,10 +179,118 @@ export class AuthorizationInteractionStore {
 		if (!interaction || !handle) return null;
 		const remaining = interaction.expiresAt - this.clock();
 		if (remaining <= 0) return null;
-		const won = await this.redis.set(this.consumedKey(handle), "1", "PX", remaining, "NX");
-		if (won !== "OK") return null;
-		await this.redis.del(this.key(handle));
-		return interaction;
+		const won = await this.redis.eval(CONSUME_SCRIPT, 3, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), JSON.stringify(interaction), Math.floor(remaining));
+		return won === 1 ? interaction : null;
+	}
+
+	// Locks the original interaction while a separately browser-bound enrollment authority exists.
+	async offerPasskeyEnrollment(handle: string, interaction: AuthorizationInteraction, principal: AuthenticatedUser):
+		Promise<{ browserProof: string } | null> {
+		if (!HANDLE_PATTERN.test(handle) || !principal.id || !principal.sub ||
+			!["HAPI_EMAIL", "APPLE", "GOOGLE"].includes(principal.authenticationMethod ?? "")) return null;
+		const remaining = interaction.expiresAt - this.clock();
+		if (remaining <= 0) return null;
+		const browserProof = randomBytes(32).toString("base64url");
+		const authority: EnrollmentAuthority = {
+			version: 1, purpose: "PASSKEY_ENROLLMENT", principal,
+			browserProofHash: digest(browserProof), csrfHash: digest(interaction.csrf),
+			expiresAt: Math.min(interaction.expiresAt, this.clock() + ENROLLMENT_AUTHORITY_TTL_MS),
+			state: "OFFERED"
+		};
+		const result = await this.redis.eval(OFFER_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), JSON.stringify(interaction),
+			JSON.stringify(authority), Math.floor(remaining), Math.floor(authority.expiresAt - this.clock()));
+		return result === 1 ? { browserProof } : null;
+	}
+
+	async transitionPasskeyEnrollment(handle: string, browserProof: string, csrf: string,
+		subjectId: string, from: EnrollmentAuthority["state"], to: EnrollmentAuthority["state"]): Promise<boolean> {
+		if (!subjectId) return false;
+		const allowed = (from === "OFFERED" && (to === "SKIPPED" || to === "ENROLLING")) ||
+			(from === "ENROLLING" && (to === "ENROLLED" || to === "FAILED")) ||
+			(from === "VERIFYING" && (to === "ENROLLED" || to === "FAILED"));
+		if (!allowed) return false;
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId, to === "FAILED");
+		if (!loaded || loaded.authority.state !== from) return false;
+		const updated = JSON.stringify({ ...loaded.authority, state: to });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), to === "FAILED" ? "0" : "1");
+		return result === 1;
+	}
+
+	async beginPasskeyRegistration(handle: string, browserProof: string, csrf: string,
+		subjectId: string, challenge: string, userHandle: string): Promise<boolean> {
+		if (!HANDLE_PATTERN.test(challenge) || !HANDLE_PATTERN.test(userHandle)) return false;
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
+		if (!loaded || loaded.authority.state !== "OFFERED") return false;
+		const updated = JSON.stringify({ ...loaded.authority, state: "ENROLLING", registration: { challenge, userHandle } });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), "1");
+		return result === 1;
+	}
+
+	async claimPasskeyRegistration(handle: string, browserProof: string, csrf: string, subjectId: string):
+		Promise<{ principal: AuthenticatedUser; challenge: string; userHandle: string; expiresAt: number; authorityRef: string } | null> {
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId);
+		if (!loaded || loaded.authority.state !== "ENROLLING" || !loaded.authority.registration) return null;
+		const updated = JSON.stringify({ ...loaded.authority, state: "VERIFYING" });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), "1");
+		if (result !== 1) return null;
+		return { principal: loaded.authority.principal, ...loaded.authority.registration,
+			expiresAt: loaded.authority.expiresAt, authorityRef: digest(handle) };
+	}
+
+	// Expiry ends enrollment, but the original browser-bound OIDC request may still be completed.
+	async expirePasskeyEnrollment(handle: string, browserProof: string, csrf: string, subjectId: string): Promise<boolean> {
+		if (!subjectId) return false;
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId, true);
+		if (!loaded || loaded.authority.state !== "OFFERED" || loaded.authority.expiresAt > this.clock()) return false;
+		const updated = JSON.stringify({ ...loaded.authority, state: "SKIPPED" });
+		const result = await this.redis.eval(TRANSITION_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw, updated,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), "0");
+		return result === 1;
+	}
+
+	async finishPasskeyEnrollment(handle: string, browserProof: string, csrf: string, subjectId: string):
+		Promise<{ interaction: AuthorizationInteraction; principal: AuthenticatedUser } | null> {
+		if (!subjectId) return null;
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, subjectId, true);
+		if (!loaded || !["SKIPPED", "ENROLLED", "FAILED"].includes(loaded.authority.state)) return null;
+		if (loaded.authority.state === "ENROLLED" && loaded.authority.expiresAt <= this.clock()) return null;
+		const result = await this.redis.eval(FINISH_SCRIPT, 4, this.key(handle), this.consumedKey(handle),
+			this.enrollmentKey(handle), this.enrollmentLiveKey(handle), loaded.interactionRaw, loaded.authorityRaw,
+			Math.floor(loaded.interaction.expiresAt - this.clock()), loaded.authority.state === "ENROLLED" ? "1" : "0");
+		return result === 1 ? { interaction: loaded.interaction, principal: loaded.authority.principal } : null;
+	}
+
+	async inspectPasskeyEnrollment(handle: string, browserProof: string, csrf: string) {
+		const loaded = await this.loadEnrollmentAuthority(handle, browserProof, csrf, undefined, true);
+		if (!loaded) return null;
+		return { principal: loaded.authority.principal, state: loaded.authority.state,
+			expired: loaded.authority.expiresAt <= this.clock() };
+	}
+
+	private async loadEnrollmentAuthority(handle: string, browserProof: string, csrf: string, subjectId?: string,
+		allowExpired = false) {
+		if (!HANDLE_PATTERN.test(handle) || !HANDLE_PATTERN.test(browserProof) || !csrf) return null;
+		const [interactionRaw, authorityRaw] = await Promise.all([
+			this.redis.get(this.key(handle)), this.redis.get(this.enrollmentKey(handle))
+		]);
+		if (!interactionRaw || !authorityRaw) return null;
+		const interaction = JSON.parse(interactionRaw) as AuthorizationInteraction;
+		const authority = JSON.parse(authorityRaw) as EnrollmentAuthority;
+		if (interaction.version !== 1 || authority.version !== 1 || authority.purpose !== "PASSKEY_ENROLLMENT" ||
+			interaction.expiresAt <= this.clock() || (!allowExpired && authority.expiresAt <= this.clock()) ||
+			(subjectId !== undefined && authority.principal.id !== subjectId) ||
+			!timingSafeEqual(Buffer.from(digest(browserProof)), Buffer.from(authority.browserProofHash)) ||
+			!timingSafeEqual(Buffer.from(digest(csrf)), Buffer.from(authority.csrfHash))) return null;
+		return { interaction, authority, interactionRaw, authorityRaw };
 	}
 
 	static csrfMatches(interaction: AuthorizationInteraction, candidate: unknown): boolean {
@@ -137,5 +304,13 @@ export class AuthorizationInteractionStore {
 
 	private consumedKey(handle: string): string {
 		return oidcRedisKey(`interaction_consumed:${digest(handle)}`);
+	}
+
+	private enrollmentKey(handle: string): string {
+		return oidcRedisKey(`interaction_passkey_enrollment:${digest(handle)}`);
+	}
+
+	private enrollmentLiveKey(handle: string): string {
+		return oidcRedisKey(`interaction_passkey_enrollment_live:${digest(handle)}`);
 	}
 }

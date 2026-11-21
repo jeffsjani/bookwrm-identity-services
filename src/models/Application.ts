@@ -1,5 +1,5 @@
 export type ApplicationStatus = "active" | "suspended";
-export type AuthenticationMethod = "HAPI_EMAIL" | "PRIVATEID_FACE" | "EXTERNAL_OIDC" | "EXTERNAL_SAML";
+export type AuthenticationMethod = "HAPI_EMAIL" | "PRIVATEID_FACE" | "EXTERNAL_OIDC" | "EXTERNAL_SAML" | "PASSKEY";
 export type ApplicationPresentation = {
 		logoUri?: string;
 		primaryColor?: string;

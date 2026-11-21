@@ -6,6 +6,7 @@ import formbody from "@fastify/formbody";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { configuration } from "../src/config/ConfigurationService.js";
+import { resolveConfiguredIssuer } from "../src/config/IssuerPolicy.js";
 import { OIDCService, type OIDCClient } from "../src/oidc/OIDCService.js";
 import type { AuthenticationProvider, PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
 import { InMemoryTenantRepository } from "../src/identity/InMemoryTenantRepository.js";
@@ -325,11 +326,72 @@ function decodeJwt(token: string): Record<string, unknown> {
 
 afterEach(() => {
 	setFlags({ HAPI_UNIVERSAL_LOGIN_ENABLED: undefined, HAPI_APPLE_FEDERATION_ENABLED: undefined,
-		HAPI_GOOGLE_FEDERATION_ENABLED: undefined, HAPI_PERSISTENT_SESSIONS_ENABLED: undefined });
+		HAPI_GOOGLE_FEDERATION_ENABLED: undefined, HAPI_PERSISTENT_SESSIONS_ENABLED: undefined,
+		HAPI_PASSKEY_AUTHENTICATION_ENABLED: undefined });
 	vi.restoreAllMocks();
 });
 
 describe("V2-D federated Universal Login (synthetic providers)", () => {
+	it("offers enrollment after Apple linking has committed and completes as the email-authenticated subject", async () => {
+		const f = await federatedFixture({ flags: { HAPI_PASSKEY_AUTHENTICATION_ENABLED: true } });
+		try {
+			const application = (await f.h1.applications.findById(f.applicationId))!;
+			await f.h1.applications.upsert({ ...application, allowedAuthenticationMethods: [...application.allowedAuthenticationMethods, "PASSKEY"] });
+			const email = await enableEmail(f);
+			const verifier = "verifier-link-then-offer";
+			const interaction = await beginInteraction(f, verifier);
+			await chooseAppleEmail(f, interaction);
+			await startLinkEmail(f, interaction, email.email);
+			const offered = await submitLinkCode(f, interaction, email.delivery.messages[0].code);
+			expect(offered.statusCode, offered.body).toBe(303);
+			expect(offered.headers.location).toBe("/login/passkey");
+			expect(await f.federation.listExternalIdentities(email.subject.id)).toHaveLength(1);
+			const proof = cookieFrom(offered, "__Host-hapi_passkey")!;
+			const cookies = `${interaction.cookie}; __Host-hapi_passkey=${proof}`;
+			const skip = await f.app.inject({ method: "POST", url: "/login/passkey/skip",
+				...form({ csrf: interaction.csrf }, cookies), headers: { ...form({}).headers, cookie: cookies, origin: resolveConfiguredIssuer() } });
+			expect(skip.statusCode, skip.body).toBe(303);
+			const token = await exchangeCode(f, skip.headers.location as string, verifier);
+			expect(token.statusCode, token.body).toBe(200);
+			expect(decodeJwt(token.json().id_token).sub).toBe(email.subject.oidcSubject);
+		} finally { await f.app.close(); }
+	});
+
+	it.each(["APPLE", "GOOGLE"] as const)("offers the same-subject enrollment bridge for returning %s login", async provider => {
+		const f = await federatedFixture({ flags: { HAPI_PASSKEY_AUTHENTICATION_ENABLED: true } });
+		try {
+			const application = (await f.h1.applications.findById(f.applicationId))!;
+			await f.h1.applications.upsert({ ...application, allowedAuthenticationMethods: [...application.allowedAuthenticationMethods, "PASSKEY"] });
+			const subject = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+				primaryProvider: "HAPI_EMAIL", primaryProviderSubject: "member@example.test",
+				emailVerified: true, status: "ACTIVE" });
+			await f.federation.linkExternalIdentity({ identitySubjectId: subject.id, provider,
+				providerIssuer: provider === "APPLE" ? APPLE_ISSUER : GOOGLE_ISSUER, providerSubject: f.identities[provider].sub });
+			const verifier = `verifier-return-${provider}`;
+			const interaction = await beginInteraction(f, verifier);
+			const { state, code } = await launchProvider(f, interaction, provider);
+			const callback = provider === "APPLE" ? await appleCallback(f, { state, code })
+				: await f.app.inject({ method: "GET", url: `/federation/google/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(code)}` });
+			expect(callback.statusCode, callback.body).toBe(303);
+			expect(callback.headers.location).toBe("/login/passkey");
+			const proof = cookieFrom(callback, "__Host-hapi_passkey")!;
+			expect(proof).toMatch(/^[A-Za-z0-9_-]{43}$/);
+			// Apple's cross-site callback does not carry the original browser cookie; the offer
+			// can only be opened after the browser returns with both cookies.
+			expect((await f.app.inject({ method: "GET", url: "/login/passkey",
+				headers: { cookie: `__Host-hapi_passkey=${proof}` } })).statusCode).toBe(400);
+			const cookies = `${interaction.cookie}; __Host-hapi_passkey=${proof}`;
+			const page = await f.app.inject({ method: "GET", url: "/login/passkey", headers: { cookie: cookies } });
+			expect(page.statusCode).toBe(200);
+			const skip = await f.app.inject({ method: "POST", url: "/login/passkey/skip",
+				...form({ csrf: interaction.csrf }, cookies), headers: { ...form({}).headers, cookie: cookies, origin: resolveConfiguredIssuer() } });
+			expect(skip.statusCode, skip.body).toBe(303);
+			const token = await exchangeCode(f, skip.headers.location as string, verifier);
+			expect(token.statusCode, token.body).toBe(200);
+			expect(decodeJwt(token.json().id_token).sub).toBe(subject.oidcSubject);
+		} finally { await f.app.close(); }
+	});
+
 	it("links Apple only after email OTP and explicit consent, and returns the same subject on later Apple login", async () => {
 		const f = await federatedFixture();
 		const email = await enableEmail(f);

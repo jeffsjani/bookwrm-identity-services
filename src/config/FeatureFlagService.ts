@@ -48,6 +48,10 @@ export class FeatureFlagService {
 				return configuration.getFeatureFlag("HAPI_GOOGLE_FEDERATION_ENABLED", false);
 		}
 
+		isPasskeyAuthenticationEnabled(): boolean {
+				return configuration.getFeatureFlag("HAPI_PASSKEY_AUTHENTICATION_ENABLED", false);
+		}
+
 		// HAPI ID V2-D: authenticated account-linking API (V2-C Phase 4 design). Default OFF.
 		isAccountLinkingApiEnabled(): boolean {
 				return configuration.getFeatureFlag("HAPI_ACCOUNT_LINKING_API_ENABLED", false);

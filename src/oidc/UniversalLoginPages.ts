@@ -1,6 +1,9 @@
 import {
 	alert, brandForClient, csrfField, escapeHtml, otpSubmitScript, renderHapiPage, type ClientBrand, type RenderedHapiPage
 } from "../presentation/HapiPagePresentation.js";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 export type RenderedLoginPage = RenderedHapiPage;
 
@@ -103,4 +106,49 @@ ${consent}
 
 export function messagePage(input: { tenantName?: string; title: string; message: string }): RenderedLoginPage {
 	return render(input.title, input.title, `<p>${escapeHtml(input.message)}</p>`);
+}
+
+export function passkeyOfferPage(input: { tenantName?: string; clientId?: string; csrf: string; available?: boolean }): RenderedLoginPage {
+	const brand = brandForClient(input.clientId);
+	if (input.available === false) {
+		return render(heading(input.tenantName), "Add a passkey", `
+<p>Passkey setup is currently unavailable.</p>
+<form id="passkey-skip" method="post" action="/login/passkey/skip">${csrfField(input.csrf)}
+<button type="submit" class="secondary">Not Now</button></form>`, undefined, brand);
+	}
+	const browserPath = createRequire(import.meta.url).resolve("@simplewebauthn/browser");
+	const browser = readFileSync(join(dirname(browserPath), "../dist/bundle/index.umd.min.js"), "utf8");
+	const script = `${browser}
+(() => {
+	const button = document.getElementById("passkey-add");
+	const status = document.getElementById("passkey-status");
+	const csrf = document.querySelector('#passkey-skip input[name="csrf"]').value;
+	button.addEventListener("click", async () => {
+		button.disabled = true;
+		status.textContent = "Creating your passkey...";
+		try {
+			const headers = { "Content-Type": "application/json" };
+			const optionsResponse = await fetch("/login/passkey/options", {
+				method: "POST", headers, body: JSON.stringify({ csrf })
+			});
+			if (!optionsResponse.ok) throw new Error("options failed");
+			const optionsJSON = await optionsResponse.json();
+			const credential = await SimpleWebAuthnBrowser.startRegistration({ optionsJSON });
+			const verification = await fetch("/login/passkey/verify", {
+				method: "POST", headers, body: JSON.stringify({ csrf, credential })
+			});
+			if (!verification.ok) throw new Error("verification failed");
+			const result = await verification.json();
+			window.location.assign(result.redirect);
+		} catch {
+			status.textContent = "Passkey setup could not be completed. Start sign-in again, or choose Not Now if available.";
+		}
+	});
+})();`;
+	return renderHapiPage({ title: heading(input.tenantName), heading: "Add a passkey", body: `
+<p>Add a passkey for future sign-in.</p>
+<button id="passkey-add" type="button">Add Passkey</button>
+<p id="passkey-status" role="status" aria-live="polite"></p>
+<form id="passkey-skip" method="post" action="/login/passkey/skip">${csrfField(input.csrf)}
+<button type="submit" class="secondary">Not Now</button></form>`, script, brand, connectSelf: true });
 }

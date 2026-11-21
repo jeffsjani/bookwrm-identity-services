@@ -5,13 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql && cp src/identity/schema-federation.sql dist/identity/schema-federation.sql && cp src/identity/schema-sessions.sql dist/identity/schema-sessions.sql && cp src/identity/schema-refresh.sql dist/identity/schema-refresh.sql && cp src/email/schema.sql dist/email/schema.sql && cp src/registration/schema.sql dist/registration/schema.sql && cp src/authentication/email/schema.sql dist/authentication/email/schema.sql && cp src/authenticators/schema.sql dist/authenticators/schema.sql",
+    "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql && cp src/identity/schema-federation.sql dist/identity/schema-federation.sql && cp src/identity/schema-sessions.sql dist/identity/schema-sessions.sql && cp src/identity/schema-refresh.sql dist/identity/schema-refresh.sql && cp src/identity/schema-passkeys.sql dist/identity/schema-passkeys.sql && cp src/email/schema.sql dist/email/schema.sql && cp src/registration/schema.sql dist/registration/schema.sql && cp src/authentication/email/schema.sql dist/authentication/email/schema.sql && cp src/authenticators/schema.sql dist/authenticators/schema.sql",
     "start": "node dist/server.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",
     "@fastify/formbody": "^9.0.0",
     "@fastify/helmet": "^13.1.0",
+    "@simplewebauthn/browser": "^13.3.0",
+    "@simplewebauthn/server": "^13.3.3",
     "axios": "^1.19.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.11.3",

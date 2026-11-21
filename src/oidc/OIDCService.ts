@@ -10,6 +10,7 @@ import {
 } from "node:crypto";
 import Provider from "oidc-provider";
 import { z } from "zod";
+import { generateRegistrationOptions, verifyRegistrationResponse } from "@simplewebauthn/server";
 import type { EmailOIDCHandoff } from "../authentication/EmailOIDCHandoff.js";
 import { EmailAuthenticationError } from "../authentication/email/EmailAuthenticationTypes.js";
 import { VerificationError } from "../email/VerificationChallenge.js";
@@ -22,6 +23,7 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
+import { PostgresPasskeyCredentialRepository } from "../identity/PostgresPasskeyCredentialRepository.js";
 import { resolveRegisteredClient, requireApplicationMethod, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
 import { inMemoryApplicationRepository } from "../identity/InMemoryApplicationRepository.js";
 import { inMemoryTenantRepository } from "../identity/InMemoryTenantRepository.js";
@@ -64,7 +66,7 @@ import {
 		type AuthorizationInteraction,
 		type AuthorizationInteractionBinding
 } from "./AuthorizationInteractionStore.js";
-import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, type RenderedLoginPage } from "./UniversalLoginPages.js";
+import { chooserPage, codePage, emailPage, federatedAccountChoicePage, messagePage, passkeyOfferPage, type RenderedLoginPage } from "./UniversalLoginPages.js";
 import type { InteractiveEmailAuthority, InteractiveEmailMode } from "../authentication/InteractiveEmailAuthentication.js";
 import { bucketRemainingTtl, diagnosticCorrelationId, logUniversalLoginDiagnostic } from "./UniversalLoginDiagnostics.js";
 import {
@@ -92,9 +94,20 @@ import type { AuthenticationMethod } from "../models/Application.js";
 
 // __Host- prefix: Secure, host-only, Path=/ — the interaction handle cannot be scoped to another domain.
 const UNIVERSAL_LOGIN_COOKIE = "__Host-hapi_login";
+const PASSKEY_ENROLLMENT_COOKIE = "__Host-hapi_passkey";
 const universalLoginEmailSchema = z.string().trim().min(3).max(320).email();
 const isInteractiveEmailMode = (value: unknown): value is InteractiveEmailMode =>
 	value === "AUTHENTICATION" || value === "REGISTRATION" || value === "INELIGIBLE";
+const base64url = z.string().regex(/^[A-Za-z0-9_-]+$/).max(100_000);
+const registrationResponseSchema = z.object({
+		id: base64url, rawId: base64url, type: z.literal("public-key"),
+		authenticatorAttachment: z.enum(["platform", "cross-platform"]).optional(),
+		clientExtensionResults: z.object({}).passthrough(),
+		response: z.object({
+				clientDataJSON: base64url, attestationObject: base64url,
+				transports: z.array(z.enum(["ble", "cable", "hybrid", "internal", "nfc", "smart-card", "usb"])).max(7).optional()
+		}).passthrough()
+});
 
 export type OIDCClient = Record<string, unknown>;
 export type OIDCSigningKey = JsonWebKey;
@@ -108,6 +121,8 @@ export type OIDCServiceOptions = {
 		authenticationProvider: AuthenticationProvider;
 		oidcClients?: OIDCClientRepository;
 		clientAuthority?: H1ClientAuthority;
+		interactionStore?: AuthorizationInteractionStore;
+		passkeyCredentials?: PostgresPasskeyCredentialRepository;
 		refreshTokenRotation?: RefreshTokenRotationService;
 		// HAPI ID V2-D: injectable federation collaborators (tests supply synthetic providers).
 		// Defaults are constructed lazily from configuration, and ONLY consulted when the
@@ -230,6 +245,7 @@ export class OIDCService {
 		private readonly lockService: RedisLockService;
 		private readonly rateLimiter: OIDCRateLimiter;
 		private readonly interactions: AuthorizationInteractionStore;
+		private readonly passkeyCredentials: PostgresPasskeyCredentialRepository;
 		private readonly keyRotationService: OIDCKeyRotationService;
 		private readonly providerAdapter = new RedisOIDCProviderAdapter();
 		// HAPI ID V2-C: constructed lazily and consulted only when HAPI_REFRESH_GRANT_ENABLED is on.
@@ -264,7 +280,8 @@ export class OIDCService {
 				this.lockService = new RedisLockService();
 				this.rateLimiter = new OIDCRateLimiter();
 				this.keyRotationService = new OIDCKeyRotationService();
-				this.interactions = new AuthorizationInteractionStore();
+				this.interactions = options.interactionStore ?? new AuthorizationInteractionStore();
+				this.passkeyCredentials = options.passkeyCredentials ?? new PostgresPasskeyCredentialRepository();
 				this.refreshRotation = options.refreshTokenRotation;
 				this.federationTransactions = options.federation?.transactions;
 				this.federationResolution = options.federation?.resolution;
@@ -1435,6 +1452,170 @@ export class OIDCService {
 								...(errorMessage !== undefined ? { error: errorMessage } : {}) }));
 				};
 
+				const passkeyOffered = async (interaction: AuthorizationInteraction) => {
+						if (!featureFlags.isPasskeyAuthenticationEnabled()) return false;
+						const registration = await resolveRegisteredClient(interaction.clientId, this.clientAuthority);
+						return registration.application.allowedAuthenticationMethods.includes("PASSKEY");
+				};
+				const showPasskeyOffer = (reply: FastifyReply, browserProof: string) => reply
+						.header("Set-Cookie", `${PASSKEY_ENROLLMENT_COOKIE}=${browserProof}; Path=/; Max-Age=${AUTHORIZATION_INTERACTION_TTL_MS / 1000}; HttpOnly; Secure; SameSite=Lax`)
+						.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer")
+						.redirect("/login/passkey", 303);
+				const browserProof = (request: FastifyRequest) => request.headers.cookie?.split(";").map(value => value.trim())
+						.find(value => value.startsWith(`${PASSKEY_ENROLLMENT_COOKIE}=`))?.slice(PASSKEY_ENROLLMENT_COOKIE.length + 1);
+				app.get("/login/passkey", async (request, reply) => {
+						const loaded = await load(request, reply, false, "GET /login/passkey");
+						if (!loaded) return reply;
+						const proof = browserProof(request);
+						const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+						if (!enrollment || enrollment.state !== "OFFERED") return expired(reply);
+						return send(reply, 200, passkeyOfferPage({ tenantName: loaded.interaction.binding?.tenantName,
+								clientId: loaded.interaction.clientId, csrf: loaded.interaction.csrf,
+								available: !enrollment.expired && await passkeyOffered(loaded.interaction) }));
+				});
+				app.post("/login/passkey/options", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/options");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								if (!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) {
+										return reply.code(403).send({ error: "passkey_not_allowed" });
+								}
+								const proof = browserProof(request);
+								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "OFFERED") return expired(reply);
+								const subject = await identityRegistry.findById(enrollment.principal.id);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
+								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(enrollment.principal.authenticationMethod));
+								const userHandle = await this.passkeyCredentials.userHandle(subject.id);
+								const excludeCredentials = await this.passkeyCredentials.activeCredentials(subject.id);
+								const issuer = this.resolveIssuer();
+								const options = await generateRegistrationOptions({
+										rpName: issuer === "https://id-staging.hapiinc.com" ? "HAPI ID Staging" : "HAPI ID",
+										rpID: new URL(issuer).hostname,
+										userName: "HAPI ID account", userDisplayName: "HAPI ID account",
+										userID: Uint8Array.from(userHandle), excludeCredentials, attestationType: "none",
+										authenticatorSelection: { residentKey: "required", userVerification: "required" }
+								});
+								if (!await this.interactions.beginPasskeyRegistration(loaded.handle, proof, loaded.interaction.csrf,
+										subject.id, options.challenge, userHandle.toString("base64url"))) return expired(reply);
+								return reply.header("Cache-Control", "no-store").send(options);
+						} catch (error) {
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_OPTIONS_UNAVAILABLE" }, "Passkey options failed");
+								return reply.code(503).send({ error: "passkey_unavailable" });
+						}
+				});
+				app.post("/login/passkey/verify", { bodyLimit: 131072 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/verify");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								if (!await passkeyOffered(loaded.interaction) || !await this.interactionClientStillValid(loaded.interaction)) {
+										return reply.code(403).send({ error: "passkey_not_allowed" });
+								}
+								const parsed = registrationResponseSchema.safeParse(loaded.body.credential);
+								if (!parsed.success || parsed.data.id !== parsed.data.rawId) return reply.code(400).send({ error: "invalid_credential" });
+								const proof = browserProof(request);
+								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+								if (!proof || !enrollment || enrollment.expired || enrollment.state !== "ENROLLING") return expired(reply);
+								const subject = await identityRegistry.findById(enrollment.principal.id);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
+								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(enrollment.principal.authenticationMethod));
+								const claimed = await this.interactions.claimPasskeyRegistration(loaded.handle, proof, loaded.interaction.csrf, subject.id);
+								if (!claimed) return expired(reply);
+								let verified;
+								try {
+										verified = await verifyRegistrationResponse({
+												response: parsed.data, expectedChallenge: claimed.challenge,
+												expectedOrigin: this.resolveIssuer(), expectedRPID: new URL(this.resolveIssuer()).hostname,
+												requireUserPresence: true, requireUserVerification: true
+										});
+								} catch {
+										await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+												subject.id, "VERIFYING", "FAILED");
+										app.log.warn({ event: "UNIVERSAL_LOGIN_PASSKEY_INVALID_CREDENTIAL" }, "Passkey verification rejected");
+										return reply.code(400).send({ error: "invalid_credential" });
+								}
+								if (!verified.verified) {
+										await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+												subject.id, "VERIFYING", "FAILED");
+										return reply.code(400).send({ error: "invalid_credential" });
+								}
+								try {
+										await this.passkeyCredentials.insert({
+												subjectId: subject.id, oidcSubject: subject.oidcSubject,
+												userHandle: Buffer.from(claimed.userHandle, "base64url"), authorityRef: claimed.authorityRef,
+												expiresAt: claimed.expiresAt, credential: verified.registrationInfo.credential,
+												backupEligible: verified.registrationInfo.credentialDeviceType === "multiDevice",
+												backupState: verified.registrationInfo.credentialBackedUp
+										});
+								} catch (error) {
+										try {
+												await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+														subject.id, "VERIFYING", "FAILED");
+										} catch {
+												app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_FAILURE_TRANSITION_UNAVAILABLE" }, "Passkey failure transition failed");
+										}
+										throw error;
+								}
+								if (!await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+										subject.id, "VERIFYING", "ENROLLED")) return reply.code(503).send({ error: "passkey_unavailable" });
+								const completed = await this.interactions.finishPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf, subject.id);
+								if (!completed) return reply.code(503).send({ error: "passkey_unavailable" });
+								const redirect = await this.issueAuthorizationRedirect(completed.principal, completed.interaction.authorization);
+								const cookies = [this.interactionCookie(null),
+										`${PASSKEY_ENROLLMENT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`];
+								const sessionCookie = await this.maybeEstablishSession(request, completed.principal, completed.interaction.clientId);
+								if (sessionCookie) cookies.push(sessionCookie);
+								return reply.header("Set-Cookie", cookies).header("Cache-Control", "no-store")
+										.header("Referrer-Policy", "no-referrer").send({ redirect });
+						} catch (error) {
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_VERIFY_UNAVAILABLE" }, "Passkey enrollment failed");
+								return reply.code(503).send({ error: "passkey_unavailable" });
+						}
+				});
+				app.post("/login/passkey/skip", { bodyLimit: 4096 }, async (request, reply) => {
+						try {
+								const loaded = await load(request, reply, true, "POST /login/passkey/skip");
+								if (!loaded) return reply;
+								if (request.headers.origin !== this.resolveIssuer()) return reply.code(403).send({ error: "invalid_origin" });
+								const proof = browserProof(request);
+								const enrollment = proof && await this.interactions.inspectPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf);
+								if (!proof || !enrollment || !["OFFERED", "ENROLLING", "FAILED"].includes(enrollment.state) ||
+										!await this.interactionClientStillValid(loaded.interaction)) return expired(reply);
+								const subject = await identityRegistry.findById(enrollment.principal.id);
+								if (!subject || subject.status !== "ACTIVE" || subject.oidcSubject !== enrollment.principal.sub) return expired(reply);
+								await requireApplicationMethod(loaded.interaction.clientId, this.clientAuthority,
+										this.applicationMethodFor(enrollment.principal.authenticationMethod));
+								const claimed = enrollment.state === "FAILED" ? true
+										: enrollment.state === "ENROLLING"
+												? await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+														subject.id, "ENROLLING", "FAILED")
+												: enrollment.expired
+														? await this.interactions.expirePasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf, subject.id)
+														: await this.interactions.transitionPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf,
+																subject.id, "OFFERED", "SKIPPED");
+								if (!claimed) return expired(reply);
+								const completed = await this.interactions.finishPasskeyEnrollment(loaded.handle, proof, loaded.interaction.csrf, subject.id);
+								if (!completed) return expired(reply);
+								const redirect = await this.issueAuthorizationRedirect(completed.principal, completed.interaction.authorization);
+								const cookies = [this.interactionCookie(null),
+										`${PASSKEY_ENROLLMENT_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`];
+								const sessionCookie = await this.maybeEstablishSession(request, completed.principal, completed.interaction.clientId);
+								if (sessionCookie) cookies.push(sessionCookie);
+								return reply.header("Set-Cookie", cookies).header("Cache-Control", "no-store")
+										.header("Referrer-Policy", "no-referrer").redirect(redirect, 303);
+						} catch (error) {
+								if (error instanceof VerificationError) return reply.code(403).send({ error: "authentication_method_not_allowed" });
+								app.log.error({ event: "UNIVERSAL_LOGIN_PASSKEY_SKIP_UNAVAILABLE" }, "Passkey offer completion failed");
+								return unavailable(reply);
+						}
+				});
+
 				app.get("/login", async (request, reply) => {
 						const loaded = await load(request, reply, false, "GET /login");
 						if (!loaded) return reply;
@@ -1573,6 +1754,31 @@ export class OIDCService {
 								const verification = await interactive.verify(authority, interaction.email.challengeId, code, mode);
 								logUniversalLoginDiagnostic(app, { event: "UNIVERSAL_LOGIN_EMAIL_VERIFIED", route: "POST /login/email/code",
 										clientId: interaction.clientId, correlationId, authorityValid: true, clientValid: true, authenticationMethod: "email" });
+								const connectVerifiedApple = async (principal: AuthenticatedUser, verifiedInteraction: AuthorizationInteraction) => {
+										if (!connectingApple(verifiedInteraction)) return true;
+										const federation = verifiedInteraction.federation!;
+										if (verification.mode !== "AUTHENTICATION") throw new EmailAuthenticationError();
+										await requireApplicationMethod(verifiedInteraction.clientId, this.clientAuthority, "EXTERNAL_OIDC");
+										const linked = await this.getFederationResolution().linkExisting(principal.id, {
+												provider: federation.provider, providerIssuer: federation.providerIssuer,
+												providerSubject: federation.providerSubject, audience: federation.audience,
+												isPrivateRelayEmail: federation.isPrivateRelayEmail,
+												evidenceReference: federation.evidenceReference, expiresAt: 0
+										});
+										if (linked.status === "linked" || linked.status === "already_linked") return true;
+										logLogin(request, "universal_login_federated_apple_link", verifiedInteraction, startedAt, false, linked.status);
+										return false;
+								};
+								const linkConflict = () => send(reply, 409, messagePage({ title: "Apple sign-in could not be connected",
+										message: "This sign-in could not be connected to your account. Start again or contact support." }));
+								if (await passkeyOffered(interaction)) {
+										const principal = verification.mode === "REGISTRATION" ? verification.principal
+												: await interactive.consumeResult(authority, verification.authenticationResult);
+										const offered = await this.interactions.offerPasskeyEnrollment(loaded.handle, interaction, principal);
+										if (!offered) return expired(reply);
+										if (!await connectVerifiedApple(principal, interaction)) return linkConflict();
+										return showPasskeyOffer(reply, offered.browserProof);
+								}
 								// Single-use: only the request that wins the interaction may turn the H4 result into an authorization code.
 								const consumed = await this.interactions.consume(loaded.handle);
 								if (!consumed) {
@@ -1589,22 +1795,7 @@ export class OIDCService {
 										clientId: interaction.clientId, correlationId });
 								const principal = verification.mode === "REGISTRATION" ? verification.principal
 									: await interactive.consumeResult(authority, verification.authenticationResult);
-								if (connectingApple(consumed)) {
-										const federation = consumed.federation!;
-										if (verification.mode !== "AUTHENTICATION") throw new EmailAuthenticationError();
-										await requireApplicationMethod(consumed.clientId, this.clientAuthority, "EXTERNAL_OIDC");
-										const linked = await this.getFederationResolution().linkExisting(principal.id, {
-												provider: federation.provider, providerIssuer: federation.providerIssuer,
-												providerSubject: federation.providerSubject, audience: federation.audience,
-												isPrivateRelayEmail: federation.isPrivateRelayEmail,
-												evidenceReference: federation.evidenceReference, expiresAt: 0
-										});
-										if (linked.status !== "linked" && linked.status !== "already_linked") {
-												logLogin(request, "universal_login_federated_apple_link", consumed, startedAt, false, linked.status);
-												return send(reply, 409, messagePage({ title: "Apple sign-in could not be connected",
-														message: "This sign-in could not be connected to your account. Start again or contact support." }));
-										}
-								}
+								if (!await connectVerifiedApple(principal, consumed)) return linkConflict();
 								logUniversalLoginDiagnostic(app, {
 									event: verification.mode === "REGISTRATION" ? "EMAIL_REGISTRATION_COMPLETED" : "EMAIL_AUTHENTICATION_COMPLETED",
 									route: "POST /login/email/code", clientId: interaction.clientId, correlationId,
@@ -1804,12 +1995,17 @@ export class OIDCService {
 								}
 								throw error;
 						}
+						const principal = this.federatedPrincipal(resolution.subject, provider);
+						if (await passkeyOffered(interaction)) {
+								const offered = await this.interactions.offerPasskeyEnrollment(transaction.interactionHandle, interaction, principal);
+								if (!offered) return expired(reply);
+								return showPasskeyOffer(reply, offered.browserProof);
+						}
 						const consumed = await this.interactions.consume(transaction.interactionHandle);
 						if (!consumed) {
 								logLogin(request, flow, interaction, startedAt, false, "interaction_replayed");
 								return expired(reply);
 						}
-						const principal = this.federatedPrincipal(resolution.subject, provider);
 						const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
 						const cookies = [this.interactionCookie(null)];
 						const sessionCookie = await this.maybeEstablishSession(request, principal, interaction.clientId);
@@ -1888,12 +2084,17 @@ export class OIDCService {
 												csrf: interaction.csrf, provider: federation.provider,
 												error: "That sign-in just became connected to another account. Sign in with email instead." }));
 								}
+								const principal = this.federatedPrincipal(registered.subject, federation.provider);
+								if (await passkeyOffered(interaction)) {
+										const offered = await this.interactions.offerPasskeyEnrollment(loaded.handle, interaction, principal);
+										if (!offered) return expired(reply);
+										return showPasskeyOffer(reply, offered.browserProof);
+								}
 								const consumed = await this.interactions.consume(loaded.handle);
 								if (!consumed) {
 										logLogin(request, flow, interaction, startedAt, false, "interaction_replayed");
 										return expired(reply);
 								}
-								const principal = this.federatedPrincipal(registered.subject, federation.provider);
 								const redirect = await this.issueAuthorizationRedirect(principal, consumed.authorization);
 								const cookies = [this.interactionCookie(null)];
 								const sessionCookie = await this.maybeEstablishSession(request, principal, interaction.clientId);

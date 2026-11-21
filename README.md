@@ -50,6 +50,21 @@ button opens the existing Email screen without creating a challenge. Face is not
 to Bookwrm users merely because H5 or legacy Face code exists. Other clients keep their
 existing choices; H2/H3/H4, OTP, H5, and OIDC semantics are unchanged.
 
+## Passkey enrollment
+
+After an Email, Apple, or Google sign-in, Universal Login can offer an existing HAPI
+subject passkey registration when `HAPI_PASSKEY_AUTHENTICATION_ENABLED=true` and
+the application permits `PASSKEY`. The flag defaults to false. Registration uses
+the configured HTTPS OIDC issuer as its exact WebAuthn origin and its hostname as
+the RP ID; the staging issuer uses `id-staging.hapiinc.com` and the RP name
+`HAPI ID Staging`. PostgreSQL stores the verified public credential and a random,
+stable user handle; Redis holds the short-lived, single-use enrollment authority.
+If completion fails after the database commit, the credential remains associated
+with its subject and the user must start sign-in again.
+
+This milestone does not implement passkey login or credential management. Do not
+enable it for users expecting to sign in with a passkey yet.
+
 ## Overview
 
 This service provides identity-facing API routes backed by an internal client and service layer:
