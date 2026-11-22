@@ -6,6 +6,7 @@ import { configuration } from "./ConfigurationService.js";
 // no suffix matching, fail closed on malformed or conflicting configuration.
 
 export const DEFAULT_OIDC_ISSUER = "https://identity.bookwrm.com";
+export const HAPI_PRODUCTION_ISSUER = "https://id.hapiinc.com";
 
 // Validates that `value` is exactly an https origin (scheme + host [+ explicit non-default
 // port]) with no credentials, path, query, fragment, wildcard, or trailing slash.

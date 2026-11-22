@@ -232,6 +232,16 @@ Issuer:
 
 - `https://identity.bookwrm.com`
 
+For the isolated HAPI issuer `https://id.hapiinc.com`, the legacy
+`/internal/identity/account-link` route is not registered, even if a service key is set.
+The new account-linking API remains disabled unless explicitly enabled. HAPI production
+requires PostgreSQL and fails startup if the identity schema bootstrap or Bookwrm seed
+fails; the other enabled schema initializers also complete before the server listens.
+This does not change the existing Bookwrm or HAPI staging bootstrap behavior.
+Startup executes additive schema statements and the existing Bookwrm seed/backfill; these
+operations are not one atomic migration. Use a dedicated, empty HAPI database, never an
+existing production database, and investigate any partial initialization before retrying.
+
 Configure Base44 OIDC client through Railway environment variables:
 
 - `OIDC_BASE44_CLIENT_ID`

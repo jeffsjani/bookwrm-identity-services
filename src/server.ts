@@ -25,7 +25,7 @@ import { configureRegistration } from "./registration/RegistrationComposition.js
 import { configureFaceEnrollment } from "./authenticators/FaceEnrollmentComposition.js";
 import { configureFaceSetupCeremony } from "./authenticators/FaceSetupComposition.js";
 import { registerCorsPolicy } from "./security/CorsPolicy.js";
-import { enforceDeploymentIssuerPin } from "./config/IssuerPolicy.js";
+import { enforceDeploymentIssuerPin, HAPI_PRODUCTION_ISSUER } from "./config/IssuerPolicy.js";
 import { registerStagingTestConsole, STAGING_ISSUER } from "./oidc/StagingTestConsole.js";
 import { protectStagingConsoleInternalLogs } from "./oidc/StagingConsoleInternal.js";
 import { registerPathOnlyNotFoundHandler, serializeRequestForLog } from "./security/RequestLogging.js";
@@ -47,13 +47,19 @@ configuration.validatePrivateIdConfiguration();
 // pin and an explicit CORS_TRUSTED_ORIGINS allowlist; the default Bookwrm issuer is unchanged.
 const issuer = enforceDeploymentIssuerPin();
 
-// Bootstrap the Identity Registry schema (identity_subjects, schema_migrations) before serving traffic.
-// Non-fatal: a transient DB issue here surfaces via /identity/admin/health instead of blocking boot.
+// The isolated HAPI production issuer must not serve with an incomplete database.
+const isHapiProductionIssuer = issuer === HAPI_PRODUCTION_ISSUER;
+if (isHapiProductionIssuer && configuration.getIdentityRegistryDriver() !== "postgres") {
+		throw new Error("HAPI production requires the PostgreSQL identity registry");
+}
+
+// Preserve the existing non-fatal bootstrap behavior for other issuers.
 if (configuration.getIdentityRegistryDriver() === "postgres") {
 		try {
 				await ensureIdentitySchema();
 		} catch (error) {
 				app.log.error({ error }, "Failed to bootstrap Identity Registry schema at startup");
+				if (isHapiProductionIssuer) throw error;
 		}
 
 		// HAPI ID H1: idempotently seeds Tenant #1 (Bookwrm) + Application #1 + its OIDCClient row,
@@ -62,6 +68,7 @@ if (configuration.getIdentityRegistryDriver() === "postgres") {
 				await ensureBookwrmApplicationSeed();
 		} catch (error) {
 				app.log.error({ error }, "Failed to seed Bookwrm Tenant/Application at startup");
+				if (isHapiProductionIssuer) throw error;
 		}
 }
 
@@ -96,8 +103,8 @@ await registerIdentityAdminRoutes(app);
 await registerHapiIdentityBridgeRoutes(app);
 await registerPrivateIDEnrollmentRoutes(app);
 // The legacy Bookwrm service-key mapping has no HAPI session or ownership-proof ceremony.
-// Keep existing non-staging consumers intact, but do not expose this bypass on the staging issuer.
-await registerIdentityAccountLinkRoutes(app, { enabled: !isStagingIssuer });
+// Keep existing consumers intact, but do not expose this bypass on HAPI staging or production.
+await registerIdentityAccountLinkRoutes(app, { enabled: !isStagingIssuer && !isHapiProductionIssuer });
 // HAPI ID V2-D: authenticated account-linking API (default-off HAPI_ACCOUNT_LINKING_API_ENABLED).
 await registerAccountAuthenticationMethodRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
