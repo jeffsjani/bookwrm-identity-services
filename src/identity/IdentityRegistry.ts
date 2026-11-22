@@ -19,6 +19,10 @@ export type IdentityLinkRequest = {
 		applicationId?: string;
 };
 
+export type IdentityResolveOptions = {
+		deferCreationSideEffects?: boolean;
+};
+
 function defaultRepository(): IdentitySubjectRepository {
 		return configuration.getIdentityRegistryDriver() === "memory"
 					? inMemoryIdentitySubjectRepository
@@ -53,10 +57,16 @@ export class IdentityRegistry {
 
 		// Reuses the existing subject for a known provider identity, or mints a new one on first authentication.
 		// Atomicity under concurrent calls is guaranteed by the repository (database uniqueness), not by this method.
-		async resolveOrCreate(request: IdentityLinkRequest): Promise<IdentitySubject> {
+		async resolveOrCreate(request: IdentityLinkRequest, options: IdentityResolveOptions = {}): Promise<IdentitySubject> {
+				return (await this.resolveOrCreateWithStatus(request, options)).subject;
+		}
+
+		async resolveOrCreateWithStatus(
+				request: IdentityLinkRequest,
+				options: IdentityResolveOptions = {}
+		): Promise<{ subject: IdentitySubject; created: boolean }> {
 				try {
-						const existing = await this.repository.findByProviderSubject(request.provider, request.providerSubject);
-						const subject = await this.repository.resolveOrCreate({
+						const input = {
 								id: randomUUID(),
 								oidcSubject: randomUUID(),
 								applicationId: request.applicationId ?? BOOKWRM_APPLICATION_ID,
@@ -65,28 +75,46 @@ export class IdentityRegistry {
 								email: request.email,
 								emailVerified: request.emailVerified,
 								displayName: request.displayName,
-								status: "ACTIVE"
-						});
-
-						if (existing) {
-								identityMetrics.recordReturningLogin();
+								status: "ACTIVE" as const
+						};
+						let result: { subject: IdentitySubject; created: boolean };
+						if (this.repository.resolveOrCreateWithStatus) {
+								result = await this.repository.resolveOrCreateWithStatus(input);
 						} else {
-								identityMetrics.recordNewIdentity();
-								recordIdentityAudit(subject.oidcSubject, "IDENTITY_CREATED", {
-										provider: request.provider,
-										providerSubject: request.providerSubject
-								});
-								recordIdentityAudit(subject.oidcSubject, "AUTHENTICATOR_LINKED", {
-										provider: request.provider,
-										providerSubject: request.providerSubject
-								});
+								const existing = await this.repository.findByProviderSubject(request.provider, request.providerSubject);
+								result = {
+										subject: await this.repository.resolveOrCreate(input),
+										created: !existing
+								};
 						}
 
-						return subject;
+						if (!result.created) {
+								identityMetrics.recordReturningLogin();
+						} else if (!options.deferCreationSideEffects) {
+								this.recordCreatedIdentity(result.subject);
+						}
+
+						return result;
 				} catch (error) {
 						identityMetrics.recordFailedLinking();
 						throw error;
 				}
+		}
+
+		recordCreatedIdentity(subject: IdentitySubject): void {
+				identityMetrics.recordNewIdentity();
+				recordIdentityAudit(subject.oidcSubject, "IDENTITY_CREATED", {
+						provider: subject.primaryProvider,
+						providerSubject: subject.primaryProviderSubject
+				});
+				recordIdentityAudit(subject.oidcSubject, "AUTHENTICATOR_LINKED", {
+						provider: subject.primaryProvider,
+						providerSubject: subject.primaryProviderSubject
+				});
+		}
+
+		delete(oidcSubject: string): Promise<boolean> {
+				return this.repository.delete(oidcSubject);
 		}
 
 		touchAuthentication(oidcSubject: string): Promise<IdentitySubject | undefined> {

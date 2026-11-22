@@ -216,16 +216,19 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 				return result.rows.map(toIdentitySubject);
 		}
 
-		// Single-statement UPSERT: the unique (primary_provider, primary_provider_subject) constraint
-		// makes this atomic under concurrent callers -- exactly one row is ever inserted per provider identity.
+		// The unique (primary_provider, primary_provider_subject) constraint arbitrates concurrent
+		// callers. INSERT ... DO NOTHING followed by UPDATE also reports whether this call created the row.
 		async resolveOrCreate(input: CreateIdentitySubjectInput): Promise<IdentitySubject> {
+				return (await this.resolveOrCreateWithStatus(input)).subject;
+		}
+
+		async resolveOrCreateWithStatus(input: CreateIdentitySubjectInput): Promise<{ subject: IdentitySubject; created: boolean }> {
 				const now = new Date();
-				const result = await this.client.query<IdentitySubjectRow>(
+				const inserted = await this.client.query<IdentitySubjectRow>(
 						`INSERT INTO identity_subjects
 							(id, oidc_subject, application_id, primary_provider, primary_provider_subject, email, email_verified, display_name, status, created_at, updated_at, last_authenticated_at)
 						 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10)
-						 ON CONFLICT (primary_provider, primary_provider_subject)
-						 DO UPDATE SET updated_at = $10, last_authenticated_at = $10
+						 ON CONFLICT (primary_provider, primary_provider_subject) DO NOTHING
 						 RETURNING *`,
 						[
 								input.id,
@@ -241,6 +244,20 @@ export class PostgresIdentitySubjectRepository implements IdentitySubjectReposit
 						]
 				);
 
-				return toIdentitySubject(result.rows[0]);
+				if (inserted.rows[0]) {
+						return { subject: toIdentitySubject(inserted.rows[0]), created: true };
+				}
+
+				const existing = await this.client.query<IdentitySubjectRow>(
+						`UPDATE identity_subjects
+						 SET updated_at = $3, last_authenticated_at = $3
+						 WHERE primary_provider = $1 AND primary_provider_subject = $2
+						 RETURNING *`,
+						[input.primaryProvider, input.primaryProviderSubject, now]
+				);
+				if (!existing.rows[0]) {
+						throw new Error("IdentitySubject disappeared during provider-identity resolution");
+				}
+				return { subject: toIdentitySubject(existing.rows[0]), created: false };
 		}
 }

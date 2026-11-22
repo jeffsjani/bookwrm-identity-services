@@ -8,6 +8,14 @@ import { PostgresOIDCClientRepository } from "../src/identity/PostgresOIDCClient
 import { PostgresTenantRepository } from "../src/identity/PostgresTenantRepository.js";
 import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
 import { PostgresApplicationAccountLinks, ApplicationAccountLinkConflict } from "../src/identity/ApplicationAccountLinks.js";
+import {
+	ApplicationAccountLinkCeremony,
+	ApplicationAccountLinkTransactionStore,
+	ApplicationOwnershipProofRejected,
+	APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+	type ApplicationOwnershipProofVerifier,
+	type VerifiedApplicationOwnershipProof
+} from "../src/identity/ApplicationAccountLinkCeremony.js";
 import { PostgresVerificationChallengeRepository } from "../src/adapters/email/PostgresVerificationChallengeRepository.js";
 import { PostgresEmailAuthenticationRepository } from "../src/authentication/email/PostgresEmailAuthenticationRepository.js";
 import { EmailAuthenticationService } from "../src/authentication/email/EmailAuthenticationService.js";
@@ -27,6 +35,22 @@ import { configuration } from "../src/config/ConfigurationService.js";
 const databaseUrl = process.env.HAPI_AUTHENTICATION_TEST_DATABASE_URL;
 const schema = "p4_" + randomUUID().replaceAll("-", "");
 
+class PostgresTestOwnershipProofVerifier implements ApplicationOwnershipProofVerifier {
+	private readonly issued = new Map<string, VerifiedApplicationOwnershipProof>();
+	issue(claims: VerifiedApplicationOwnershipProof): string {
+		const proof = randomUUID();
+		this.issued.set(proof, claims);
+		return proof;
+	}
+	async verify(proof: string, expected: { applicationId: string; clientId: string }) {
+		const claims = this.issued.get(proof);
+		if (!claims || claims.applicationId !== expected.applicationId || claims.clientId !== expected.clientId) {
+			throw new ApplicationOwnershipProofRejected();
+		}
+		return claims;
+	}
+}
+
 describe.skipIf(!databaseUrl)("Phase 4 durable multi-client identity and link invariants", () => {
 	const admin = new pg.Pool({ connectionString: databaseUrl });
 	const pool = new pg.Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}` });
@@ -43,6 +67,13 @@ describe.skipIf(!databaseUrl)("Phase 4 durable multi-client identity and link in
 	const links = new PostgresApplicationAccountLinks(pool);
 	const email = `${randomUUID()}@example.com`, oidcSubject = randomUUID();
 	const app = Fastify();
+	const createLinkSubject = async () => {
+		const id = randomUUID(), subjectEmail = `${randomUUID()}@example.com`;
+		await subjects.create({ id, oidcSubject: randomUUID(), applicationId: bookwrm,
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: subjectEmail,
+			email: subjectEmail, emailVerified: true, status: "ACTIVE" });
+		return id;
+	};
 	const provider: AuthenticationProvider = {
 		authenticate: vi.fn(async () => { throw new Error("Provider must not run"); }),
 		cancel: vi.fn(async () => {}), logout: vi.fn(async () => {}), status: vi.fn(async () => ({ state: "idle" as const }))
@@ -131,6 +162,98 @@ describe.skipIf(!databaseUrl)("Phase 4 durable multi-client identity and link in
 		expect((await pool.query("SELECT count(*)::int AS n FROM application_account_links")).rows[0].n).toBe(2);
 		expect((await pool.query("SELECT count(*)::int AS n FROM application_account_link_audit WHERE result='conflict'")).rows[0].n).toBe(2);
 	});
+	it("persists a proof-bound application association and rejects cross-application authority", async () => {
+		const verifier = new PostgresTestOwnershipProofVerifier();
+		const ceremony = new ApplicationAccountLinkCeremony(links, new ApplicationAccountLinkTransactionStore(), verifier);
+		const linkSubjectId = await createLinkSubject();
+		const sessionId = randomUUID();
+		const started = await ceremony.start({ identitySubjectId: linkSubjectId, sessionId,
+			authenticationMethod: "HAPI_EMAIL", applicationId: bookwrm, clientId: "BOOKWRM_TEST", consent: true });
+		const issuedAt = Date.now();
+		const proof = verifier.issue({ applicationId: bookwrm, clientId: "BOOKWRM_TEST",
+			externalAccountId: "proof-owned-account", audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+			transactionId: started.id, nonce: started.nonce, proofId: randomUUID(), issuedAt,
+			expiresAt: issuedAt + 60_000 });
+		const result = await ceremony.complete({ identitySubjectId: linkSubjectId, sessionId,
+			authenticationMethod: "HAPI_EMAIL", transactionId: started.id, ownershipProof: proof });
+		expect(result.created).toBe(true);
+		expect(result.link).toMatchObject({ identitySubjectId: linkSubjectId, applicationId: bookwrm,
+			externalAccountId: "proof-owned-account" });
+		expect((await pool.query(
+			"SELECT authority, client_id, request_id, authentication_method, result FROM application_account_link_audit WHERE external_account_id=$1",
+			["proof-owned-account"])).rows).toEqual([{
+				authority: "APPLICATION_OWNERSHIP_PROOF", client_id: "BOOKWRM_TEST",
+				request_id: started.id, authentication_method: "HAPI_EMAIL", result: "created"
+			}]);
+
+		const tenant2 = randomUUID(), app2 = randomUUID(), otherClientId = `OTHER_${randomUUID()}`;
+		await tenants.upsert({ id: tenant2, name: "Other", slug: tenant2, status: "active" });
+		await applications.upsert({ id: app2, tenantId: tenant2, name: "Other", slug: app2,
+			applicationKey: app2, status: "active", allowedAuthenticationMethods: ["HAPI_EMAIL"] });
+		await clients.upsert({ id: randomUUID(), applicationId: app2, clientId: otherClientId,
+			clientSecret: "test-secret", redirectUris: ["https://rp.example/callback"],
+			scopes: ["openid"], grantTypes: ["authorization_code"], responseTypes: ["code"],
+			tokenEndpointAuthMethod: "client_secret_basic", requirePkce: true });
+		await expect(ceremony.start({ identitySubjectId: linkSubjectId, sessionId,
+			authenticationMethod: "HAPI_EMAIL", applicationId: bookwrm, clientId: otherClientId, consent: true }))
+			.rejects.toMatchObject({ code: "APPLICATION_UNAUTHORIZED" });
+	});
+
+	it("rejects cross-account claims and rolls back a link if its audit write fails", async () => {
+		const verifier = new PostgresTestOwnershipProofVerifier();
+		const ceremony = new ApplicationAccountLinkCeremony(links, new ApplicationAccountLinkTransactionStore(), verifier);
+		const ownerSubjectId = await createLinkSubject();
+		const attackerSubjectId = await createLinkSubject();
+		const sessionId = randomUUID();
+		const startFor = async (identitySubjectId: string, externalAccountId: string) => {
+			const transaction = await ceremony.start({ identitySubjectId, sessionId,
+				authenticationMethod: "HAPI_EMAIL", applicationId: bookwrm, clientId: "BOOKWRM_TEST", consent: true });
+			const issuedAt = Date.now();
+			return {
+				transaction,
+				proof: verifier.issue({ applicationId: bookwrm, clientId: "BOOKWRM_TEST", externalAccountId,
+					audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE, transactionId: transaction.id,
+					nonce: transaction.nonce, proofId: randomUUID(), issuedAt, expiresAt: issuedAt + 60_000 })
+			};
+		};
+		const owner = await startFor(ownerSubjectId, "cross-account-owned");
+		await ceremony.complete({ identitySubjectId: ownerSubjectId, sessionId, authenticationMethod: "HAPI_EMAIL",
+			transactionId: owner.transaction.id, ownershipProof: owner.proof });
+		const attacker = await startFor(attackerSubjectId, "cross-account-owned");
+		await expect(ceremony.complete({ identitySubjectId: attackerSubjectId, sessionId,
+			authenticationMethod: "HAPI_EMAIL", transactionId: attacker.transaction.id,
+			ownershipProof: attacker.proof })).rejects.toMatchObject({ code: "LINK_CONFLICT" });
+		expect(await links.find(bookwrm, "cross-account-owned")).toMatchObject({ identitySubjectId: ownerSubjectId });
+
+		const failureSubjectId = await createLinkSubject();
+		const externalAccountId = `write-failure-${randomUUID()}`;
+		const suffix = randomUUID().replaceAll("-", "");
+		const functionName = `hapi_fail_app_link_audit_${suffix}`;
+		const triggerName = `hapi_fail_app_link_audit_${suffix}`;
+		await pool.query(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF NEW.external_account_id = '${externalAccountId}' THEN
+					RAISE EXCEPTION 'synthetic account-link audit failure';
+				END IF;
+				RETURN NEW;
+			END
+		$$`);
+		await pool.query(`CREATE TRIGGER ${triggerName} BEFORE INSERT ON application_account_link_audit
+			FOR EACH ROW EXECUTE FUNCTION ${functionName}()`);
+		const failed = await startFor(failureSubjectId, externalAccountId);
+		try {
+			await expect(ceremony.complete({ identitySubjectId: failureSubjectId, sessionId,
+				authenticationMethod: "HAPI_EMAIL", transactionId: failed.transaction.id,
+				ownershipProof: failed.proof })).rejects.toThrow("synthetic account-link audit failure");
+		} finally {
+			await pool.query(`DROP TRIGGER IF EXISTS ${triggerName} ON application_account_link_audit`);
+			await pool.query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+		}
+		expect(await links.find(bookwrm, externalAccountId)).toBeUndefined();
+		expect((await pool.query("SELECT id FROM application_account_link_audit WHERE external_account_id=$1",
+			[externalAccountId])).rows).toHaveLength(0);
+	});
+
 	it("keeps schema migration idempotent and preserves canonical identities and link meaning", async () => {
 		const before = (await pool.query("SELECT * FROM identity_subjects ORDER BY id")).rows;
 		const linkRows = (await pool.query("SELECT * FROM application_account_links ORDER BY id")).rows;

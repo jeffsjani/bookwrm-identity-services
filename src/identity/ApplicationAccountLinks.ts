@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { PostgresClient } from "./infrastructure/PostgresInfrastructure.js";
+import type { HapiSessionAuthenticationMethod } from "../models/HapiSession.js";
 
 export type ApplicationAccountLink = {
 	id: string;
@@ -13,10 +14,10 @@ export type ApplicationAccountLink = {
 
 // Server-issued continuity evidence, never a browser/application request body.
 export type AccountLinkEvidence = {
-	authority: "OIDC_CONTINUITY" | "BOOKWRM_SERVICE_CONTINUITY";
+	authority: "OIDC_CONTINUITY" | "BOOKWRM_SERVICE_CONTINUITY" | "APPLICATION_OWNERSHIP_PROOF";
 	clientId: string;
 	requestId: string;
-	authenticationMethod: "HAPI_EMAIL" | "PRIVATEID_FACE";
+	authenticationMethod: HapiSessionAuthenticationMethod;
 };
 export type ReconcileApplicationLink = Pick<ApplicationAccountLink, "identitySubjectId" | "applicationId" | "externalAccountId"> & {
 	evidence: AccountLinkEvidence;
@@ -25,18 +26,24 @@ export class ApplicationAccountLinkConflict extends Error {
 	constructor() { super("Application account link conflicts with an existing association"); }
 }
 export interface ApplicationAccountLinks {
+	isAuthorized(identitySubjectId: string, applicationId: string, clientId: string): Promise<boolean>;
 	find(applicationId: string, externalAccountId: string): Promise<ApplicationAccountLink | undefined>;
 	reconcile(input: ReconcileApplicationLink): Promise<{ link: ApplicationAccountLink; created: boolean }>;
 }
 function assertEvidence(input: ReconcileApplicationLink): void {
 	if (!input.externalAccountId.trim() || !input.evidence.clientId || !input.evidence.requestId ||
-		!["OIDC_CONTINUITY", "BOOKWRM_SERVICE_CONTINUITY"].includes(input.evidence.authority)) {
+		!["OIDC_CONTINUITY", "BOOKWRM_SERVICE_CONTINUITY", "APPLICATION_OWNERSHIP_PROOF"].includes(input.evidence.authority)) {
 		throw new Error("Authoritative account continuity evidence is required");
 	}
 }
 export class InMemoryApplicationAccountLinks implements ApplicationAccountLinks {
 	private readonly links: ApplicationAccountLink[] = [];
 	readonly audit: Array<ReconcileApplicationLink & { result: string }> = [];
+	constructor(private readonly authorize: (identitySubjectId: string, applicationId: string, clientId: string) => Promise<boolean> =
+		async () => false) {}
+	isAuthorized(identitySubjectId: string, applicationId: string, clientId: string) {
+		return this.authorize(identitySubjectId, applicationId, clientId);
+	}
 	async find(applicationId: string, externalAccountId: string) {
 		const link = this.links.find(link => link.applicationId === applicationId && link.externalAccountId === externalAccountId);
 		return link ? { ...link } : undefined;
@@ -70,6 +77,15 @@ function fromRow(row: LinkRow): ApplicationAccountLink {
 }
 export class PostgresApplicationAccountLinks implements ApplicationAccountLinks {
 	constructor(private readonly client: PostgresClient) {}
+	async isAuthorized(identitySubjectId: string, applicationId: string, clientId: string) {
+		const result = await this.client.query(`SELECT 1 FROM identity_subjects i
+			JOIN applications a ON a.id=$2
+			JOIN tenants t ON t.id=a.tenant_id
+			JOIN oidc_clients c ON c.application_id=a.id AND c.client_id=$3
+			WHERE i.id=$1 AND i.status='ACTIVE' AND a.status='active' AND t.status='active' AND c.status='active'`,
+		[identitySubjectId, applicationId, clientId]);
+		return result.rows.length > 0;
+	}
 	async find(applicationId: string, externalAccountId: string) {
 		const result = await this.client.query<LinkRow>(
 			"SELECT * FROM application_account_links WHERE application_id=$1 AND external_account_id=$2",
@@ -78,20 +94,19 @@ export class PostgresApplicationAccountLinks implements ApplicationAccountLinks 
 	}
 	async reconcile(input: ReconcileApplicationLink) {
 		assertEvidence(input);
-		const authorized = await this.client.query(`SELECT 1 FROM identity_subjects i, applications a
-			JOIN tenants t ON t.id=a.tenant_id JOIN oidc_clients c ON c.application_id=a.id
-			WHERE i.id=$1 AND a.id=$2 AND c.client_id=$3 AND i.status='ACTIVE'
-			AND a.status='active' AND t.status='active' AND c.status='active'`,
-		[input.identitySubjectId, input.applicationId, input.evidence.clientId]);
-		if (!authorized.rows[0]) throw new Error("Account continuity authority is not active for this application");
+		if (!await this.isAuthorized(input.identitySubjectId, input.applicationId, input.evidence.clientId)) {
+			throw new Error("Account continuity authority is not active for this application");
+		}
 		const id = randomUUID();
 		const created = await this.client.query<LinkRow>(`WITH inserted AS (
 			INSERT INTO application_account_links
 				(id,identity_subject_id,application_id,external_account_id,created_at,updated_at)
-			SELECT $1,i.id,a.id,$4,NOW(),NOW() FROM identity_subjects i, applications a
-			JOIN oidc_clients c ON c.application_id=a.id
-			WHERE i.id=$2 AND a.id=$3 AND i.status='ACTIVE' AND a.status='active'
-				AND c.client_id=$6 AND c.status='active'
+			SELECT $1,i.id,a.id,$4,NOW(),NOW() FROM identity_subjects i
+			JOIN applications a ON a.id=$3
+			JOIN tenants t ON t.id=a.tenant_id
+			JOIN oidc_clients c ON c.application_id=a.id AND c.client_id=$6
+			WHERE i.id=$2 AND i.status='ACTIVE' AND a.status='active'
+				AND t.status='active' AND c.status='active'
 			ON CONFLICT DO NOTHING RETURNING *
 		), audit AS (
 			INSERT INTO application_account_link_audit

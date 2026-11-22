@@ -133,6 +133,10 @@ export class InMemoryIdentitySubjectRepository implements IdentitySubjectReposit
 		// Mirrors the Postgres ON CONFLICT DO UPDATE semantics: first writer wins the row,
 		// later callers only get their last-authenticated timestamp touched.
 		async resolveOrCreate(input: CreateIdentitySubjectInput): Promise<IdentitySubject> {
+				return (await this.resolveOrCreateWithStatus(input)).subject;
+		}
+
+		async resolveOrCreateWithStatus(input: CreateIdentitySubjectInput): Promise<{ subject: IdentitySubject; created: boolean }> {
 				const key = providerKey(input.primaryProvider, input.primaryProviderSubject);
 				const existingId = this.idByProviderKey.get(key);
 				if (existingId) {
@@ -141,11 +145,11 @@ export class InMemoryIdentitySubjectRepository implements IdentitySubjectReposit
 								const now = new Date().toISOString();
 								existing.updatedAt = now;
 								existing.lastAuthenticatedAt = now;
-								return { ...existing };
+								return { subject: { ...existing }, created: false };
 						}
 				}
 
-				return this.create(input);
+				return { subject: await this.create(input), created: true };
 		}
 }
 

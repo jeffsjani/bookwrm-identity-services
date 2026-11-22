@@ -1,6 +1,6 @@
 # HAPI ID V2-E Stage 5A — Registration and Application Identity Foundation
 
-**Status: CORE REGISTRATION CERTIFIED; APPLICATION OWNERSHIP LINKING AND LIVE PROVIDER ACCEPTANCE REMAIN OPEN.**
+**Status: FEDERATED REGISTRATION IS ATOMIC; HAPI-SIDE APPLICATION-LINK CONTRACT IS IMPLEMENTED BUT NOT PRODUCTION-ENABLED.**
 
 Date: 2026-11-22  
 Branch: `feature/hapi-id-v2e-stage1`  
@@ -8,20 +8,21 @@ Baseline: `92caf54ae0236ec3314da160c7cd17cd3b16f5f6`
 Staging issuer: `https://id-staging.hapiinc.com`  
 Planned production issuer: `https://id.hapiinc.com`
 
-No runtime authentication code, configuration, staging identity, passkey, deployment, or production
-resource was changed. This certification adds tests only.
+This follow-up closes the PostgreSQL federated-registration atomicity gap and adds a fail-closed
+HAPI application-linking contract with a test verifier. It does not configure a trusted production
+proof verifier or change staging/production resources, application clients, or identity data.
 
 ## 1. BUILT / PARTIAL / MISSING inventory
 
 | Area | Status | Evidence and boundary |
 | --- | --- | --- |
 | Email registration and return | **BUILT** | H2 verified OTP → H3 atomic registration/evidence/audit → original OIDC interaction. Existing HAPI_EMAIL accounts use H4 and retain their `oidc_subject`. |
-| Google registration and return | **PARTIAL** | Verified exact provider identity; unknown users explicitly choose creation or email sign-in. Matching email never merges. First-time concurrency is now exercised against PostgreSQL, but subject creation and external binding are separate transactions. |
-| Apple registration and return | **PARTIAL** | Same explicit choice and exact-identity binding. Added a first-time Apple test for returning-subject continuity and no same-email merge. As with Google, subject creation and external binding are separate transactions. |
+| Google registration and return | **BUILT** | Verified exact provider identity; unknown users explicitly choose creation or email sign-in. Matching email never merges. Subject creation, provider binding, and link audit now share one PostgreSQL transaction with unique constraints resolving races. |
+| Apple registration and return | **BUILT** | Same explicit choice and exact-identity binding. PostgreSQL subject creation, provider binding, and audit are atomic; retry returns the prior subject. Matching email never merges. |
 | Passkey enrollment and authentication | **BUILT** | Post-authentication enrollment is bound to the canonical subject; credential authentication resolves that subject and its existing OIDC `sub`. PostgreSQL/Redis/Chromium tests cover enrollment, login, revocation, and failure paths. |
 | Stable HAPI subject | **BUILT** | `identity_subjects.oidc_subject` is the canonical OIDC subject. Email, provider, and passkey paths resolve to their linked subject; email changes do not define identity. |
 | Provider linking and recovery | **PARTIAL** | Apple/Google account-method APIs require an authenticated HAPI session, CSRF, and recent authentication. No general self-service recovery exists when every enrolled method is lost; email/provider recovery still depends on access to a linked method. |
-| Application account mapping | **PARTIAL** | `application_account_links` has per-application associations, two-way uniqueness, audit, idempotent retry, and conflict rejection. A legacy internal Bookwrm route exists. There is no wired reusable Bookwrm/Elite+ linking ceremony that independently proves application-account ownership and captures explicit consent. |
+| Application account mapping | **PARTIAL** | Added authenticated HAPI-session start/complete endpoints and a short-lived, session/subject/application/client-bound Redis transaction. Completion accepts only an injected application-proof verifier's claims and rechecks active tenant/application/client authority before the existing audited association write. Production proof verification is deliberately not configured; the legacy Bookwrm continuity route remains and must be migrated or disabled before enabling this surface. |
 | OIDC RP foundation | **BUILT** | Discovery, registered clients, authorization code, PKCE S256, exact redirects, state/nonce, signed ID tokens, stable `sub`, and UserInfo consistency have automated coverage. |
 | Bookwrm / Elite+ client integrations | **PARTIAL** | Bookwrm/Base44 has a confidential OIDC client adapter and registered callback shape, but no Base44-hosted live flow was certified here. Elite+ web/native client registrations and app-side acceptance are not present in this repository. |
 
@@ -36,27 +37,47 @@ resource was changed. This certification adds tests only.
   tables/repository.
 - Existing OIDC discovery, code + PKCE, ID-token, UserInfo, redirect, and replay protections.
 
-H3 email registration is transactional across identity creation, verification consumption, evidence,
-provenance, and audit. Federated first-time registration is not: `registerFirstTime` resolves or
-creates the subject before writing the external-identity binding. A failed binding write can leave
-an unusable subject without that binding; this race/orphan limitation was already recorded in the
-V2-D certification. A retry of the same provider identity reuses the subject, but this is not
-equivalent to the requested all-or-nothing transaction and remains a Stage 5A gap.
+H3 email registration remains transactional across identity creation, verification consumption,
+evidence, provenance, and audit. Federated registration now creates/resolves the subject and links
+the exact `(provider, issuer, subject)` binding through transaction-scoped instances of the existing
+`IdentityRegistry`, `IdentityFederationService`, and PostgreSQL repositories. A returned binding
+conflict aborts the transaction; a database binding/audit failure rolls back the subject. The unique
+primary-provider and external-identity constraints serialize concurrent first registrations.
+Repeated or retried requests return the same HAPI subject and binding. Verified email remains
+contact metadata only and is never part of identity resolution.
 
 ## 3. Application account mapping design and gap
 
-The canonical association is `(application_id, external_account_id) → identity_subject_id`.
-Database uniqueness prevents both one application account being claimed by two HAPI subjects and
-one HAPI subject being silently assigned multiple accounts within the same application. Audit
-records retain the application, authority, client, request, authentication method, and result.
+The canonical association remains `(application_id, external_account_id) → identity_subject_id`.
+Database uniqueness prevents one application account being claimed by multiple HAPI subjects and
+one HAPI subject being assigned multiple accounts within one application. The existing
+`PostgresApplicationAccountLinks` repository writes the association and audit in one statement and
+checks the active HAPI subject, tenant, application, and client both before and during insertion.
 Associations do not copy roles, subscriptions, permissions, or historical data.
 
-The PostgreSQL repository checks that the subject, tenant, application, and client are active; the
-database constraints arbitrate concurrent claims. The existing Bookwrm internal route instead uses
-a shared service credential plus a Bookwrm user-id header and a supplied HAPI `oidcSubject`. That is
-not, by itself, a reusable application-specific user-ownership proof or explicit-consent ceremony.
-No equivalent Elite+ route/integration is wired. Do not treat matching email as proof or use this
-partial surface to migrate accounts.
+The HAPI contract is behind the existing default-off `HAPI_ACCOUNT_LINKING_API_ENABLED` surface:
+
+1. `POST /account/application-links/start` requires a live HAPI session, CSRF, recent
+   authentication, explicit `consent: true`, and an active registered application/client. The
+   response contains a random transaction ID, nonce, fixed HAPI audience, and expiry.
+2. The app proves ownership of its existing account and returns an app-signed proof through its
+   own authenticated flow. HAPI never accepts an external account ID from the browser request.
+3. `POST /account/application-links/complete` requires the same HAPI subject and session. The
+   verifier must validate a signing key trusted specifically for the expected application/client.
+   HAPI then checks application/client, audience, transaction ID, nonce, proof ID, issue/expiry
+   bounds (maximum two minutes), and single-use Redis claims before reconciling the exact verified
+   account ID.
+4. The association audit records the approved HAPI subject, application account, authority,
+   registered client, transaction ID, authentication method, and result. Conflicts fail closed.
+   Redis atomically consumes the proof and transaction after persistence succeeds, so a transient
+   database failure can be retried with the same proof; terminal association conflicts consume it.
+
+The production server does not inject a proof verifier, so these routes return unavailable even if
+the shared account-linking flag is enabled. The test verifier is synthetic and is not a trusted
+production proof mechanism. The existing internal Bookwrm continuity endpoint still uses a
+service credential, principal header, and supplied HAPI subject; it does not meet the new
+short-lived proof contract and remains a rollout blocker until Bookwrm migrates or operators
+disable that legacy path. No Elite+ proof issuer or integration is present.
 
 ## 4. Minimum OIDC application contract
 
@@ -107,22 +128,24 @@ All provider tokens and identities in these tests are synthetic.
 | Validation | Result |
 | --- | --- |
 | `npm run build` | PASS |
-| Full default suite, `npx vitest run --hookTimeout=30000` | **74 files passed, 14 skipped; 766 passed, 194 skipped; 0 failed** |
-| Focused registration/federation/OIDC/linking suites | **115 passed** |
-| Disposable PostgreSQL 16 registration, email, federation, multi-client, and tenant/application suites | **57 passed** |
-| Disposable Redis 7 + PostgreSQL + Chromium passkey/Universal Login suites | **94 passed** |
-| Worktree after validation | No generated build changes |
+| Full default suite, `npx vitest run --hookTimeout=30000` | **74 files passed, 15 skipped; 772 passed, 201 skipped; 0 failed** |
+| Focused registration/federation/linking and authentication regressions | **106 passed** |
+| Disposable PostgreSQL 16 registration, email, registry, federation, and multi-client suites | **62 passed** |
+| Account-link API plus disposable Redis 7 ceremony suite | **23 passed** |
+| PostgreSQL/Redis/Chromium passkey and Universal Login suites | **94 passed in the prior Stage 5A baseline; not rerun in this follow-up** |
+| `git diff --check` | PASS |
 
-The first unadjusted full-suite run hit the Chromium suite's 10-second `beforeAll` timeout under
-parallel load. That suite passed alone with a 30-second hook timeout, and the complete rerun above
-passed with the same timeout allowance. The default run skips database/Redis-gated suites; the
-reported integration runs used disposable loopback-only containers and did not connect to staging
-or production.
+The default run skips database/Redis-gated suites. The follow-up PostgreSQL and Redis integration
+runs used disposable loopback-only containers and did not connect to staging or production. The
+Redis test uses unique proof IDs so replay protection is exercised without stale test data causing
+cross-run failures.
 
-The three new tests certify Apple first-time creation/returning continuity, concurrent federated
-registration under PostgreSQL uniqueness, and rollback of H3 email identity/evidence/challenge/audit
-writes when a final audit write fails. They do not certify federated subject-plus-binding rollback.
-No runtime behavior changed.
+The follow-up tests certify Apple/Google first-time and repeated registration, concurrent subject
+creation, provider-binding rollback, explicit application-link consent, transaction/subject/app
+binding, proof expiry and replay rejection, association conflicts, and audit rollback. The
+synthetic ownership verifier tests do not certify a production Bookwrm/Elite+ signing-key trust
+relationship. Passkey browser integration results above are from the prior certified baseline,
+while the current full default suite includes the available passkey regression tests.
 
 ## 7. Live acceptance outstanding
 
@@ -140,12 +163,34 @@ and in the user-provided certified baseline; it was not re-executed in this work
 
 ## 8. Delivery and recommendation
 
-No runtime feature was missing from the tested email/Apple/Google registration paths, so those
-flows were not rewritten. Development changes are limited to focused certification tests and this
-report. No staging release branch update, deploy, Railway change, production provisioning, or
-Bookwrm/Elite+ application change is authorized or performed.
+Existing email, Apple, Google, and passkey login behavior was preserved. Runtime changes are limited
+to atomic federated registration and the new fail-closed HAPI application-link contract; no
+application-side integration was made. No staging release branch update, deploy, Railway change,
+production provisioning, or staging/production identity change was performed.
 
-**GO for continued development-branch certification. NO-GO for staging deployment** until federated
-subject-plus-binding creation is atomic or otherwise safely recoverable, the application
-ownership-proof/consent contract is agreed and wired, and live Apple/Google staging acceptance and
-operator resource-isolation checks are complete.
+**NO-GO for staging deployment** until the application trust/key-verification mechanism is agreed
+and implemented by each app, the legacy Bookwrm route is migrated or disabled, the app-side consent
+and ownership proof flows are accepted for Bookwrm and Elite+, live Apple/Google staging acceptance
+is complete, and operators confirm staging resource isolation.
+
+## 9. Stage 5A follow-up delivery
+
+The follow-up implementation adds:
+
+- PostgreSQL transaction-scoped subject and external-identity repositories for first-time Apple and
+  Google registration; conflicts and failed provider-binding writes leave no orphan subject.
+- An application-link ceremony using the existing HAPI session/CSRF/recent-authentication guard,
+  existing `application_account_links` persistence/audit, a short-TTL Redis transaction, and a
+  verifier interface that has no production implementation configured.
+- Synthetic unit/integration adapters for application ownership proofs; these certify HAPI claim
+  binding and replay handling, not a Bookwrm/Elite+ production signature/key trust relationship.
+
+Application-side contract requirement: after independently authenticating the user to the existing
+Bookwrm or Elite+ account, the app must issue a signed, app-specific ownership assertion containing
+its stable account ID, registered application/client, HAPI audience
+`urn:hapi:application-account-link:complete`, HAPI transaction ID and nonce, a unique `jti`, and
+`iat`/`exp` with at most a 120-second lifetime. The app must protect the signing key and bind it to
+that application/client in HAPI's approved verifier configuration. HAPI's verifier must validate
+signature, issuer/key trust, audience, client and claim types, then normalize timestamps to
+milliseconds for the current verifier interface. The app must present clear user consent before
+starting the HAPI ceremony. No key source, signing algorithm, or production trust is assumed here.

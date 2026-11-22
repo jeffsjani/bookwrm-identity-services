@@ -137,13 +137,16 @@ function isUniqueViolation(error: unknown): boolean {
 // the same provider identity are decided by the partial unique index (the loser fails closed with
 // a unique violation and is reported -- and audited -- as a conflict).
 export class PostgresExternalIdentityRepository implements ExternalIdentityRepository {
-		constructor(private readonly pool?: pg.Pool) {}
+		constructor(private readonly pool?: pg.Pool, private readonly transactionClient?: PostgresClient) {}
 
 		private get reader(): PostgresClient {
-				return (this.pool as PostgresClient | undefined) ?? getPostgresPool();
+				return this.transactionClient ?? (this.pool as PostgresClient | undefined) ?? getPostgresPool();
 		}
 
 		private withTransaction<T>(fn: (client: PostgresClient) => Promise<T>): Promise<T> {
+				if (this.transactionClient) {
+						return fn(this.transactionClient);
+				}
 				return withPostgresTransaction(fn, this.pool);
 		}
 
@@ -214,6 +217,12 @@ export class PostgresExternalIdentityRepository implements ExternalIdentityRepos
 						});
 				} catch (error) {
 						if (!isUniqueViolation(error)) {
+								throw error;
+						}
+						// The caller owns the outer transaction. A PostgreSQL uniqueness violation
+						// aborts it; let that transaction roll back rather than attempting an audit
+						// write through an already-aborted transaction client.
+						if (this.transactionClient) {
 								throw error;
 						}
 						// Lost a cross-subject race: the transaction rolled back, so record the rejection now.

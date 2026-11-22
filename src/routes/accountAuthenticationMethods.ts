@@ -6,6 +6,11 @@ import {
 		identityFederationService,
 		type IdentityFederationService
 } from "../identity/IdentityFederationService.js";
+import {
+		ApplicationAccountLinkCeremony,
+		ApplicationAccountLinkError,
+		APPLICATION_OWNERSHIP_PROOF_AUDIENCE
+} from "../identity/ApplicationAccountLinkCeremony.js";
 import type { FederatedAuthorizationService } from "../identity/federation/FederatedAuthorizationService.js";
 import type { FederatedIdentityTokenVerifier } from "../identity/federation/FederatedIdentityTypes.js";
 import { FederationTransactionStore } from "../identity/federation/FederationTransactionStore.js";
@@ -34,12 +39,14 @@ export type AccountAuthenticationMethodsDependencies = {
 		authorization?: Partial<Record<ExternalIdentityProvider, FederatedAuthorizationService>>;
 		rateLimiter?: OIDCRateLimiter;
 		refreshRotation?: RefreshTokenRotationService;
+		applicationAccountLinkCeremony?: ApplicationAccountLinkCeremony;
 };
 
 type ResolvedDependencies = Required<Pick<AccountAuthenticationMethodsDependencies,
 		"sessions" | "federation" | "transactions" | "rateLimiter" | "refreshRotation">> & {
 		verifiers: Partial<Record<ExternalIdentityProvider, FederatedIdentityTokenVerifier>>;
 		authorization: Partial<Record<ExternalIdentityProvider, FederatedAuthorizationService>>;
+		applicationAccountLinkCeremony?: ApplicationAccountLinkCeremony;
 };
 
 function readSessionCookie(request: FastifyRequest): string | undefined {
@@ -74,8 +81,8 @@ function methodsView(methods: IdentityAuthenticationMethod[]) {
 //   1. every endpoint requires a valid, non-stale HAPI session (__Host-hapi_sid);
 //   2. every state-changing request requires the double-submit CSRF header;
 //   3. start/complete/unlink require RECENT authentication (step-up window);
-//   4. the browser NEVER supplies a trusted issuer or subject -- only raw provider id_tokens that
-//      are fully verified server-side against the transaction's server-generated nonce;
+//   4. the browser NEVER supplies trusted provider or application account identifiers -- provider
+//      tokens and application ownership proofs are verified against server-side transactions;
 //   5. linking/unlinking and audit are atomic in the V2-B repository; matching emails never link.
 // The whole surface ships behind the default-off HAPI_ACCOUNT_LINKING_API_ENABLED flag.
 export async function registerAccountAuthenticationMethodRoutes(
@@ -92,7 +99,9 @@ export async function registerAccountAuthenticationMethodRoutes(
 								verifiers: dependencies.verifiers ?? {},
 								authorization: dependencies.authorization ?? {},
 								rateLimiter: dependencies.rateLimiter ?? new OIDCRateLimiter(),
-								refreshRotation: dependencies.refreshRotation ?? new RefreshTokenRotationService()
+								refreshRotation: dependencies.refreshRotation ?? new RefreshTokenRotationService(),
+								...(dependencies.applicationAccountLinkCeremony
+										? { applicationAccountLinkCeremony: dependencies.applicationAccountLinkCeremony } : {})
 						};
 				}
 				return resolved;
@@ -298,5 +307,79 @@ export async function registerAccountAuthenticationMethodRoutes(
 						}
 				}
 				return listResponse(context.session);
+		});
+
+		app.post("/account/application-links/start", { bodyLimit: 4096 }, async (request, reply) => {
+				const context = await authenticate(request, reply, { mutation: true, stepUp: true });
+				if (!context) return reply;
+				const ceremony = deps().applicationAccountLinkCeremony;
+				if (!ceremony) {
+						return reply.code(404).send({ error: "application_linking_unavailable" });
+				}
+				const body = (request.body ?? {}) as Record<string, unknown>;
+				if (body.consent !== true || typeof body.applicationId !== "string" ||
+						!body.applicationId.trim() || typeof body.clientId !== "string" || !body.clientId.trim()) {
+						return reply.code(400).send({ error: "invalid_request" });
+				}
+				try {
+						const transaction = await ceremony.start({
+								identitySubjectId: context.session.identitySubjectId,
+								sessionId: context.session.id,
+								authenticationMethod: context.session.authenticationMethod,
+								applicationId: body.applicationId,
+								clientId: body.clientId,
+								consent: true
+						});
+						return {
+								transactionId: transaction.id,
+								nonce: transaction.nonce,
+								audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+								expiresAt: new Date(transaction.expiresAt).toISOString()
+						};
+				} catch (error) {
+						if (error instanceof ApplicationAccountLinkError &&
+								error.code === "APPLICATION_UNAUTHORIZED") {
+								return reply.code(403).send({ error: "application_not_authorized" });
+						}
+						throw error;
+				}
+		});
+
+		app.post("/account/application-links/complete", { bodyLimit: 12288 }, async (request, reply) => {
+				const context = await authenticate(request, reply, { mutation: true, stepUp: true });
+				if (!context) return reply;
+				const ceremony = deps().applicationAccountLinkCeremony;
+				if (!ceremony) {
+						return reply.code(404).send({ error: "application_linking_unavailable" });
+				}
+				const body = (request.body ?? {}) as Record<string, unknown>;
+				if (typeof body.transactionId !== "string" || typeof body.ownershipProof !== "string" ||
+						!body.transactionId || body.ownershipProof.length < 1 || body.ownershipProof.length > 8192) {
+						return reply.code(400).send({ error: "invalid_request" });
+				}
+				try {
+						const result = await ceremony.complete({
+								identitySubjectId: context.session.identitySubjectId,
+								sessionId: context.session.id,
+								authenticationMethod: context.session.authenticationMethod,
+								transactionId: body.transactionId,
+								ownershipProof: body.ownershipProof
+						});
+						return { link: result.link, created: result.created };
+				} catch (error) {
+						if (error instanceof ApplicationAccountLinkError) {
+								switch (error.code) {
+										case "INVALID_TRANSACTION":
+												return reply.code(400).send({ error: "invalid_transaction" });
+										case "PROOF_REJECTED":
+												return reply.code(400).send({ error: "ownership_proof_rejected" });
+										case "APPLICATION_UNAUTHORIZED":
+												return reply.code(403).send({ error: "application_not_authorized" });
+										case "LINK_CONFLICT":
+												return reply.code(409).send({ error: "account_link_conflict" });
+								}
+						}
+						throw error;
+				}
 		});
 }

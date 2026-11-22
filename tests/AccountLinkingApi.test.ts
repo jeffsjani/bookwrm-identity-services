@@ -1,13 +1,22 @@
 import { exportJWK, generateKeyPair, SignJWT, type JSONWebKeySet } from "jose";
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import { configuration } from "../src/config/ConfigurationService.js";
 import { AppleIdentityTokenVerifier, APPLE_ISSUER } from "../src/identity/federation/AppleIdentityTokenVerifier.js";
 import { GoogleIdentityTokenVerifier, GOOGLE_ISSUER } from "../src/identity/federation/GoogleIdentityTokenVerifier.js";
 import { FederationTransactionStore } from "../src/identity/federation/FederationTransactionStore.js";
 import { IdentityFederationService } from "../src/identity/IdentityFederationService.js";
+import {
+		ApplicationAccountLinkCeremony,
+		ApplicationAccountLinkTransactionStore,
+		ApplicationOwnershipProofRejected,
+		APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+		type ApplicationOwnershipProofVerifier,
+		type VerifiedApplicationOwnershipProof
+} from "../src/identity/ApplicationAccountLinkCeremony.js";
+import { InMemoryApplicationAccountLinks } from "../src/identity/ApplicationAccountLinks.js";
 import { InMemoryExternalIdentityRepository } from "../src/identity/InMemoryExternalIdentityRepository.js";
 import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdentitySubjectRepository.js";
 import { HapiSessionService, HAPI_SESSION_COOKIE } from "../src/identity/sessions/HapiSessionService.js";
@@ -32,6 +41,24 @@ let appleKey: CryptoKey | import("node:crypto").KeyObject;
 let appleJwks: JSONWebKeySet;
 let googleKey: CryptoKey | import("node:crypto").KeyObject;
 let googleJwks: JSONWebKeySet;
+
+class TestApplicationOwnershipProofVerifier implements ApplicationOwnershipProofVerifier {
+		private readonly proofs = new Map<string, VerifiedApplicationOwnershipProof>();
+
+		issue(claims: VerifiedApplicationOwnershipProof): string {
+				const proof = `test-ownership-proof-${randomUUID()}`;
+				this.proofs.set(proof, claims);
+				return proof;
+		}
+
+		async verify(proof: string, expected: { applicationId: string; clientId: string }) {
+				const claims = this.proofs.get(proof);
+				if (!claims || claims.applicationId !== expected.applicationId || claims.clientId !== expected.clientId) {
+						throw new ApplicationOwnershipProofRejected();
+				}
+				return claims;
+		}
+}
 
 beforeAll(async () => {
 		ensureOidcTestEnvironment();
@@ -78,6 +105,13 @@ async function linkingFixture() {
 		const transactions = new FederationTransactionStore();
 		const refreshRepository = new InMemoryRefreshTokenFamilyRepository();
 		const refreshRotation = new RefreshTokenRotationService(refreshRepository, undefined, clock);
+		const authorizedApplications = new Set<string>();
+		const applicationLinks = new InMemoryApplicationAccountLinks(async (identitySubjectId, applicationId, clientId) =>
+				authorizedApplications.has(`${identitySubjectId}:${applicationId}:${clientId}`));
+		const applicationLinkTransactions = new ApplicationAccountLinkTransactionStore(undefined, () => now);
+		const applicationProofVerifier = new TestApplicationOwnershipProofVerifier();
+		const applicationLinkCeremony = new ApplicationAccountLinkCeremony(
+				applicationLinks, applicationLinkTransactions, applicationProofVerifier, () => now);
 
 		const app: FastifyInstance = Fastify();
 		await registerAccountAuthenticationMethodRoutes(app, {
@@ -88,14 +122,22 @@ async function linkingFixture() {
 				verifiers: {
 						APPLE: new AppleIdentityTokenVerifier({ expectedAudiences: [APPLE_CLIENT], jwks: appleJwks }),
 						GOOGLE: new GoogleIdentityTokenVerifier({ expectedAudiences: [GOOGLE_CLIENT], jwks: googleJwks })
-				}
+				},
+				applicationAccountLinkCeremony: applicationLinkCeremony
 		});
 		await app.ready();
 
-		const createSubject = (overrides: Partial<IdentitySubject> = {}) => subjects.create({
-				id: randomUUID(), oidcSubject: randomUUID(), primaryProvider: "HAPI_EMAIL",
-				primaryProviderSubject: "member@example.com", email: "member@example.com",
-				emailVerified: true, status: "ACTIVE", ...overrides });
+		const createSubject = async (overrides: Partial<IdentitySubject> = {}) => {
+				const email = `member-${randomUUID()}@example.com`;
+				const subject = await subjects.create({
+						id: randomUUID(), oidcSubject: randomUUID(), primaryProvider: "HAPI_EMAIL",
+						primaryProviderSubject: email, email,
+						emailVerified: true, status: "ACTIVE", ...overrides });
+				for (const applicationId of ["BOOKWRM_TEST", "ELITE_TEST"]) {
+						authorizedApplications.add(`${subject.id}:${applicationId}:${applicationId}`);
+				}
+				return subject;
+		};
 
 		const authenticatedSession = async (identitySubjectId: string) => {
 				const established = await sessions.establishSession({ identitySubjectId, authenticationMethod: "HAPI_EMAIL" });
@@ -110,7 +152,8 @@ async function linkingFixture() {
 
 		return { app, subjects, federation, externalRepository, sessions, sessionRepository, transactions,
 				refreshRotation, refreshRepository, createSubject, authenticatedSession,
-				advance: (ms: number) => { now += ms; } };
+				applicationLinks, applicationLinkTransactions, applicationProofVerifier,
+				currentTime: () => now, advance: (ms: number) => { now += ms; } };
 }
 
 type Fixture = Awaited<ReturnType<typeof linkingFixture>>;
@@ -126,6 +169,40 @@ async function completeLink(f: Fixture, headers: Record<string, string>, transac
 				headers, payload: { transactionId, identityToken } });
 }
 
+async function startApplicationLink(
+		f: Fixture,
+		headers: Record<string, string>,
+		options: { applicationId?: string; clientId?: string; consent?: boolean } = {}
+) {
+		return f.app.inject({
+				method: "POST",
+				url: "/account/application-links/start",
+				headers,
+				payload: {
+						applicationId: options.applicationId ?? "BOOKWRM_TEST",
+						clientId: options.clientId ?? "BOOKWRM_TEST",
+						consent: options.consent ?? true
+				}
+		});
+}
+
+async function createApplicationOwnershipProof(f: Fixture, transactionId: string, externalAccountId: string) {
+		const transaction = await f.applicationLinkTransactions.findById(transactionId);
+		if (!transaction) throw new Error("Expected an active application-link transaction");
+		const issuedAt = f.currentTime();
+		return f.applicationProofVerifier.issue({
+				applicationId: transaction.applicationId,
+				clientId: transaction.clientId,
+				externalAccountId,
+				audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+				transactionId: transaction.id,
+				nonce: transaction.nonce,
+				proofId: randomUUID(),
+				issuedAt,
+				expiresAt: issuedAt + 60_000
+		});
+}
+
 afterEach(() => setFlag(undefined));
 
 describe("V2-D authenticated account-linking API", () => {
@@ -137,6 +214,8 @@ describe("V2-D authenticated account-linking API", () => {
 				for (const [method, url] of [["GET", "/account/authentication-methods"],
 						["POST", "/account/authentication-methods/link"],
 						["POST", "/account/authentication-methods/link/complete"],
+						["POST", "/account/application-links/start"],
+						["POST", "/account/application-links/complete"],
 						["DELETE", `/account/authentication-methods/${randomUUID()}`]] as const) {
 						const response = await f.app.inject({ method, url, headers,
 								...(method === "POST" ? { payload: {} } : {}) });
@@ -151,6 +230,10 @@ describe("V2-D authenticated account-linking API", () => {
 				const anonymous = await f.app.inject({ method: "GET", url: "/account/authentication-methods" });
 				expect(anonymous.statusCode).toBe(401);
 				expect(JSON.parse(anonymous.body).error).toBe("authentication_required");
+				for (const url of ["/account/application-links/start", "/account/application-links/complete"]) {
+						const response = await f.app.inject({ method: "POST", url, payload: {} });
+						expect(response.statusCode).toBe(401);
+				}
 
 				const unknown = await f.app.inject({ method: "GET", url: "/account/authentication-methods",
 						headers: { cookie: `${HAPI_SESSION_COOKIE}=hsid_forged` } });
@@ -194,6 +277,8 @@ describe("V2-D authenticated account-linking API", () => {
 						const started = await startLink(f, candidate as Record<string, string>);
 						expect(started.statusCode).toBe(403);
 						expect(JSON.parse(started.body).error).toBe("csrf_invalid");
+						const applicationLink = await startApplicationLink(f, candidate as Record<string, string>);
+						expect(applicationLink.statusCode).toBe(403);
 						const unlinked = await f.app.inject({ method: "DELETE",
 								url: `/account/authentication-methods/${randomUUID()}`, headers: candidate as Record<string, string> });
 						expect(unlinked.statusCode).toBe(403);
@@ -208,6 +293,9 @@ describe("V2-D authenticated account-linking API", () => {
 				for (const response of [
 						await startLink(f, headers),
 						await completeLink(f, headers, randomUUID(), "x"),
+						await startApplicationLink(f, headers),
+						await f.app.inject({ method: "POST", url: "/account/application-links/complete", headers,
+								payload: { transactionId: randomUUID(), ownershipProof: "x" } }),
 						await f.app.inject({ method: "DELETE", url: `/account/authentication-methods/${randomUUID()}`, headers })
 				]) {
 						expect(response.statusCode).toBe(428);
@@ -428,5 +516,271 @@ describe("V2-D authenticated account-linking API", () => {
 				const body = JSON.parse(completed.body);
 				expect(body.methods.map((method: { type: string }) => method.type).sort())
 						.toEqual(["GOOGLE", "HAPI_EMAIL"]);
+		});
+
+		it("requires explicit consent and an app-issued ownership proof, then binds the verified account id", async () => {
+				const f = await linkingFixture();
+				const subject = await f.createSubject();
+				const { headers } = await f.authenticatedSession(subject.id);
+				const noConsent = await startApplicationLink(f, headers, { consent: false });
+				expect(noConsent.statusCode).toBe(400);
+
+				const started = await startApplicationLink(f, headers);
+				expect(started.statusCode, started.body).toBe(200);
+				const transaction = started.json();
+				const proof = await createApplicationOwnershipProof(f, transaction.transactionId, "BW-verified-1");
+
+				const missingProof = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers,
+						payload: { transactionId: transaction.transactionId, externalAccountId: "BW-attacker-choice" }
+				});
+				expect(missingProof.statusCode).toBe(400);
+
+				const completed = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers,
+						payload: { transactionId: transaction.transactionId, ownershipProof: proof }
+				});
+				expect(completed.statusCode, completed.body).toBe(200);
+				expect(completed.json()).toMatchObject({
+						created: true,
+						link: {
+								identitySubjectId: subject.id,
+								applicationId: "BOOKWRM_TEST",
+								externalAccountId: "BW-verified-1"
+						}
+				});
+				expect(f.applicationLinks.audit[0]).toMatchObject({
+						evidence: {
+								authority: "APPLICATION_OWNERSHIP_PROOF",
+								requestId: transaction.transactionId,
+								authenticationMethod: "HAPI_EMAIL"
+						},
+						result: "created"
+				});
+
+				const replay = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers,
+						payload: { transactionId: transaction.transactionId, ownershipProof: proof }
+				});
+				expect(replay.statusCode).toBe(400);
+		});
+
+		it("keeps a valid link transaction retryable when persistence fails", async () => {
+				const f = await linkingFixture();
+				const subject = await f.createSubject();
+				const { headers } = await f.authenticatedSession(subject.id);
+				const started = await startApplicationLink(f, headers);
+				const transactionId = started.json().transactionId as string;
+				const proof = await createApplicationOwnershipProof(f, transactionId, "BW-retryable");
+				vi.spyOn(f.applicationLinks, "reconcile").mockRejectedValueOnce(new Error("storage unavailable"));
+
+				const failedWrite = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers,
+						payload: { transactionId, ownershipProof: proof }
+				});
+				expect(failedWrite.statusCode).toBe(500);
+
+				const retry = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers,
+						payload: { transactionId, ownershipProof: proof }
+				});
+				expect(retry.statusCode, retry.body).toBe(200);
+				expect(retry.json().link.externalAccountId).toBe("BW-retryable");
+		});
+
+		it("rejects forged, stale, cross-subject and wrong-application ownership evidence", async () => {
+				const f = await linkingFixture();
+				const subject = await f.createSubject();
+				const otherSubject = await f.createSubject();
+				const owner = await f.authenticatedSession(subject.id);
+				const other = await f.authenticatedSession(otherSubject.id);
+				const started = await startApplicationLink(f, owner.headers);
+				const transactionId = started.json().transactionId as string;
+				const validProof = await createApplicationOwnershipProof(f, transactionId, "BW-owned");
+
+				const forged = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId, ownershipProof: `${validProof}-forged` }
+				});
+				expect(forged.statusCode).toBe(400);
+
+				const crossSubject = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: other.headers,
+						payload: { transactionId, ownershipProof: validProof }
+				});
+				expect(crossSubject.statusCode).toBe(400);
+
+				const wrongApplication = await startApplicationLink(f, owner.headers);
+				const wrongTransactionId = wrongApplication.json().transactionId as string;
+				const tx = await f.applicationLinkTransactions.findById(wrongTransactionId);
+				if (!tx) throw new Error("Expected an active application-link transaction");
+				const wrongAppProof = f.applicationProofVerifier.issue({
+						applicationId: "ELITE_TEST",
+						clientId: "ELITE_TEST",
+						externalAccountId: "BW-owned",
+						audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+						transactionId: tx.id,
+						nonce: tx.nonce,
+						proofId: randomUUID(),
+						issuedAt: f.currentTime(),
+						expiresAt: f.currentTime() + 60_000
+				});
+				const wrongApp = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId: wrongTransactionId, ownershipProof: wrongAppProof }
+				});
+				expect(wrongApp.statusCode).toBe(400);
+
+				const wrongNonceProof = f.applicationProofVerifier.issue({
+						applicationId: tx.applicationId,
+						clientId: tx.clientId,
+						externalAccountId: "BW-owned",
+						audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+						transactionId: tx.id,
+						nonce: "mismatched-nonce",
+						proofId: randomUUID(),
+						issuedAt: f.currentTime(),
+						expiresAt: f.currentTime() + 60_000
+				});
+				const wrongNonce = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId: wrongTransactionId, ownershipProof: wrongNonceProof }
+				});
+				expect(wrongNonce.statusCode).toBe(400);
+
+				const wrongAudienceProof = f.applicationProofVerifier.issue({
+						applicationId: tx.applicationId,
+						clientId: tx.clientId,
+						externalAccountId: "BW-owned",
+						audience: "urn:wrong-audience",
+						transactionId: tx.id,
+						nonce: tx.nonce,
+						proofId: randomUUID(),
+						issuedAt: f.currentTime(),
+						expiresAt: f.currentTime() + 60_000
+				});
+				const wrongAudience = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId: wrongTransactionId, ownershipProof: wrongAudienceProof }
+				});
+				expect(wrongAudience.statusCode).toBe(400);
+
+				const invertedLifetimeProof = f.applicationProofVerifier.issue({
+						applicationId: tx.applicationId,
+						clientId: tx.clientId,
+						externalAccountId: "BW-owned",
+						audience: APPLICATION_OWNERSHIP_PROOF_AUDIENCE,
+						transactionId: tx.id,
+						nonce: tx.nonce,
+						proofId: randomUUID(),
+						issuedAt: f.currentTime() + 1_000,
+						expiresAt: f.currentTime() + 500
+				});
+				const invertedLifetime = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId: wrongTransactionId, ownershipProof: invertedLifetimeProof }
+				});
+				expect(invertedLifetime.statusCode).toBe(400);
+
+				f.advance(121_000);
+				const expiredProof = await f.app.inject({
+						method: "POST",
+						url: "/account/application-links/complete",
+						headers: owner.headers,
+						payload: { transactionId, ownershipProof: validProof }
+				});
+				expect(expiredProof.statusCode).toBe(400);
+				expect(f.applicationLinks.audit).toHaveLength(0);
+		});
+
+		it("rejects a client from another application before issuing an ownership challenge", async () => {
+				const f = await linkingFixture();
+				const subject = await f.createSubject();
+				const { headers } = await f.authenticatedSession(subject.id);
+				const response = await startApplicationLink(f, headers, {
+						applicationId: "BOOKWRM_TEST",
+						clientId: "ELITE_TEST"
+				});
+				expect(response.statusCode).toBe(403);
+		});
+
+		it("returns an existing same-owner association and rejects another subject's claim", async () => {
+				const f = await linkingFixture();
+				const owner = await f.createSubject();
+				const otherOwner = await f.createSubject();
+				const ownerAuth = await f.authenticatedSession(owner.id);
+				const otherAuth = await f.authenticatedSession(otherOwner.id);
+				const firstStart = await startApplicationLink(f, ownerAuth.headers);
+				const firstTransaction = firstStart.json();
+				const firstProof = await createApplicationOwnershipProof(f, firstTransaction.transactionId, "BW-unique");
+				const first = await f.app.inject({ method: "POST", url: "/account/application-links/complete",
+						headers: ownerAuth.headers, payload: { transactionId: firstTransaction.transactionId, ownershipProof: firstProof } });
+				expect(first.statusCode).toBe(200);
+
+				const retryStart = await startApplicationLink(f, ownerAuth.headers);
+				const retryTransaction = retryStart.json();
+				const retryProof = await createApplicationOwnershipProof(f, retryTransaction.transactionId, "BW-unique");
+				const retry = await f.app.inject({ method: "POST", url: "/account/application-links/complete",
+						headers: ownerAuth.headers, payload: { transactionId: retryTransaction.transactionId, ownershipProof: retryProof } });
+				expect(retry.statusCode).toBe(200);
+				expect(retry.json().created).toBe(false);
+				expect(retry.json().link.id).toBe(first.json().link.id);
+
+				const attackerStart = await startApplicationLink(f, otherAuth.headers);
+				const attackerTransaction = attackerStart.json();
+				const attackerProof = await createApplicationOwnershipProof(f, attackerTransaction.transactionId, "BW-unique");
+				const attacker = await f.app.inject({ method: "POST", url: "/account/application-links/complete",
+						headers: otherAuth.headers, payload: { transactionId: attackerTransaction.transactionId, ownershipProof: attackerProof } });
+				expect(attacker.statusCode).toBe(409);
+				expect(await f.applicationLinks.find("BOOKWRM_TEST", "BW-unique"))
+						.toMatchObject({ identitySubjectId: owner.id });
+		});
+
+		it("keeps application linking unavailable when no trusted proof verifier is configured", async () => {
+				const f = await linkingFixture();
+				const app = Fastify();
+				await registerAccountAuthenticationMethodRoutes(app, { sessions: f.sessions, federation: f.federation });
+				const subject = await f.createSubject();
+				const { headers } = await f.authenticatedSession(subject.id);
+				const response = await app.inject({ method: "POST", url: "/account/application-links/start",
+						headers, payload: { consent: true, applicationId: "BOOKWRM_TEST", clientId: "BOOKWRM_TEST" } });
+				expect(response.statusCode).toBe(404);
+				expect(response.json()).toMatchObject({ error: "application_linking_unavailable" });
+				await app.close();
+		});
+
+		it("rejects an expired application-link transaction", async () => {
+				const f = await linkingFixture();
+				const subject = await f.createSubject();
+				const { headers } = await f.authenticatedSession(subject.id);
+				const started = await startApplicationLink(f, headers);
+				const transactionId = started.json().transactionId as string;
+				f.advance(300_001);
+				const response = await f.app.inject({ method: "POST", url: "/account/application-links/complete",
+						headers, payload: { transactionId, ownershipProof: "expired" } });
+				expect(response.statusCode).toBe(400);
+				expect(response.json()).toMatchObject({ error: "invalid_transaction" });
 		});
 });

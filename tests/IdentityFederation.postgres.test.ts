@@ -8,6 +8,7 @@ import { PostgresExternalIdentityRepository } from "../src/identity/PostgresExte
 import { IdentityFederationService } from "../src/identity/IdentityFederationService.js";
 import { IdentityRegistry } from "../src/identity/IdentityRegistry.js";
 import { FederatedIdentityResolutionService } from "../src/identity/federation/FederatedIdentityResolutionService.js";
+import { withPostgresTransaction } from "../src/identity/infrastructure/PostgresInfrastructure.js";
 import { BOOKWRM_APPLICATION_ID, BOOKWRM_TENANT_ID } from "../src/identity/WellKnownIdentities.js";
 
 // HAPI ID V2-B integration certification against a real PostgreSQL instance. Proves the
@@ -180,7 +181,13 @@ describe.skipIf(!databaseUrl)("V2-B external identity linking (PostgreSQL integr
 		});
 
 		it("concurrent first-time federated registration resolves to one stable subject and binding", async () => {
-				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects));
+				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects), undefined,
+						operation => withPostgresTransaction(client => operation({
+								atomic: true,
+								registry: new IdentityRegistry(new PostgresIdentitySubjectRepository(client)),
+								federation: new IdentityFederationService(
+										new PostgresExternalIdentityRepository(undefined, client))
+						}), pool));
 				const verified = {
 						provider: "GOOGLE" as const,
 						providerIssuer: GOOGLE_ISSUER,
@@ -205,6 +212,112 @@ describe.skipIf(!databaseUrl)("V2-B external identity linking (PostgreSQL integr
 						"SELECT identity_subject_id FROM external_identities WHERE provider='GOOGLE' AND provider_issuer=$1 AND provider_subject=$2 AND status='linked'",
 						[GOOGLE_ISSUER, verified.providerSubject]);
 				expect(bindings.rows).toEqual([{ identity_subject_id: subjectsForProvider.rows[0].id }]);
+		});
+
+		it("returns the same subject and provider binding after a repeated registration submission", async () => {
+				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects), undefined,
+						operation => withPostgresTransaction(client => operation({
+								atomic: true,
+								registry: new IdentityRegistry(new PostgresIdentitySubjectRepository(client)),
+								federation: new IdentityFederationService(
+										new PostgresExternalIdentityRepository(undefined, client))
+						}), pool));
+				const verified = {
+						provider: "APPLE" as const,
+						providerIssuer: APPLE_ISSUER,
+						providerSubject: `apple-repeat-${randomUUID()}`,
+						audience: "synthetic-apple-client",
+						isPrivateRelayEmail: false,
+						expiresAt: Date.now() + 60_000,
+						evidenceReference: "synthetic-registration-evidence"
+				};
+				const first = await resolution.registerFirstTime(verified);
+				const retry = await resolution.registerFirstTime(verified);
+				expect(first.status).toBe("registered");
+				expect(retry.status).toBe("registered");
+				if (first.status !== "registered" || retry.status !== "registered") {
+						throw new Error("Repeated registration did not resolve");
+				}
+				expect(retry.subject.oidcSubject).toBe(first.subject.oidcSubject);
+				expect(retry.externalIdentity.id).toBe(first.externalIdentity.id);
+		});
+
+		it("rolls back a newly minted subject when the exact provider identity is already linked elsewhere", async () => {
+				const ownerId = await createSubject();
+				const providerSubject = `google-conflict-${randomUUID()}`;
+				await service.linkExternalIdentity({
+						identitySubjectId: ownerId,
+						provider: "GOOGLE",
+						providerIssuer: GOOGLE_ISSUER,
+						providerSubject
+				});
+				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects), undefined,
+						operation => withPostgresTransaction(client => operation({
+								atomic: true,
+								registry: new IdentityRegistry(new PostgresIdentitySubjectRepository(client)),
+								federation: new IdentityFederationService(
+										new PostgresExternalIdentityRepository(undefined, client))
+						}), pool));
+				const result = await resolution.registerFirstTime({
+						provider: "GOOGLE",
+						providerIssuer: GOOGLE_ISSUER,
+						providerSubject,
+						audience: "synthetic-google-client",
+						isPrivateRelayEmail: false,
+						expiresAt: Date.now() + 60_000,
+						evidenceReference: "synthetic-registration-evidence"
+				});
+				expect(result).toEqual({ status: "conflict" });
+				expect((await pool.query(
+						"SELECT id FROM identity_subjects WHERE primary_provider='Google' AND primary_provider_subject=$1",
+						[providerSubject])).rows).toHaveLength(0);
+				expect((await pool.query(
+						"SELECT identity_subject_id FROM external_identities WHERE provider='GOOGLE' AND provider_issuer=$1 AND provider_subject=$2 AND status='linked'",
+						[GOOGLE_ISSUER, providerSubject])).rows).toEqual([{ identity_subject_id: ownerId }]);
+		});
+
+		it("rolls back the subject when the provider binding write itself fails", async () => {
+				const providerSubject = `google-failed-binding-${randomUUID()}`;
+				const suffix = randomUUID().replaceAll("-", "");
+				const functionName = `hapi_fail_federated_binding_${suffix}`;
+				const triggerName = `hapi_fail_federated_binding_${suffix}`;
+				await pool.query(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+					BEGIN
+						IF NEW.provider_subject = '${providerSubject}' THEN
+							RAISE EXCEPTION 'synthetic provider binding failure';
+						END IF;
+						RETURN NEW;
+					END
+				$$`);
+				await pool.query(`CREATE TRIGGER ${triggerName} BEFORE INSERT ON external_identities
+					FOR EACH ROW EXECUTE FUNCTION ${functionName}()`);
+				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects), undefined,
+						operation => withPostgresTransaction(client => operation({
+								atomic: true,
+								registry: new IdentityRegistry(new PostgresIdentitySubjectRepository(client)),
+								federation: new IdentityFederationService(
+										new PostgresExternalIdentityRepository(undefined, client))
+						}), pool));
+				try {
+						await expect(resolution.registerFirstTime({
+								provider: "GOOGLE",
+								providerIssuer: GOOGLE_ISSUER,
+								providerSubject,
+								audience: "synthetic-google-client",
+								isPrivateRelayEmail: false,
+								expiresAt: Date.now() + 60_000,
+								evidenceReference: "synthetic-registration-evidence"
+						})).rejects.toThrow("synthetic provider binding failure");
+				} finally {
+						await pool.query(`DROP TRIGGER IF EXISTS ${triggerName} ON external_identities`);
+						await pool.query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+				}
+				expect((await pool.query(
+						"SELECT id FROM identity_subjects WHERE primary_provider='Google' AND primary_provider_subject=$1",
+						[providerSubject])).rows).toHaveLength(0);
+				expect((await pool.query(
+						"SELECT id FROM external_identities WHERE provider='GOOGLE' AND provider_issuer=$1 AND provider_subject=$2",
+						[GOOGLE_ISSUER, providerSubject])).rows).toHaveLength(0);
 		});
 
 		it("never races two concurrent unlinks down to zero usable methods", async () => {

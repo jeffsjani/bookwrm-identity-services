@@ -35,4 +35,5 @@ export interface IdentitySubjectRepository {
 		// Atomically inserts a new subject or returns the pre-existing one for the same provider identity.
 		// Guarantees exactly one row per (primaryProvider, primaryProviderSubject) under concurrent calls.
 		resolveOrCreate(input: CreateIdentitySubjectInput): Promise<IdentitySubject>;
+		resolveOrCreateWithStatus?(input: CreateIdentitySubjectInput): Promise<{ subject: IdentitySubject; created: boolean }>;
 }
