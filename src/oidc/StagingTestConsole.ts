@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createLocalJWKSet, jwtVerify, type JSONWebKeySet } from "jose";
-import { renderHapiPage, csrfField } from "../presentation/HapiPagePresentation.js";
+import { renderHapiPage, csrfField, escapeHtml } from "../presentation/HapiPagePresentation.js";
+import { normalizeEmail } from "../email/EmailNormalizationService.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 import { getRedisClient, oidcRedisKey, type RedisClient } from "./infrastructure/RedisInfrastructure.js";
@@ -11,7 +12,7 @@ export const STAGING_ISSUER = "https://id-staging.hapiinc.com";
 export const STAGING_CONSOLE_CALLBACK = `${STAGING_ISSUER}/staging-console/callback`;
 const STAGING_HOST = new URL(STAGING_ISSUER).host;
 const CLIENT = "staging-web";
-const EMAIL = "jeff@hapiinc.com";
+const DEFAULT_EMAIL = "jeff@hapiinc.com";
 const COOKIE = "__Host-hapi_staging_test";
 const TTL = 600_000;
 const HANDLE = /^[A-Za-z0-9_-]{43}$/;
@@ -119,20 +120,33 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 		if (saved !== "OK") throw new Error("Unable to create staging test");
 		reply.header("Set-Cookie", `${COOKIE}=${handle}; Path=/; Max-Age=${TTL / 1000}; HttpOnly; Secure; SameSite=Lax`);
 		return page(reply, 200, "HAPI ID Staging Test",
-			`<p>Sign in or register with ${EMAIL}. The verification code will be sent to that mailbox.</p>` +
-			`<form method="post" action="/staging-console/start">${csrfField(flow.csrf)}<button type="submit">Start test</button></form>`, "same-origin");
+			`<p>Sign in or register with the test mailbox below. The verification code will be sent to that mailbox.</p>` +
+			`<form method="post" action="/staging-console/start">${csrfField(flow.csrf)}` +
+			`<label for="email">Test email address</label>` +
+			`<input id="email" name="email" type="email" required maxlength="254" value="${escapeHtml(DEFAULT_EMAIL)}">` +
+			`<button type="submit">Start test</button></form>`, "same-origin");
 	});
 
 	app.post("/staging-console/start", { ...route, bodyLimit: 1024 }, async (request, reply) => {
 		const handle = cookie(request);
-		const body = request.body as { csrf?: unknown } | undefined;
+		const body = request.body as { csrf?: unknown; email?: unknown } | undefined;
 		const raw = handle ? await redis.get(key(handle, "flow")) : null;
 		if (!handle || !raw || request.headers.origin !== STAGING_ISSUER || typeof body?.csrf !== "string") {
 			return page(reply, 400, "Test expired", "<p>Return to the test console and start again.</p>");
 		}
 		const flow = JSON.parse(raw) as Flow;
-		if (!constantTimeStringEqual(flow.csrf, body.csrf) ||
-			await redis.set(key(handle, "started"), "1", "PX", TTL, "NX") !== "OK") {
+		if (!constantTimeStringEqual(flow.csrf, body.csrf)) {
+			return page(reply, 400, "Test expired", "<p>Return to the test console and start again.</p>");
+		}
+		let email: string | undefined;
+		if (typeof body.email === "string" && body.email.length <= 254) {
+			try { email = normalizeEmail(body.email); } catch { email = undefined; }
+		}
+		if (!email) {
+			return page(reply, 400, "Invalid email", "<p>Enter a valid test email address and start again.</p>");
+		}
+		if (await redis.set(key(handle, "started"), "1", "PX", TTL, "NX") !== "OK" ||
+			await redis.set(key(handle, "email"), email, "PX", TTL, "NX") !== "OK") {
 			return page(reply, 400, "Test expired", "<p>Return to the test console and start again.</p>");
 		}
 		const query = new URLSearchParams({
@@ -147,7 +161,8 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 		const handle = cookie(request);
 		const query = request.query as { state?: unknown; code?: unknown; error?: unknown };
 		const raw = handle ? await redis.get(key(handle, "flow")) : null;
-		if (!handle || !raw || query.error !== undefined || typeof query.state !== "string" || typeof query.code !== "string" ||
+		const expectedEmail = handle ? await redis.get(key(handle, "email")) : null;
+		if (!handle || !raw || !expectedEmail || query.error !== undefined || typeof query.state !== "string" || typeof query.code !== "string" ||
 			!query.code || !await redis.get(key(handle, "started"))) {
 			return page(reply, 400, "Test failed", "<p>Invalid or expired callback. Start again.</p>");
 		}
@@ -156,7 +171,7 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 			await redis.set(key(handle, "consumed"), "1", "PX", TTL, "NX") !== "OK") {
 			return page(reply, 400, "Test failed", "<p>Invalid or expired callback. Start again.</p>");
 		}
-		await redis.del(key(handle, "flow"));
+		await redis.del(key(handle, "flow"), key(handle, "email"));
 		const results: Result[] = [{ name: "Authorization and state", passed: true }];
 		try {
 			const basic = Buffer.from(`${encodeURIComponent(CLIENT)}:${encodeURIComponent(secret)}`).toString("base64");
@@ -198,10 +213,10 @@ export async function registerStagingTestConsole(app: FastifyInstance, options: 
 						headers: { ...stagingConsoleInternalHeaders(), authorization: `Bearer ${tokens.access_token}` } });
 					const info: StagingConsoleUserInfo = response.json();
 					const expected = Array.isArray(idClaims?.amr) && idClaims.amr.includes("passkey")
-						? await identityRegistry.findByProvider("HAPI_EMAIL", EMAIL) : undefined;
+						? await identityRegistry.findByProvider("HAPI_EMAIL", expectedEmail) : undefined;
 					const matched = response.statusCode === 200 && idClaims !== undefined
-						&& validateStagingConsoleUserInfo(idClaims, info, EMAIL,
-							expected?.status === "ACTIVE" && expected.email === EMAIL && expected.emailVerified === true
+						&& validateStagingConsoleUserInfo(idClaims, info, expectedEmail,
+							expected?.status === "ACTIVE" && expected.email === expectedEmail && expected.emailVerified === true
 								? expected.oidcSubject : undefined);
 					const passkey = Array.isArray(idClaims?.amr) && idClaims.amr.length === 1 && idClaims.amr[0] === "passkey";
 					results.push({ name: `UserInfo matches the test mailbox${passkey ? " (PASSKEY)" : ""}`, passed: matched });

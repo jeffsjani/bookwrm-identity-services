@@ -46,7 +46,10 @@ SELECT EXISTS (SELECT 1 FROM account) AS active_verified_account,
 - Confirm the staging service, staging PostgreSQL and staging Redis are isolated from Bookwrm
   production. The issuer must be exactly `https://id-staging.hapiinc.com`, with its existing
   single-issuer allowlist. Do not copy production credentials or data into staging.
-- Confirm `jeff@hapiinc.com` is a controlled mailbox and approved for a staging identity. A first
+- Confirm the test mailbox is controlled and approved for a staging identity. The console prefills
+  `jeff@hapiinc.com`; the operator may enter a different controlled mailbox before starting. The
+  entered mailbox is normalized, stored server-side with the flow state, and becomes the expected
+  mailbox for the UserInfo check. A first
   login creates a staging identity; subsequent logins use it. Enabling Universal Login and email
   also makes their normal staging routes available, not only the console.
 - Confirm the staging Resend key, verified sender and verification secret exist and are dedicated
@@ -109,7 +112,8 @@ SELECT EXISTS (SELECT 1 FROM account) AS active_verified_account,
    Do not enable the one-time client-secret rotation flag for this procedure.
 4. After the separately approved activation, visit
    `https://id-staging.hapiinc.com/staging-console/`. Enter the dedicated operator credential in
-   the browser's native prompt. Start the test, choose email, enter `jeff@hapiinc.com`, and enter
+   the browser's native prompt. Confirm or change the prefilled test email address, start the
+   test, choose email, sign in with that same mailbox, and enter
    the email OTP in the existing HAPI screen. The final page reports each check as PASS or FAIL.
    The positive exchange proves a verifier was used; a wrong-verifier rejection is covered by
    automated tests, not by an additional live OTP.

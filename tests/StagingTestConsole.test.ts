@@ -18,7 +18,8 @@ const env = { STAGING_TEST_CONSOLE_ENABLED: "true", STAGING_TEST_CONSOLE_USERNAM
 const authorization = "Basic " + Buffer.from(`operator:${password}`).toString("base64");
 const headers = { host: "id-staging.hapiinc.com", "x-forwarded-proto": "https", authorization };
 
-async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: NodeJS.ProcessEnv = env) {
+async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: NodeJS.ProcessEnv = env,
+	userinfoEmail = "jeff@hapiinc.com") {
 	const app = Fastify({ trustProxy: false });
 	await app.register(formbody);
 	const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -37,7 +38,7 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 		const passkey = scenario.startsWith("passkey");
 		const idToken = await new SignJWT({ nonce: scenario === "bad-nonce" ? "wrong" : nonce,
 			amr: [passkey ? "passkey" : "email"],
-			...(passkey ? { email: "jeff@hapiinc.com", email_verified: true } : {}) })
+			...(passkey ? { email: userinfoEmail, email_verified: true } : {}) })
 			.setProtectedHeader({ alg: "RS256", kid: "test" }).setIssuer(scenario === "bad-issuer" ? "https://identity.bookwrm.com" : STAGING_ISSUER)
 			.setAudience(scenario === "bad-audience" ? "other-client" : "staging-web").setSubject("test-subject").setIssuedAt()
 			.setExpirationTime(scenario === "expired" ? "1 second ago" : "5 minutes").sign(privateKey);
@@ -45,17 +46,17 @@ async function fixture(scenario = "valid", issuer = STAGING_ISSUER, config: Node
 	});
 	app.get("/jwks", async () => { jwksCalls++; return { keys: [jwk] }; });
 	app.get("/userinfo", async () => { userinfoCalls++; return { sub: scenario === "bad-userinfo" || scenario === "passkey-bad-userinfo" ? "other-subject" : "test-subject",
-		email: "jeff@hapiinc.com", email_verified: true }; });
+		email: userinfoEmail, email_verified: true }; });
 	await registerStagingTestConsole(app, { issuer, env: config });
 	await app.ready();
-	async function start() {
+	async function start(email = "jeff@hapiinc.com") {
 		const index = await app.inject({ method: "GET", url: "/staging-console/", headers });
 		const cookie = String(index.headers["set-cookie"]).split(";")[0];
 		const csrf = /name="csrf" value="([^"]+)"/.exec(index.body)?.[1];
 		expect(csrf).toBeTruthy();
 		const response = await app.inject({ method: "POST", url: "/staging-console/start",
 			headers: { ...headers, cookie, origin: STAGING_ISSUER, "content-type": "application/x-www-form-urlencoded" },
-			payload: new URLSearchParams({ csrf: csrf! }).toString() });
+			payload: new URLSearchParams({ csrf: csrf!, email }).toString() });
 		expect(response.statusCode).toBe(303);
 		const url = new URL(String(response.headers.location));
 		nonce = url.searchParams.get("nonce")!;
@@ -277,6 +278,75 @@ describe("staging test console", () => {
 			expect(results.body).toContain("PASS: UserInfo matches the test mailbox");
 			expect(results.body).not.toContain("(PASSKEY)");
 		} finally { await f.app.close(); }
+	});
+
+	it("prefills an editable test email field with the default mailbox", async () => {
+		const f = await fixture();
+		try {
+			const index = await f.app.inject({ method: "GET", url: "/staging-console/", headers });
+			expect(index.statusCode).toBe(200);
+			expect(index.body).toMatch(/<input id="email" name="email" type="email" required maxlength="254" value="jeff@hapiinc\.com">/);
+		} finally { await f.app.close(); }
+	});
+
+	it("passes when UserInfo matches the normalized operator-entered mailbox", async () => {
+		const f = await fixture("valid", STAGING_ISSUER, env, "operator@hapiinc.com");
+		try {
+			const { cookie, state } = await f.start("operator@HAPIINC.COM");
+			expect((await f.app.inject({ method: "GET", url: `/staging-console/callback?code=secret-code&state=${state}`,
+				headers: { ...headers, cookie } })).statusCode).toBe(303);
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results", headers: { ...headers, cookie } });
+			expect(results.body).toContain("Test passed");
+			expect(results.body).toContain("PASS: UserInfo matches the test mailbox");
+		} finally { await f.app.close(); }
+	});
+
+	it("fails when UserInfo does not match the operator-entered mailbox", async () => {
+		const f = await fixture();
+		try {
+			const { cookie, state } = await f.start("different@hapiinc.com");
+			expect((await f.app.inject({ method: "GET", url: `/staging-console/callback?code=secret-code&state=${state}`,
+				headers: { ...headers, cookie } })).statusCode).toBe(303);
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results", headers: { ...headers, cookie } });
+			expect(results.body).toContain("Test failed");
+			expect(results.body).toContain("FAIL: UserInfo matches the test mailbox");
+		} finally { await f.app.close(); }
+	});
+
+	it("rejects a missing or invalid operator email without consuming the test", async () => {
+		const f = await fixture();
+		try {
+			const index = await f.app.inject({ method: "GET", url: "/staging-console/", headers });
+			const cookie = String(index.headers["set-cookie"]).split(";")[0];
+			const csrf = /name="csrf" value="([^"]+)"/.exec(index.body)![1];
+			const post = (payload: Record<string, string>) => f.app.inject({ method: "POST", url: "/staging-console/start",
+				headers: { ...headers, cookie, origin: STAGING_ISSUER, "content-type": "application/x-www-form-urlencoded" },
+				payload: new URLSearchParams(payload).toString() });
+			for (const payload of [{ csrf }, { csrf, email: "not-an-email" }, { csrf, email: "a@b" }]) {
+				const response = await post(payload);
+				expect(response.statusCode).toBe(400);
+				expect(response.body).toContain("Invalid email");
+			}
+			expect((await post({ csrf, email: "jeff@hapiinc.com" })).statusCode).toBe(303);
+			expect(f.tokenCalls()).toBe(0);
+		} finally { await f.app.close(); }
+	});
+
+	it("resolves the canonical passkey account from the operator-entered mailbox", async () => {
+		const lookup = vi.spyOn(identityRegistry, "findByProvider").mockResolvedValue({
+			id: "identity-id", oidcSubject: "test-subject", primaryProvider: "HAPI_EMAIL",
+			primaryProviderSubject: "operator@hapiinc.com", email: "operator@hapiinc.com", emailVerified: true,
+			status: "ACTIVE", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+		});
+		const f = await fixture("passkey", STAGING_ISSUER, env, "operator@hapiinc.com");
+		try {
+			const { cookie, state } = await f.start("operator@hapiinc.com");
+			await f.app.inject({ method: "GET", url: `/staging-console/callback?code=secret-code&state=${state}`,
+				headers: { ...headers, cookie } });
+			const results = await f.app.inject({ method: "GET", url: "/staging-console/results", headers: { ...headers, cookie } });
+			expect(results.body).toContain("PASS: UserInfo matches the test mailbox (PASSKEY)");
+			expect(lookup).toHaveBeenCalledWith("HAPI_EMAIL", "operator@hapiinc.com");
+		} finally { await f.app.close(); lookup.mockRestore(); }
 	});
 
 	it("expires the pending state and PKCE session after ten minutes", async () => {

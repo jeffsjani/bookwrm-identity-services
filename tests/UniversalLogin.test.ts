@@ -377,7 +377,7 @@ describe("Staging browser console", () => {
 			const consoleCookie = String(index.headers["set-cookie"]).split(";")[0];
 			const start = await f.app.inject({ method: "POST", url: "/staging-console/start",
 				headers: { ...headers, cookie: consoleCookie, origin: STAGING_ISSUER, "content-type": "application/x-www-form-urlencoded" },
-				payload: new URLSearchParams({ csrf: csrfFrom(index.body) }).toString() });
+				payload: new URLSearchParams({ csrf: csrfFrom(index.body), email: "jeff@hapiinc.com" }).toString() });
 			expect(start.statusCode).toBe(303);
 			const authorizeUrl = new URL(String(start.headers.location));
 			expect(authorizeUrl.origin).toBe(STAGING_ISSUER);
