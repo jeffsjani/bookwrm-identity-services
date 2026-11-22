@@ -663,6 +663,43 @@ describe("V2-D federated Universal Login (synthetic providers)", () => {
 		expect(googleLog).not.toHaveProperty("appleExchangeCategory");
 	});
 
+	it("registers an unknown Apple identity only after consent and keeps its subject on later login", async () => {
+		const f = await federatedFixture();
+		const existing = await f.subjects.create({ id: randomUUID(), oidcSubject: randomUUID(),
+			primaryProvider: "HAPI_EMAIL", primaryProviderSubject: f.identities.APPLE.email,
+			email: f.identities.APPLE.email, emailVerified: true, status: "ACTIVE" });
+
+		const verifier = "verifier-first-time-apple";
+		const firstInteraction = await beginInteraction(f, verifier);
+		const firstProvider = await launchProvider(f, firstInteraction, "APPLE");
+		const firstCallback = await appleCallback(f, { state: firstProvider.state, code: firstProvider.code });
+		expect(firstCallback.statusCode, firstCallback.body).toBe(200);
+		expect(firstCallback.body).toContain("isn't connected to an account here yet");
+
+		const completed = await f.app.inject({ method: "POST", url: "/login/federated/complete",
+			...form({ csrf: firstInteraction.csrf, choice: "create" }, firstInteraction.cookie) });
+		expect(completed.statusCode, completed.body).toBe(303);
+		const firstToken = await exchangeCode(f, completed.headers.location as string, verifier);
+		expect(firstToken.statusCode, firstToken.body).toBe(200);
+		const firstSubject = decodeJwt(JSON.parse(firstToken.body).id_token).sub as string;
+		expect(firstSubject).not.toBe(existing.oidcSubject);
+
+		const created = await f.subjects.findByOidcSubject(firstSubject);
+		expect(created?.primaryProvider).toBe("Apple");
+		const links = await f.federation.listExternalIdentities(created!.id);
+		expect(links).toHaveLength(1);
+		expect(links[0]).toMatchObject({ provider: "APPLE", providerSubject: f.identities.APPLE.sub, status: "linked" });
+
+		const returningInteraction = await beginInteraction(f, "verifier-returning-apple");
+		const returningProvider = await launchProvider(f, returningInteraction, "APPLE");
+		const returningCallback = await appleCallback(f, { state: returningProvider.state, code: returningProvider.code });
+		expect(returningCallback.statusCode, returningCallback.body).toBe(303);
+		const returningToken = await exchangeCode(f, returningCallback.headers.location as string, "verifier-returning-apple");
+		expect(returningToken.statusCode, returningToken.body).toBe(200);
+		expect(decodeJwt(JSON.parse(returningToken.body).id_token).sub).toBe(firstSubject);
+		expect(await f.subjects.list()).toHaveLength(2);
+	});
+
 	it("keeps the Google switch to email sign-in unchanged", async () => {
 		const f = await federatedFixture();
 		const interaction = await beginInteraction(f, "verifier-switch-email");

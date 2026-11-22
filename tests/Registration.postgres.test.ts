@@ -127,6 +127,45 @@ describe.skipIf(!databaseUrl)("H3 durable PostgreSQL atomicity/concurrency", () 
 		expect(rows.rows).toHaveLength(1);
 	});
 
+	it("rolls back identity, evidence, challenge consumption, and audit when a registration write fails", async () => {
+		const email = uniqueEmail();
+		const verificationId = await verifiedChallenge(email);
+		const suffix = randomUUID().replaceAll("-", "");
+		const functionName = `hapi_fail_registration_${suffix}`;
+		const triggerName = `hapi_fail_registration_${suffix}`;
+		await pool.query(`CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF NEW.type = 'IDENTITY_REGISTERED' THEN
+					RAISE EXCEPTION 'synthetic registration audit failure';
+				END IF;
+				RETURN NEW;
+			END
+		$$`);
+		await pool.query(`CREATE TRIGGER ${triggerName} BEFORE INSERT ON identity_registration_audit
+			FOR EACH ROW EXECUTE FUNCTION ${functionName}()`);
+
+		try {
+			await expect(registrationRepository.complete({ context, verificationId }))
+				.rejects.toMatchObject({ code: "REGISTRATION_UNAVAILABLE" });
+
+			expect((await pool.query(
+				"SELECT id FROM identity_subjects WHERE primary_provider='HAPI_EMAIL' AND primary_provider_subject=$1", [email]
+			)).rows).toHaveLength(0);
+			expect((await pool.query(
+				"SELECT verification_challenge_id FROM registration_evidence WHERE verification_challenge_id=$1", [verificationId]
+			)).rows).toHaveLength(0);
+			expect((await pool.query(
+				"SELECT status, consumed_at FROM verification_challenges WHERE id=$1", [verificationId]
+			)).rows[0]).toMatchObject({ status: "VERIFIED", consumed_at: null });
+			expect((await pool.query(
+				"SELECT id FROM identity_registration_audit WHERE verification_challenge_id=$1", [verificationId]
+			)).rows).toHaveLength(0);
+		} finally {
+			await pool.query(`DROP TRIGGER IF EXISTS ${triggerName} ON identity_registration_audit`);
+			await pool.query(`DROP FUNCTION IF EXISTS ${functionName}()`);
+		}
+	});
+
 	it("Case C conflict: a verified email already owned by a different-provider identity is rejected without mutation", async () => {
 		const email = uniqueEmail();
 		const conflictingSubjectId = randomUUID();

@@ -6,6 +6,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgresIdentitySubjectRepository } from "../src/identity/PostgresIdentitySubjectRepository.js";
 import { PostgresExternalIdentityRepository } from "../src/identity/PostgresExternalIdentityRepository.js";
 import { IdentityFederationService } from "../src/identity/IdentityFederationService.js";
+import { IdentityRegistry } from "../src/identity/IdentityRegistry.js";
+import { FederatedIdentityResolutionService } from "../src/identity/federation/FederatedIdentityResolutionService.js";
+import { BOOKWRM_APPLICATION_ID, BOOKWRM_TENANT_ID } from "../src/identity/WellKnownIdentities.js";
 
 // HAPI ID V2-B integration certification against a real PostgreSQL instance. Proves the
 // database-enforced invariants that the in-memory suite can only simulate: atomic uniqueness
@@ -50,6 +53,16 @@ describe.skipIf(!databaseUrl)("V2-B external identity linking (PostgreSQL integr
 				await pool.query(federationDdl);
 				await pool.query(identityDdl);
 				await pool.query(federationDdl);
+				await pool.query(
+						"INSERT INTO tenants VALUES ($1, 'Bookwrm', 'bookwrm', 'active', NOW(), NOW())",
+						[BOOKWRM_TENANT_ID]
+				);
+				await pool.query(
+						`INSERT INTO applications
+							(id, tenant_id, name, slug, status, created_at, updated_at, application_key)
+						 VALUES ($1, $2, 'Bookwrm', 'bookwrm', 'active', NOW(), NOW(), 'BOOKWRM')`,
+						[BOOKWRM_APPLICATION_ID, BOOKWRM_TENANT_ID]
+				);
 		});
 
 		afterAll(async () => {
@@ -164,6 +177,34 @@ describe.skipIf(!databaseUrl)("V2-B external identity linking (PostgreSQL integr
 						`SELECT id FROM external_identities WHERE identity_subject_id = $1 AND status = 'linked'`,
 						[subjectId]);
 				expect(active.rows).toHaveLength(1);
+		});
+
+		it("concurrent first-time federated registration resolves to one stable subject and binding", async () => {
+				const resolution = new FederatedIdentityResolutionService(service, new IdentityRegistry(subjects));
+				const verified = {
+						provider: "GOOGLE" as const,
+						providerIssuer: GOOGLE_ISSUER,
+						providerSubject: `google-registration-${randomUUID()}`,
+						audience: "synthetic-google-client",
+						isPrivateRelayEmail: false,
+						expiresAt: Date.now() + 60_000,
+						evidenceReference: "synthetic-registration-evidence"
+				};
+
+				const results = await Promise.all(Array.from({ length: 10 }, () => resolution.registerFirstTime(verified)));
+				expect(results.every(result => result.status === "registered")).toBe(true);
+				expect(new Set(results.map(result => result.subject.oidcSubject)).size).toBe(1);
+
+				const subjectsForProvider = await pool.query(
+						"SELECT id, oidc_subject FROM identity_subjects WHERE primary_provider='Google' AND primary_provider_subject=$1",
+						[verified.providerSubject]);
+				expect(subjectsForProvider.rows).toHaveLength(1);
+				expect(subjectsForProvider.rows[0].oidc_subject).toBe(results[0].subject.oidcSubject);
+
+				const bindings = await pool.query(
+						"SELECT identity_subject_id FROM external_identities WHERE provider='GOOGLE' AND provider_issuer=$1 AND provider_subject=$2 AND status='linked'",
+						[GOOGLE_ISSUER, verified.providerSubject]);
+				expect(bindings.rows).toEqual([{ identity_subject_id: subjectsForProvider.rows[0].id }]);
 		});
 
 		it("never races two concurrent unlinks down to zero usable methods", async () => {
