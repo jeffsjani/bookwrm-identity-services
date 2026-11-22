@@ -78,14 +78,24 @@ export type StartApplicationAccountLinkInput = AuthenticatedLinkInitiator & {
 };
 
 const digest = (value: string) => createHash("sha256").update(value).digest("base64url");
+const RESERVE_PROOF_SCRIPT = `
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+local ttl = math.min(tonumber(ARGV[2]), redis.call('PTTL', KEYS[1]))
+if ttl <= 0 then return 0 end
+local reserved = redis.call('GET', KEYS[3])
+if reserved and reserved ~= ARGV[3] then return 0 end
+local proofOwner = redis.call('GET', KEYS[4])
+if proofOwner and proofOwner ~= ARGV[4] then return 0 end
+redis.call('SET', KEYS[3], ARGV[3], 'PX', ttl)
+redis.call('SET', KEYS[4], ARGV[4], 'PX', ttl)
+return 1`;
 const CONSUME_TRANSACTION_SCRIPT = `
-if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('EXISTS', KEYS[3]) ~= 0 then return 0 end
-if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('EXISTS', KEYS[2]) ~= 0 or redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('GET', KEYS[3]) ~= ARGV[3] or redis.call('GET', KEYS[4]) ~= ARGV[4] then return 0 end
 local ttl = math.min(tonumber(ARGV[2]), redis.call('PTTL', KEYS[1]))
 if ttl <= 0 then return 0 end
 redis.call('SET', KEYS[2], '1', 'PX', ttl)
-redis.call('SET', KEYS[3], '1', 'PX', ttl)
-redis.call('DEL', KEYS[1])
+redis.call('DEL', KEYS[1], KEYS[3])
 return 1`;
 
 export class ApplicationAccountLinkTransactionStore {
@@ -128,15 +138,27 @@ export class ApplicationAccountLinkTransactionStore {
 				return transaction;
 		}
 
+		async reserveProof(id: string, applicationId: string, proofId: string): Promise<ApplicationAccountLinkTransaction | null> {
+				const transaction = await this.findById(id);
+				if (!transaction || transaction.applicationId !== applicationId || !proofId) return null;
+				const remaining = transaction.expiresAt - this.clock();
+				if (remaining <= 0) return null;
+
+				const reserved = await this.redis.eval(RESERVE_PROOF_SCRIPT, 4,
+						this.transactionKey(id), this.consumedKey(id), this.reservationKey(id),
+						this.proofKey(applicationId, proofId), JSON.stringify(transaction), remaining, digest(proofId), id);
+				return reserved === 1 ? transaction : null;
+		}
+
 		async consume(id: string, applicationId: string, proofId: string): Promise<ApplicationAccountLinkTransaction | null> {
 				const transaction = await this.findById(id);
 				if (!transaction || transaction.applicationId !== applicationId || !proofId) return null;
 				const remaining = transaction.expiresAt - this.clock();
 				if (remaining <= 0) return null;
 
-				const consumed = await this.redis.eval(CONSUME_TRANSACTION_SCRIPT, 3,
-						this.transactionKey(id), this.consumedKey(id), this.proofKey(applicationId, proofId),
-						JSON.stringify(transaction), remaining);
+				const consumed = await this.redis.eval(CONSUME_TRANSACTION_SCRIPT, 4,
+						this.transactionKey(id), this.consumedKey(id), this.reservationKey(id),
+						this.proofKey(applicationId, proofId), JSON.stringify(transaction), remaining, digest(proofId), id);
 				return consumed === 1 ? transaction : null;
 		}
 
@@ -163,6 +185,10 @@ export class ApplicationAccountLinkTransactionStore {
 
 		private consumedKey(id: string): string {
 				return oidcRedisKey(`application_account_link_consumed:${digest(id)}`);
+		}
+
+		private reservationKey(id: string): string {
+				return oidcRedisKey(`application_account_link_reservation:${digest(id)}`);
 		}
 
 		private proofKey(applicationId: string, proofId: string): string {
@@ -213,6 +239,9 @@ export class ApplicationAccountLinkCeremony {
 
 				if (!this.proofMatches(transaction, proof)) {
 						throw new ApplicationAccountLinkError("PROOF_REJECTED");
+				}
+				if (!await this.transactions.reserveProof(transaction.id, transaction.applicationId, proof.proofId)) {
+						throw new ApplicationAccountLinkError("INVALID_TRANSACTION");
 				}
 
 				try {

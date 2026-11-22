@@ -43,7 +43,12 @@ function isNonEmptyString(value: unknown): value is string {
 
 // Internal-only: the service-authenticated Bookwrm caller is the sole trusted supplier of email/emailVerified.
 // PrivateID never calls this endpoint and must never become the source of email (Release C5.1).
-export async function registerIdentityAccountLinkRoutes(app: FastifyInstance): Promise<void> {
+export async function registerIdentityAccountLinkRoutes(
+		app: FastifyInstance,
+		options: { enabled?: boolean } = {}
+): Promise<void> {
+		if (options.enabled === false) return;
+
 		app.post<{ Body: AccountLinkBody }>("/internal/identity/account-link", async (request, reply) => {
 				if (!hasValidServiceCredential(request)) {
 						reply.code(401);

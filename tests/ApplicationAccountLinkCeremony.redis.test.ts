@@ -35,26 +35,35 @@ describe.skipIf(!redisUrl)("Application-account-link transactions (Redis integra
 		it("consumes transactions once and prevents proof-id replay across transactions", async () => {
 				const first = await store.create(input);
 				const proofId = randomUUID();
+				expect(await store.reserveProof(first.id, first.applicationId, proofId)).toEqual(first);
+				expect(await store.reserveProof(first.id, first.applicationId, proofId)).toEqual(first);
 				const consumed = await store.consume(first.id, first.applicationId, proofId);
 				expect(consumed).toEqual(first);
+				expect(await store.reserveProof(first.id, first.applicationId, proofId)).toBeNull();
 				expect(await store.consume(first.id, first.applicationId, proofId)).toBeNull();
 
 				const replay = await store.create(input);
-				expect(await store.consume(replay.id, replay.applicationId, proofId)).toBeNull();
-				expect(await store.consume(replay.id, replay.applicationId, randomUUID())).toEqual(replay);
+				expect(await store.reserveProof(replay.id, replay.applicationId, proofId)).toBeNull();
+				const newProofId = randomUUID();
+				expect(await store.reserveProof(replay.id, replay.applicationId, newProofId)).toEqual(replay);
+				expect(await store.consume(replay.id, replay.applicationId, newProofId)).toEqual(replay);
 		});
 
 		it("allows only one concurrent completion and expires a transaction at its TTL", async () => {
 				const transaction = await store.create(input);
+				const proofIds = [randomUUID(), randomUUID()];
 				const results = await Promise.all([
-						store.consume(transaction.id, transaction.applicationId, randomUUID()),
-						store.consume(transaction.id, transaction.applicationId, randomUUID())
+						store.reserveProof(transaction.id, transaction.applicationId, proofIds[0]),
+						store.reserveProof(transaction.id, transaction.applicationId, proofIds[1])
 				]);
 				expect(results.filter(Boolean)).toHaveLength(1);
+				const winningProofId = proofIds[results.findIndex(result => result !== null)];
+				expect(await store.consume(transaction.id, transaction.applicationId, winningProofId)).toEqual(transaction);
 
 				const expiring = await store.create(input);
 				now += APPLICATION_ACCOUNT_LINK_TTL_MS + 1;
 				expect(await store.findById(expiring.id)).toBeNull();
+				expect(await store.reserveProof(expiring.id, expiring.applicationId, randomUUID())).toBeNull();
 				expect(await store.consume(expiring.id, expiring.applicationId, randomUUID())).toBeNull();
 		});
 });

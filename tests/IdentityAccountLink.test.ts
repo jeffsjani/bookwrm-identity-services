@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import Fastify from "fastify";
 import { describe, expect, it } from "vitest";
 
 import { storeCorrelation } from "../src/oidc/CorrelationStore.js";
@@ -6,6 +7,7 @@ import { PrivateIDAuthenticationProvider } from "../src/privateid/PrivateIDAuthe
 import { resolvePrivateIDSessionRecord } from "../src/privateid/PrivateIDSessionStore.js";
 import { identityRegistry } from "../src/identity/IdentityRegistry.js";
 import { inMemoryUserAuthenticatorRepository } from "../src/identity/InMemoryUserAuthenticatorRepository.js";
+import { registerIdentityAccountLinkRoutes } from "../src/routes/identityAccountLink.js";
 import type { PendingAuthorizationContext } from "../src/authentication/AuthenticationProvider.js";
 import { buildOidcTestApp, exchangeAuthorizationCode, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 
@@ -271,6 +273,21 @@ describe("Release C5.1: Bookwrm account -> IdentitySubject link", () => {
 				});
 				expect(response.statusCode).toBe(401);
 
+				await app.close();
+		});
+
+		it("does not register the legacy linking route when disabled for staging", async () => {
+				const app = Fastify();
+				await registerIdentityAccountLinkRoutes(app, { enabled: false });
+				await app.ready();
+
+				const response = await app.inject({
+						method: "POST",
+						url: "/internal/identity/account-link",
+						headers: { authorization: `Bearer ${SERVICE_KEY}`, "x-bookwrm-user-id": "test-user" },
+						payload: { source: "bookwrm", oidcSubject: randomUUID() }
+				});
+				expect(response.statusCode).toBe(404);
 				await app.close();
 		});
 });

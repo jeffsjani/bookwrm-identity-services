@@ -95,7 +95,9 @@ await registerIdentityRoutes(app);
 await registerIdentityAdminRoutes(app);
 await registerHapiIdentityBridgeRoutes(app);
 await registerPrivateIDEnrollmentRoutes(app);
-await registerIdentityAccountLinkRoutes(app);
+// The legacy Bookwrm service-key mapping has no HAPI session or ownership-proof ceremony.
+// Keep existing non-staging consumers intact, but do not expose this bypass on the staging issuer.
+await registerIdentityAccountLinkRoutes(app, { enabled: !isStagingIssuer });
 // HAPI ID V2-D: authenticated account-linking API (default-off HAPI_ACCOUNT_LINKING_API_ENABLED).
 await registerAccountAuthenticationMethodRoutes(app);
 await registerAuthenticatorStatusRoutes(app);
