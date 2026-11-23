@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { createPrivateOIDCCertificationApp, verifyCertificationIdToken } from "../src/certification/PrivateOIDCCertificationClient.js";
 
-const redirectUri = "https://certification.example.com/oidc-certification/callback";
+const redirectUri = "https://certification.hapiinc.com/oidc-certification/callback";
 const clientSecret = "independent-pilot-client-secret-at-least-32-characters";
 const operatorPassword = "independent-operator-password-at-least-32-characters";
 
@@ -21,6 +21,16 @@ function basic() {
 }
 
 describe("private OIDC certification client", () => {
+	it("serves a secret-free liveness response without operator authentication", async () => {
+		const app = await createPrivateOIDCCertificationApp({ env: env() });
+		const response = await app.inject({ method: "GET", url: "/health/live" });
+		expect(response.statusCode).toBe(200);
+		expect(response.json()).toEqual({ status: "ok" });
+		expect(response.payload).not.toContain(clientSecret);
+		expect(response.payload).not.toContain("token");
+		await app.close();
+	});
+
 	it("requires operator authentication before starting", async () => {
 		const app = await createPrivateOIDCCertificationApp({ env: env() });
 		const response = await app.inject({ method: "GET", url: "/oidc-certification" });
@@ -71,7 +81,10 @@ describe("private OIDC certification client", () => {
 		const root = await app.inject({ method: "GET", url: "/oidc-certification", headers: { authorization: basic() } });
 		const cookie = root.headers["set-cookie"] as string;
 		const handleCookie = cookie.split(";")[0];
-		const start = await app.inject({ method: "POST", url: "/oidc-certification/start", headers: { authorization: basic(), cookie: handleCookie } });
+		const csrf = root.payload.match(/name="csrf" value="([^"]+)"/)?.[1] as string;
+		const start = await app.inject({ method: "POST", url: "/oidc-certification/start",
+			headers: { authorization: basic(), cookie: handleCookie, origin: "https://certification.hapiinc.com", "content-type": "application/x-www-form-urlencoded" },
+			payload: new URLSearchParams({ csrf }).toString() });
 		expect(start.statusCode).toBe(303);
 		const location = new URL(start.headers.location as string);
 		const state = location.searchParams.get("state") as string;
@@ -88,6 +101,22 @@ describe("private OIDC certification client", () => {
 		expect(text.match(/<strong>PASS<\/strong>/g)?.length).toBe(4);
 		expect(text).not.toContain("never-rendered");
 		expect(text).not.toContain(clientSecret);
+		await app.close();
+	});
+
+	it("rejects an invalid start origin or missing CSRF", async () => {
+		const app = await createPrivateOIDCCertificationApp({ env: env() });
+		const root = await app.inject({ method: "GET", url: "/oidc-certification", headers: { authorization: basic() } });
+		const handleCookie = (root.headers["set-cookie"] as string).split(";")[0];
+		const csrf = root.payload.match(/name="csrf" value="([^"]+)"/)?.[1] as string;
+		const wrongOrigin = await app.inject({ method: "POST", url: "/oidc-certification/start",
+			headers: { authorization: basic(), cookie: handleCookie, origin: "https://evil.example", "content-type": "application/x-www-form-urlencoded" },
+			payload: new URLSearchParams({ csrf }).toString() });
+		const missingCsrf = await app.inject({ method: "POST", url: "/oidc-certification/start",
+			headers: { authorization: basic(), cookie: handleCookie, origin: "https://certification.hapiinc.com", "content-type": "application/x-www-form-urlencoded" },
+			payload: "" });
+		expect(wrongOrigin.statusCode).toBe(403);
+		expect(missingCsrf.statusCode).toBe(400);
 		await app.close();
 	});
 
@@ -113,7 +142,10 @@ describe("private OIDC certification client", () => {
 		const app = await createPrivateOIDCCertificationApp({ env: env() });
 		const root = await app.inject({ method: "GET", url: "/oidc-certification", headers: { authorization: basic() } });
 		const handleCookie = (root.headers["set-cookie"] as string).split(";")[0];
-		await app.inject({ method: "POST", url: "/oidc-certification/start", headers: { authorization: basic(), cookie: handleCookie } });
+		const csrf = root.payload.match(/name="csrf" value="([^"]+)"/)?.[1] as string;
+		await app.inject({ method: "POST", url: "/oidc-certification/start",
+			headers: { authorization: basic(), cookie: handleCookie, origin: "https://certification.hapiinc.com", "content-type": "application/x-www-form-urlencoded" },
+			payload: new URLSearchParams({ csrf }).toString() });
 		const callback = await app.inject({
 			method: "GET",
 			url: "/oidc-certification/callback?state=wrong&code=code",

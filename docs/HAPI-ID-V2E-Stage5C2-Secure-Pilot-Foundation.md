@@ -18,7 +18,7 @@ node scripts/provision-production-pilot.mjs \
   --redirect-uri <exact-approved-HTTPS-callback>
 ```
 
-This defaults to a plan-only output and makes no database changes. Execution requires `--execute`, `DATABASE_URL`, and `HAPI_PILOT_PROVISIONING_ACKNOWLEDGED=true`. Existing configuration is compared; mismatches or a different application are refused rather than mutated. A newly created secret is printed once to operator output and is not written to source control.
+This defaults to a plan-only output and makes no database changes. Execution requires `--execute`, `DATABASE_URL`, `HAPI_PILOT_PROVISIONING_ACKNOWLEDGED=true`, `HAPI_PILOT_PROVISIONING_TARGET=https://id.hapiinc.com`, `OIDC_ISSUER=https://id.hapiinc.com`, an exact approved `HAPI_PILOT_PROVISIONING_DATABASE_HOST`, and TLS (`sslmode=require` or `sslmode=verify-full`). Existing configuration is compared; mismatches or a different application are refused rather than mutated. A newly created secret is printed once to operator output and is not written to source control.
 
 The mechanism creates or preserves:
 
@@ -45,7 +45,7 @@ The simplest hosting arrangement is a separate lightweight Railway service or ap
 
 Proposed callback for operator approval: `https://certification.hapiinc.com/oidc-certification/callback`. This hostname is not active and must not be registered until explicitly approved. It can be replaced only after approval; it must be exact in the pilot client and in `HAPI_CERTIFICATION_REDIRECT_URI`.
 
-The app may hold short-lived state, nonce, PKCE verifier and one-time code server-side, but no accounts or application data. It must not expose staging-only routes, Bookwrm migration actions or Elite+ privileges.
+The app may hold short-lived state, nonce, PKCE verifier, CSRF token and one-time code in process memory, but no accounts or application data. It must not expose staging-only routes, Bookwrm migration actions or Elite+ privileges. It is intended for one Railway replica; multiple replicas require shared encrypted session storage or sticky routing, and a restart invalidates in-progress tests.
 
 ## Information required from the operator
 

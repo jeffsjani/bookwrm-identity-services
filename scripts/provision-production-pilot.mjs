@@ -54,6 +54,12 @@ if (process.env.OIDC_ISSUER !== "https://id.hapiinc.com") {
 }
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 const databaseUrl = new URL(process.env.DATABASE_URL);
+const approvedDatabaseHost = process.env.HAPI_PILOT_PROVISIONING_DATABASE_HOST?.trim();
+if (!approvedDatabaseHost) throw new Error("Execution refused: HAPI_PILOT_PROVISIONING_DATABASE_HOST is required");
+if (approvedDatabaseHost !== databaseUrl.hostname) throw new Error("Execution refused: DATABASE_URL host differs from approved production database host");
+if (databaseUrl.searchParams.get("sslmode") !== "require" && databaseUrl.searchParams.get("sslmode") !== "verify-full") {
+	throw new Error("Execution refused: DATABASE_URL must use sslmode=require or sslmode=verify-full");
+}
 if (/^(localhost|127\.0\.0\.1)$/i.test(databaseUrl.hostname) || /(staging|test|dev)/i.test(databaseUrl.hostname)) {
 	throw new Error("Execution refused: DATABASE_URL appears to be non-production or a disposable environment");
 }
@@ -70,6 +76,9 @@ try {
 	await client.query("BEGIN");
 	const existingTenant = await client.query(
 		"SELECT id, name, slug, status FROM tenants WHERE slug=$1 OR id=$2", [plan.tenant.slug, plan.tenant.id]);
+	if (existingTenant.rows.length > 1) {
+		throw new Error("multiple pilot tenant matches; refusing mutation");
+	}
 	if (existingTenant.rows.length === 0) {
 		await client.query(
 			`INSERT INTO tenants (id, name, slug, status, created_at, updated_at)

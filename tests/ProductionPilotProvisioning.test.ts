@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 
 const script = "scripts/provision-production-pilot.mjs";
 const applicationId = "123e4567-e89b-42d3-a456-426614174000";
-const redirectUri = "https://certification.example.com/oidc-certification/callback";
+const redirectUri = "https://certification.hapiinc.com/oidc-certification/callback";
 
 describe("production pilot provisioning", () => {
 	it("plan mode cannot write and emits the exact pilot shape", () => {
@@ -35,7 +35,8 @@ describe("production pilot provisioning", () => {
 				HAPI_PILOT_PROVISIONING_ACKNOWLEDGED: "true",
 				HAPI_PILOT_PROVISIONING_TARGET: "https://id.hapiinc.com",
 				OIDC_ISSUER: "https://id.hapiinc.com",
-				DATABASE_URL: "postgresql://user:pass@staging-db.example/db"
+				HAPI_PILOT_PROVISIONING_DATABASE_HOST: "staging-db.example",
+				DATABASE_URL: "postgresql://user:pass@staging-db.example/db?sslmode=require"
 			}
 		});
 		expect(run.status).not.toBe(0);

@@ -2,9 +2,11 @@ import { createHash, randomBytes } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createLocalJWKSet, jwtVerify } from "jose";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
+import formbody from "@fastify/formbody";
 
 export const PRIVATE_CERTIFICATION_ISSUER = "https://id.hapiinc.com";
 export const PRIVATE_CERTIFICATION_CALLBACK_PATH = "/oidc-certification/callback";
+export const PRIVATE_CERTIFICATION_CALLBACK_URI = `https://certification.hapiinc.com${PRIVATE_CERTIFICATION_CALLBACK_PATH}`;
 export const PRIVATE_CERTIFICATION_CLIENT_ID = "hapi-pilot-certification";
 
 const COOKIE = "__Host-hapi_oidc_certification";
@@ -22,6 +24,7 @@ type Flow = {
 	state: string;
 	nonce: string;
 	verifier: string;
+	csrf: string;
 	expiresAt: number;
 	consumed: boolean;
 	results?: CertificationResult[];
@@ -78,14 +81,20 @@ export async function createPrivateOIDCCertificationApp(options: CertificationOp
 	const fetchImpl = options.fetch ?? globalThis.fetch;
 
 	if (issuer !== PRIVATE_CERTIFICATION_ISSUER) throw new Error("Private certification client requires the production HAPI issuer");
-	if (!redirectUri || new URL(redirectUri).protocol !== "https:") throw new Error("Approved HTTPS callback is required");
-	if (new URL(redirectUri).pathname !== PRIVATE_CERTIFICATION_CALLBACK_PATH) throw new Error("Callback path does not match certification client");
+	if (!redirectUri || redirectUri !== PRIVATE_CERTIFICATION_CALLBACK_URI) throw new Error("Exact approved HTTPS callback is required");
+	if (new URL(redirectUri).protocol !== "https:") throw new Error("Approved HTTPS callback is required");
 	if (!username || username.includes(":") || password.length < 32 || password === clientSecret) {
 		throw new Error("Independent operator credentials and confidential client secret are required");
 	}
 	if (!clientSecret || clientSecret.length < 32) throw new Error("HAPI certification client secret is required");
 
+	await app.register(formbody);
 	const flows = new Map<string, Flow>();
+
+	app.get("/health/live", async (_request, reply) => reply.code(200)
+		.header("Cache-Control", "no-store")
+		.header("X-Content-Type-Options", "nosniff")
+		.send({ status: "ok" }));
 	const operatorAuth = async (request: FastifyRequest, reply: FastifyReply) => {
 		reply.header("Cache-Control", "no-store").header("Referrer-Policy", "no-referrer");
 		const match = typeof request.headers.authorization === "string"
@@ -103,23 +112,29 @@ export async function createPrivateOIDCCertificationApp(options: CertificationOp
 
 	app.get("/oidc-certification", route, async (_request, reply) => {
 		const handle = random();
-		flows.set(handle, { state: "", nonce: "", verifier: "", expiresAt: Date.now() + TTL_MS, consumed: false });
+		const csrf = random();
+		flows.set(handle, { state: "", nonce: "", verifier: "", csrf, expiresAt: Date.now() + TTL_MS, consumed: false });
 		reply.header("Set-Cookie", `${COOKIE}=${handle}; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Lax`);
 		return page(reply, 200, "HAPI ID Private OIDC Certification",
 			'<p>Operator access only. Starting a test sends you to the HAPI ID production issuer.</p>' +
-			'<form method="post" action="/oidc-certification/start"><button type="submit">Start test</button></form>');
+			`<form method="post" action="/oidc-certification/start"><input type="hidden" name="csrf" value="${csrf}"><button type="submit">Start test</button></form>`);
 	});
 
 	app.post("/oidc-certification/start", route, async (request, reply) => {
 		const handle = cookieHandle(request);
+		const body = request.body as { csrf?: unknown } | undefined;
+		if (request.headers.origin !== "https://certification.hapiinc.com") {
+			return page(reply, 403, "Test refused", '<p><a href="/oidc-certification">Start another test</a></p>');
+		}
 		const existing = handle ? flows.get(handle) : undefined;
-		if (!handle || !existing || existing.expiresAt < Date.now()) {
+		if (!handle || !existing || existing.expiresAt < Date.now() || typeof body?.csrf !== "string" ||
+			!constantTimeStringEqual(existing.csrf, body.csrf)) {
 			return page(reply, 400, "Test expired", '<p><a href="/oidc-certification">Start another test</a></p>');
 		}
 		const state = random();
 		const nonce = random();
 		const verifier = random();
-		flows.set(handle, { state, nonce, verifier, expiresAt: Date.now() + TTL_MS, consumed: false });
+		flows.set(handle, { state, nonce, verifier, csrf: existing.csrf, expiresAt: Date.now() + TTL_MS, consumed: false });
 		const query = new URLSearchParams({
 			client_id: clientId,
 			redirect_uri: redirectUri,
@@ -147,11 +162,11 @@ export async function createPrivateOIDCCertificationApp(options: CertificationOp
 		if (!handle || !flow || flow.expiresAt < Date.now() || flow.consumed || typeof query.state !== "string" ||
 			query.error !== undefined || typeof query.code !== "string" || !query.code) {
 			flow && (flow.results = results);
-			return renderResults(reply, results);
+			return renderResults(reply, results, flow?.csrf);
 		}
 		if (!constantTimeStringEqual(flow.state, query.state)) {
 			flow.results = results;
-			return renderResults(reply, results);
+			return renderResults(reply, results, flow.csrf);
 		}
 		flow.consumed = true;
 		results[0].passed = true;
@@ -201,15 +216,16 @@ export async function createPrivateOIDCCertificationApp(options: CertificationOp
 		}
 
 		flow.results = results;
-		return renderResults(reply, results);
+		return renderResults(reply, results, flow.csrf);
 	});
 
 	app.setNotFoundHandler((_request, reply) => reply.code(404).send({ error: "not_found" }));
 	return app;
 }
 
-function renderResults(reply: FastifyReply, results: CertificationResult[]) {
+function renderResults(reply: FastifyReply, results: CertificationResult[], csrf?: string) {
 	const resultRows = results.map(result => `<li><strong>${result.passed ? "PASS" : "FAIL"}</strong>: ${escapeHtml(result.name)}</li>`).join("");
+	const csrfField = csrf ? `<input type="hidden" name="csrf" value="${escapeHtml(csrf)}">` : "";
 	return page(reply, 200, "HAPI ID OIDC Certification Results",
-		`<ol>${resultRows}</ol><form method="post" action="/oidc-certification/start"><button type="submit">Start another test</button></form>`);
+		`<ol>${resultRows}</ol><form method="post" action="/oidc-certification/start">${csrfField}<button type="submit">Start another test</button></form>`);
 }
