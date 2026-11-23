@@ -28,9 +28,10 @@ if (callback.protocol !== "https:" || callback.username || callback.password || 
 	throw new Error("--redirect-uri must be an exact HTTPS callback URL without credentials or fragment");
 }
 
+const PILOT_TENANT_ID = "c04e7cf0-9e90-49cb-b26f-9ec8e3e7fd18";
 const plan = {
 	issuer: "https://id.hapiinc.com",
-	tenant: { name: "HAPI Pilot", slug: "hapi-pilot", applicationKey: "HAPI_PILOT" },
+	tenant: { id: PILOT_TENANT_ID, name: "HAPI Pilot", slug: "hapi-pilot", applicationKey: "HAPI_PILOT" },
 	applicationId,
 	application: { name: "HAPI Pilot Certification", slug: "hapi-pilot-certification", allowedAuthenticationMethods: ["HAPI_EMAIL"], allowedIdentityProviders: [], faceSetupEnabled: false },
 	client: { clientId: "hapi-pilot-certification", redirectUri, grantTypes: ["authorization_code"], scopes: ["openid", "email"], authMethod: "client_secret_basic", requirePkce: true }
@@ -45,7 +46,17 @@ if (!execute) {
 if (process.env.HAPI_PILOT_PROVISIONING_ACKNOWLEDGED !== "true") {
 	throw new Error("Execution refused: set HAPI_PILOT_PROVISIONING_ACKNOWLEDGED=true only for an explicitly approved database target");
 }
+if (process.env.HAPI_PILOT_PROVISIONING_TARGET !== "https://id.hapiinc.com") {
+	throw new Error("Execution refused: HAPI_PILOT_PROVISIONING_TARGET must exactly equal https://id.hapiinc.com");
+}
+if (process.env.OIDC_ISSUER !== "https://id.hapiinc.com") {
+	throw new Error("Execution refused: OIDC_ISSUER must exactly equal https://id.hapiinc.com");
+}
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
+const databaseUrl = new URL(process.env.DATABASE_URL);
+if (/^(localhost|127\.0\.0\.1)$/i.test(databaseUrl.hostname) || /(staging|test|dev)/i.test(databaseUrl.hostname)) {
+	throw new Error("Execution refused: DATABASE_URL appears to be non-production or a disposable environment");
+}
 
 function hashSecret(secret) {
 	const salt = crypto.randomBytes(16);
@@ -57,29 +68,41 @@ const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
 await client.connect();
 try {
 	await client.query("BEGIN");
-	const tenantResult = await client.query(
-		`INSERT INTO tenants (id, name, slug, status, created_at, updated_at)
-		 VALUES (COALESCE((SELECT id FROM tenants WHERE slug=$1), gen_random_uuid()), $2, $1, 'active', now(), now())
-		 ON CONFLICT (slug) DO UPDATE SET name=EXCLUDED.name, status='active', updated_at=now()
-		 RETURNING id`, [plan.tenant.slug, plan.tenant.name]);
-	const tenantId = tenantResult.rows[0].id;
+	const existingTenant = await client.query(
+		"SELECT id, name, slug, status FROM tenants WHERE slug=$1 OR id=$2", [plan.tenant.slug, plan.tenant.id]);
+	if (existingTenant.rows.length === 0) {
+		await client.query(
+			`INSERT INTO tenants (id, name, slug, status, created_at, updated_at)
+			 VALUES ($1,$2,$3,'active',now(),now())`,
+			[plan.tenant.id, plan.tenant.name, plan.tenant.slug]);
+	} else {
+		const tenant = existingTenant.rows[0];
+		if (tenant.id !== plan.tenant.id || tenant.name !== plan.tenant.name || tenant.slug !== plan.tenant.slug || tenant.status !== "active") {
+			throw new Error("existing pilot tenant differs; refusing mutation");
+		}
+	}
+	const tenantId = plan.tenant.id;
 
 	const existingApplication = await client.query(
 		"SELECT id, tenant_id, name, slug, status, application_key, allowed_authentication_methods, allowed_identity_providers, face_setup_enabled FROM applications WHERE id=$1",
 		[applicationId]);
-	if (existingApplication.rows.length && (existingApplication.rows[0].tenant_id !== tenantId || existingApplication.rows[0].application_key !== plan.tenant.applicationKey)) {
-		throw new Error("approved application ID belongs to a different tenant/application; refusing");
-	}
-
-	await client.query(
+	if (existingApplication.rows.length) {
+		const application = existingApplication.rows[0];
+		if (application.tenant_id !== tenantId || application.application_key !== plan.tenant.applicationKey ||
+			application.name !== plan.application.name || application.slug !== plan.application.slug || application.status !== "active" ||
+			JSON.stringify(application.allowed_authentication_methods) !== JSON.stringify(plan.application.allowedAuthenticationMethods) ||
+			JSON.stringify(application.allowed_identity_providers) !== JSON.stringify(plan.application.allowedIdentityProviders) ||
+			application.face_setup_enabled !== false) {
+			throw new Error("existing approved application differs; refusing mutation");
+		}
+	} else {
+		await client.query(
 		`INSERT INTO applications
 		 (id, tenant_id, name, slug, status, created_at, updated_at, application_key, allowed_authentication_methods, allowed_identity_providers, face_setup_enabled)
-		 VALUES ($1,$2,$3,$4,'active',now(),now(),$5,$6,$7,false)
-		 ON CONFLICT (id) DO UPDATE SET
-		 tenant_id=$2, name=$3, slug=$4, status='active', updated_at=now(), application_key=$5,
-		 allowed_authentication_methods=$6, allowed_identity_providers=$7, face_setup_enabled=false`,
+		 VALUES ($1,$2,$3,$4,'active',now(),now(),$5,$6,$7,false)`,
 		[applicationId, tenantId, plan.application.name, plan.application.slug, plan.tenant.applicationKey,
 			plan.application.allowedAuthenticationMethods, plan.application.allowedIdentityProviders]);
+	}
 
 	const existingClient = await client.query(
 		"SELECT id, application_id, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, status FROM oidc_clients WHERE client_id=$1",

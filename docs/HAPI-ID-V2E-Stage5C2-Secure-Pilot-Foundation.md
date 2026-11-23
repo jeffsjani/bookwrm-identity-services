@@ -37,9 +37,13 @@ It must not be run against production by this development task.
 
 ## Private certification application
 
-A minimal private browser relying party should reuse the staging console pattern but be a separate production-issuer implementation. It should use an operator allowlist in its server session/authorization gate, exact approved HTTPS callback, authorization code plus PKCE S256, cryptographically random state and nonce, remote production JWKS signature validation, exact issuer `https://id.hapiinc.com`, exact pilot audience/client ID, expiration validation, and UserInfo `sub` equality with the ID-token `sub`. It should report only named PASS/FAIL checks and no token or secret values.
+The implementation is [src/certification/PrivateOIDCCertificationClient.ts](../src/certification/PrivateOIDCCertificationClient.ts), with a standalone entrypoint in [src/certification/server.ts](../src/certification/server.ts). It is independent of Bookwrm, Elite+, and Base44. It uses HTTP Basic operator access, a short-lived HttpOnly Secure session cookie, authorization code plus PKCE S256, random state and nonce, production JWKS signature validation, exact issuer `https://id.hapiinc.com`, exact pilot audience/client ID, expiration validation, and UserInfo `sub` equality.
 
-Host it only behind an approved private HTTPS service or approved static app plus a server-side callback/session component. The exact hostname and callback are not specified here and must not be invented or registered. Candidate callback shape: `<approved-operator-host>/auth/callback`, after explicit approval.
+It reports exactly four PASS/FAIL results and stores neither tokens nor private identity data. No staging-only route or staging console is mounted.
+
+The simplest hosting arrangement is a separate lightweight Railway service or approved private HTTPS service. This task creates no hosting resource and does not register a hostname.
+
+Proposed callback for operator approval: `https://certification.hapiinc.com/oidc-certification/callback`. This hostname is not active and must not be registered until explicitly approved. It can be replaced only after approval; it must be exact in the pilot client and in `HAPI_CERTIFICATION_REDIRECT_URI`.
 
 The app may hold short-lived state, nonce, PKCE verifier and one-time code server-side, but no accounts or application data. It must not expose staging-only routes, Bookwrm migration actions or Elite+ privileges.
 
