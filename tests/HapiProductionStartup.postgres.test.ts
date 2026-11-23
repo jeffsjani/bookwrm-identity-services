@@ -180,6 +180,8 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						const server = start(url, {
 								HAPI_EMAIL_PROVIDER: "resend",
 								HAPI_EMAIL_AUTHENTICATION_ENABLED: "true",
+								HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
+								HAPI_EMAIL_PILOT_APPLICATION_ID: randomUUID(),
 								HAPI_EMAIL_VERIFICATION_SECRET: "synthetic-verification-secret-32-bytes",
 								RESEND_API_KEY: "synthetic-key",
 								HAPI_EMAIL_FROM: "test@example.invalid"
@@ -193,6 +195,24 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 				} finally {
 						await pool.end();
 				}
+		}, 25_000);
+
+		it("refuses production Email OTP startup without a pilot allowlist", async () => {
+			const { url, pool } = await newSchema();
+			try {
+				const server = start(url, {
+					HAPI_EMAIL_PROVIDER: "resend",
+					HAPI_EMAIL_PILOT_APPLICATION_ID: randomUUID(),
+					HAPI_EMAIL_VERIFICATION_SECRET: "synthetic-verification-secret-32-bytes",
+					RESEND_API_KEY: "synthetic-key",
+					HAPI_EMAIL_FROM: "test@example.invalid"
+				});
+				expect(await server.exited).not.toBe(0);
+				expect(server.output()).toContain("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required");
+				expect(server.output()).not.toContain("Server listening");
+			} finally {
+				await pool.end();
+			}
 		}, 25_000);
 
 		it.each(["https://id-staging.hapiinc.com", "https://identity.bookwrm.com"])(

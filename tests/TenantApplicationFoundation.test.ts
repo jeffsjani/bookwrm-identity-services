@@ -10,6 +10,7 @@ import { InMemoryIdentitySubjectRepository } from "../src/identity/InMemoryIdent
 import { IdentityRegistry } from "../src/identity/IdentityRegistry.js";
 import { BOOKWRM_TENANT_ID, BOOKWRM_APPLICATION_ID } from "../src/identity/WellKnownIdentities.js";
 import { registerOIDCClients } from "../src/oidc/clients.js";
+import { configuration } from "../src/config/ConfigurationService.js";
 
 describe("HAPI ID H1 - Bookwrm Tenant/Application seed (memory driver)", () => {
 		beforeEach(() => {
@@ -54,6 +55,68 @@ describe("HAPI ID H1 - Bookwrm Tenant/Application seed (memory driver)", () => {
 				expect(await tenants.list()).toHaveLength(1);
 				expect(await applications.listByTenant(BOOKWRM_TENANT_ID)).toHaveLength(1);
 				expect(await oidcClients.list()).toHaveLength(1);
+		});
+
+		it("does not backfill or migrate Bookwrm account mappings on the HAPI production issuer", async () => {
+			const previous = {
+				issuer: process.env.OIDC_ISSUER,
+				driver: process.env.IDENTITY_REGISTRY_DRIVER,
+				clientId: process.env.OIDC_BASE44_CLIENT_ID
+			};
+			process.env.OIDC_ISSUER = "https://id.hapiinc.com";
+			process.env.IDENTITY_REGISTRY_DRIVER = "postgres";
+			delete process.env.OIDC_BASE44_CLIENT_ID;
+			configuration.reload();
+			const statements: string[] = [];
+			try {
+				await ensureBookwrmApplicationSeed({
+					tenants: new InMemoryTenantRepository(),
+					applications: new InMemoryApplicationRepository(),
+					oidcClients: new InMemoryOIDCClientRepository(),
+					postgresClient: { async query(text: string) { statements.push(text); return { rows: [] }; } }
+				});
+				expect(statements).toEqual([]);
+			} finally {
+				if (previous.issuer === undefined) delete process.env.OIDC_ISSUER;
+				else process.env.OIDC_ISSUER = previous.issuer;
+				if (previous.driver === undefined) delete process.env.IDENTITY_REGISTRY_DRIVER;
+				else process.env.IDENTITY_REGISTRY_DRIVER = previous.driver;
+				if (previous.clientId === undefined) delete process.env.OIDC_BASE44_CLIENT_ID;
+				else process.env.OIDC_BASE44_CLIENT_ID = previous.clientId;
+				configuration.reload();
+			}
+		});
+
+		it("preserves legacy Bookwrm mapping migration behavior on staging", async () => {
+			const previous = {
+				issuer: process.env.OIDC_ISSUER,
+				driver: process.env.IDENTITY_REGISTRY_DRIVER,
+				clientId: process.env.OIDC_BASE44_CLIENT_ID
+			};
+			process.env.OIDC_ISSUER = "https://id-staging.hapiinc.com";
+			process.env.IDENTITY_REGISTRY_DRIVER = "postgres";
+			delete process.env.OIDC_BASE44_CLIENT_ID;
+			configuration.reload();
+			const statements: string[] = [];
+			try {
+				await ensureBookwrmApplicationSeed({
+					tenants: new InMemoryTenantRepository(),
+					applications: new InMemoryApplicationRepository(),
+					oidcClients: new InMemoryOIDCClientRepository(),
+					postgresClient: { async query(text: string) { statements.push(text); return { rows: [] }; } }
+				});
+				expect(statements).toHaveLength(2);
+				expect(statements[0]).toContain("UPDATE identity_subjects");
+				expect(statements[1]).toContain("application_account_links");
+			} finally {
+				if (previous.issuer === undefined) delete process.env.OIDC_ISSUER;
+				else process.env.OIDC_ISSUER = previous.issuer;
+				if (previous.driver === undefined) delete process.env.IDENTITY_REGISTRY_DRIVER;
+				else process.env.IDENTITY_REGISTRY_DRIVER = previous.driver;
+				if (previous.clientId === undefined) delete process.env.OIDC_BASE44_CLIENT_ID;
+				else process.env.OIDC_BASE44_CLIENT_ID = previous.clientId;
+				configuration.reload();
+			}
 		});
 });
 

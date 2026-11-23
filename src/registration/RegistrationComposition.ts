@@ -7,13 +7,19 @@ import { PostgresOIDCClientRepository } from "../identity/PostgresOIDCClientRepo
 import { PostgresRegistrationRepository } from "./PostgresRegistrationRepository.js";
 import { RegistrationService } from "./RegistrationService.js";
 import { registerRegistrationRoutes } from "../routes/registration.js";
+import { emailPilotAllowlistFromEnvironment } from "../email/EmailPilotAllowlist.js";
+import { HAPI_PRODUCTION_ISSUER } from "../config/IssuerPolicy.js";
 
 // H3 is always active on the Postgres Identity Registry driver (it has no in-memory production
 // mode -- "memory" is test-only, see InMemoryRegistrationRepository). Mirrors
 // adapters/email/EmailVerificationComposition.ts's wiring shape.
 export async function configureRegistration(app: FastifyInstance, env = process.env): Promise<RegistrationService | undefined> {
 	if ((env.IDENTITY_REGISTRY_DRIVER ?? "postgres").trim().toLowerCase() === "memory") return undefined;
-	const repository = new PostgresRegistrationRepository(getPostgresPool() as pg.Pool);
+	const pilotAllowlist = emailPilotAllowlistFromEnvironment(
+		env,
+		env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER
+	);
+	const repository = new PostgresRegistrationRepository(getPostgresPool() as pg.Pool, pilotAllowlist.allows);
 	await repository.ensureSchema();
 	const service = new RegistrationService(repository);
 	await registerRegistrationRoutes(app, service, {
