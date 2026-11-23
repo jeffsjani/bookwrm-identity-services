@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import { readFileSync } from "node:fs";
 import { createPrivateOIDCCertificationApp, verifyCertificationIdToken } from "../src/certification/PrivateOIDCCertificationClient.js";
 
 const redirectUri = "https://certification.hapiinc.com/oidc-certification/callback";
@@ -21,6 +22,15 @@ function basic() {
 }
 
 describe("private OIDC certification client", () => {
+	it("certification module imports no main backend configuration", () => {
+		const source = readFileSync(new URL("../src/certification/PrivateOIDCCertificationClient.ts", import.meta.url), "utf8");
+		expect(source).not.toContain("ConfigurationService");
+		expect(source).not.toContain("DATABASE_URL");
+		expect(source).not.toContain("REDIS_URL");
+		expect(source).not.toContain("JWT_PRIVATE_KEY");
+		expect(source).not.toContain("PRIVATEID");
+	});
+
 	it("serves a secret-free liveness response without operator authentication", async () => {
 		const app = await createPrivateOIDCCertificationApp({ env: env() });
 		const response = await app.inject({ method: "GET", url: "/health/live" });

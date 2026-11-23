@@ -1,7 +1,6 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { createLocalJWKSet, jwtVerify } from "jose";
-import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
 import formbody from "@fastify/formbody";
 
 export const PRIVATE_CERTIFICATION_ISSUER = "https://id.hapiinc.com";
@@ -32,6 +31,11 @@ type Flow = {
 
 const random = () => randomBytes(32).toString("base64url");
 const sha256 = (value: string) => createHash("sha256").update(value).digest("base64url");
+const constantTimeStringEqual = (left: string, right: string): boolean => {
+	const leftDigest = createHash("sha256").update(left).digest();
+	const rightDigest = createHash("sha256").update(right).digest();
+	return timingSafeEqual(leftDigest, rightDigest);
+};
 
 function cookieHandle(request: FastifyRequest): string | undefined {
 	const cookie = request.headers.cookie?.split(";").map(part => part.trim())
