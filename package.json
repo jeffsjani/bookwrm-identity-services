@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "pilot:plan": "node scripts/provision-production-pilot.mjs",
     "build": "tsc && cp src/identity/schema.sql dist/identity/schema.sql && cp src/identity/schema-federation.sql dist/identity/schema-federation.sql && cp src/identity/schema-sessions.sql dist/identity/schema-sessions.sql && cp src/identity/schema-refresh.sql dist/identity/schema-refresh.sql && cp src/identity/schema-passkeys.sql dist/identity/schema-passkeys.sql && cp src/email/schema.sql dist/email/schema.sql && cp src/registration/schema.sql dist/registration/schema.sql && cp src/authentication/email/schema.sql dist/authentication/email/schema.sql && cp src/authenticators/schema.sql dist/authenticators/schema.sql",
     "start": "node dist/server.js"
   },

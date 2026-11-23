@@ -58,6 +58,7 @@ import {
 } from "./refresh/RefreshTokenRotationService.js";
 import type { OIDCLogEntry } from "./types.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
+import { verifyOIDCClientSecret } from "../security/OIDCClientSecret.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
 	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
@@ -783,7 +784,7 @@ export class OIDCService {
 								if (
 										tokenEndpointAuthMethod !== "none" &&
 										(!clientSecret || !configuredClientSecret.trim() ||
-											!constantTimeStringEqual(configuredClientSecret, clientSecret))
+											!(await verifyOIDCClientSecret(configuredClientSecret, clientSecret)))
 								) {
 										reply.code(400);
 										error = "client_secret is invalid";
@@ -2789,7 +2790,7 @@ export class OIDCService {
 				if (
 						tokenEndpointAuthMethod !== "none" &&
 						(!input.clientSecret || !configuredClientSecret.trim() ||
-								!constantTimeStringEqual(configuredClientSecret, input.clientSecret))
+								!(await verifyOIDCClientSecret(configuredClientSecret, input.clientSecret)))
 				) {
 						reply.code(400);
 						return {
