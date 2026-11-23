@@ -97,7 +97,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						const base = await server.waitForListening();
 						const ready = await fetch(`${base}/health/ready`);
 						expect(ready.status).toBe(200);
-						expect(await ready.json()).toMatchObject({ databaseConnected: true, providerReady: true });
+						expect(await ready.json()).toMatchObject({ databaseConnected: true, providerReady: true, migrationsReady: true });
 						const versions = await pool.query("SELECT version FROM schema_migrations ORDER BY version");
 						expect(versions.rows.map(row => row.version)).toEqual(["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]);
 						expect((await fetch(`${base}/internal/identity/account-link`, {
@@ -111,12 +111,106 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						expect(await server.exited).toBe(0);
 						const restarted = start(url);
 						const restartedBase = await restarted.waitForListening();
-						expect((await fetch(`${restartedBase}/health/ready`)).status).toBe(200);
+						const restartedReady = await fetch(`${restartedBase}/health/ready`);
+						expect(restartedReady.status).toBe(200);
+						expect(await restartedReady.json()).toMatchObject({ migrationsReady: true });
 						expect((await pool.query("SELECT version FROM schema_migrations")).rows).toHaveLength(5);
 				} finally {
 						await pool.end();
 				}
 		}, 35_000);
+
+		it("fails readiness for each missing migration, missing unversioned schema, or verification error", async () => {
+				const { url, pool } = await newSchema();
+				try {
+						const server = start(url);
+						const base = await server.waitForListening();
+						for (const version of ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]) {
+								const removed = await pool.query("DELETE FROM schema_migrations WHERE version = $1 RETURNING *", [version]);
+								const ready = await fetch(`${base}/health/ready`);
+								expect(ready.status, version).toBe(503);
+								expect(await ready.json()).toMatchObject({ status: "not_ready", databaseConnected: true, migrationsReady: false });
+								const row = removed.rows[0];
+								await pool.query("INSERT INTO schema_migrations (version, description, applied_at) VALUES ($1, $2, $3)",
+										[row.version, row.description, row.applied_at]);
+						}
+						await pool.query("ALTER TABLE identity_registration_audit RENAME TO hidden_registration_audit");
+						let ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(503);
+						expect(await ready.json()).toMatchObject({ migrationsReady: false });
+						await pool.query("ALTER TABLE hidden_registration_audit RENAME TO identity_registration_audit");
+						await pool.query("ALTER TABLE authenticator_enrollment_audit RENAME TO hidden_face_audit");
+						ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(503);
+						expect(await ready.json()).toMatchObject({ migrationsReady: false });
+						await pool.query("ALTER TABLE hidden_face_audit RENAME TO authenticator_enrollment_audit");
+						await pool.query("ALTER TABLE schema_migrations RENAME TO hidden_schema_migrations");
+						ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(503);
+						expect(await ready.json()).toMatchObject({ migrationsReady: false });
+						await pool.query("ALTER TABLE hidden_schema_migrations RENAME TO schema_migrations");
+						ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(200);
+						expect(await ready.json()).toMatchObject({ migrationsReady: true });
+				} finally {
+						await pool.end();
+				}
+		}, 25_000);
+
+		it("does not become ready when a migration record is not persisted during bootstrap", async () => {
+				const { url, pool } = await newSchema();
+				try {
+						await pool.query(readFileSync(new URL("../src/identity/schema.sql", import.meta.url), "utf8"));
+						await pool.query(`CREATE FUNCTION suppress_migration() RETURNS trigger LANGUAGE plpgsql AS $$
+								BEGIN IF NEW.version = '1.1.0' THEN RETURN NULL; END IF; RETURN NEW; END $$`);
+						await pool.query("CREATE TRIGGER suppress_migration BEFORE INSERT ON schema_migrations FOR EACH ROW EXECUTE FUNCTION suppress_migration()");
+						const server = start(url);
+						const base = await server.waitForListening();
+						const ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(503);
+						expect(await ready.json()).toMatchObject({ migrationsReady: false });
+				} finally {
+						await pool.end();
+				}
+		}, 25_000);
+
+		it("checks email schema tables when the email provider is configured", async () => {
+				const { url, pool } = await newSchema();
+				try {
+						const server = start(url, {
+								HAPI_EMAIL_PROVIDER: "resend",
+								HAPI_EMAIL_AUTHENTICATION_ENABLED: "true",
+								HAPI_EMAIL_VERIFICATION_SECRET: "synthetic-verification-secret-32-bytes",
+								RESEND_API_KEY: "synthetic-key",
+								HAPI_EMAIL_FROM: "test@example.invalid"
+						});
+						const base = await server.waitForListening();
+						expect((await fetch(`${base}/health/ready`)).status).toBe(200);
+						await pool.query("ALTER TABLE email_authentication_audit RENAME TO hidden_email_audit");
+						const ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(503);
+						expect(await ready.json()).toMatchObject({ migrationsReady: false });
+				} finally {
+						await pool.end();
+				}
+		}, 25_000);
+
+		it.each(["https://id-staging.hapiinc.com", "https://identity.bookwrm.com"])(
+				"does not change readiness for %s", async issuer => {
+				const { url, pool } = await newSchema();
+				try {
+						const server = start(url, { OIDC_ISSUER: issuer, OIDC_ALLOWED_ISSUERS: issuer });
+						const base = await server.waitForListening();
+						await pool.query("DELETE FROM schema_migrations WHERE version = '1.0.0'");
+						const ready = await fetch(`${base}/health/ready`);
+						expect(ready.status).toBe(200);
+						expect(await ready.json()).not.toHaveProperty("migrationsReady");
+						const link = await fetch(`${base}/internal/identity/account-link`, { method: "POST" });
+						expect(link.status).toBe(issuer === "https://id-staging.hapiinc.com" ? 404 : 401);
+				} finally {
+						await pool.end();
+				}
+		}, 25_000);
 
 		it("exits before listening when schema initialization fails despite a reachable database", async () => {
 				const { url, pool } = await newSchema();

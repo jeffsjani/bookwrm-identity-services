@@ -5,7 +5,8 @@ import { featureFlags } from "../config/FeatureFlagService.js";
 import { identityService } from "../identity/IdentityService.js";
 import { oidcService } from "../oidc/oidcServiceInstance.js";
 import { getRedisClient } from "../oidc/infrastructure/RedisInfrastructure.js";
-import { getPostgresPool } from "../identity/infrastructure/PostgresInfrastructure.js";
+import { getMissingRequiredSchema, getPostgresPool } from "../identity/infrastructure/PostgresInfrastructure.js";
+import { HAPI_PRODUCTION_ISSUER } from "../config/IssuerPolicy.js";
 import { identityCircuitBreaker } from "../infrastructure/CircuitBreaker.js";
 import { DependencyHealthMonitor } from "../infrastructure/DependencyHealthMonitor.js";
 
@@ -17,6 +18,7 @@ export type ReadinessChecks = {
 		pingRedis: () => Promise<boolean>;
 		// Undefined when the identity registry is not Postgres-backed (e.g. the in-memory test driver).
 		pingDatabase?: () => Promise<boolean>;
+		checkMigrations?: () => Promise<boolean>;
 		signingKeysLoaded: () => boolean;
 		providerReady: () => boolean;
 		base44: DependencyHealthMonitor;
@@ -28,6 +30,8 @@ export function defaultReadinessChecks(app: FastifyInstance): ReadinessChecks {
 				redisRequired: () => featureFlags.isRedisEnabled(),
 				pingRedis: thisRedisPing,
 				pingDatabase: configuration.getIdentityRegistryDriver() === "postgres" ? pingDatabase : undefined,
+				checkMigrations: configuration.get("OIDC_ISSUER")?.trim() === HAPI_PRODUCTION_ISSUER
+						? () => checkProductionMigrations(app) : undefined,
 				signingKeysLoaded: () => oidcService.hasSigningKeysAvailable(),
 				providerReady: () => oidcService.isProviderReady(),
 				// The Base44 identity platform is a relying-application adapter, not a core HAPI dependency.
@@ -66,24 +70,26 @@ export async function registerHealthRoutes(app: FastifyInstance, checks: Readine
 
 		app.get("/health/ready", async (_request, reply) => {
 				const base44 = checks.base44.observe();
-				const [redisInitialized, databaseConnected] = await Promise.all([
+				const [redisInitialized, databaseConnected, migrationsReady] = await Promise.all([
 						checks.redisRequired() ? checks.pingRedis() : Promise.resolve(true),
-						checks.pingDatabase ? checks.pingDatabase() : Promise.resolve(true)
+						checks.pingDatabase ? checks.pingDatabase() : Promise.resolve(true),
+						checks.checkMigrations ? checks.checkMigrations() : Promise.resolve(true)
 				]);
 				const configurationLoaded = checks.configurationLoaded();
 				const keysLoaded = checks.signingKeysLoaded();
 				const providerReady = checks.providerReady();
 
-				const ready = configurationLoaded && redisInitialized && databaseConnected && keysLoaded && providerReady;
+				const ready = configurationLoaded && redisInitialized && databaseConnected && migrationsReady && keysLoaded && providerReady;
 				if (!ready) {
 						reply.code(503);
 				}
 
 				return {
-						status: "ready",
+						status: checks.checkMigrations && !ready ? "not_ready" : "ready",
 						configurationLoaded,
 						redisInitialized,
 						databaseConnected,
+						...(checks.checkMigrations ? { migrationsReady } : {}),
 						keysLoaded,
 						providerReady,
 						dependencies: {
@@ -101,6 +107,29 @@ export async function registerHealthRoutes(app: FastifyInstance, checks: Readine
 						uptime: process.uptime()
 				};
 		});
+}
+
+async function checkProductionMigrations(app: FastifyInstance): Promise<boolean> {
+		let timer: NodeJS.Timeout | undefined;
+		try {
+				const timeout = new Promise<never>((_resolve, reject) => {
+						timer = setTimeout(() => reject(new Error("schema verification timeout")), DATABASE_PING_TIMEOUT_MS);
+				});
+				const missing = await Promise.race([
+						getMissingRequiredSchema(Boolean(configuration.get("HAPI_EMAIL_PROVIDER"))),
+						timeout
+				]);
+				if (missing.versions.length || missing.tables.length) {
+						app.log.warn({ missingVersions: missing.versions, missingTables: missing.tables }, "Required schema is incomplete");
+						return false;
+				}
+				return true;
+		} catch (error) {
+				app.log.error({ error }, "Failed to verify required schema");
+				return false;
+		} finally {
+				clearTimeout(timer);
+		}
 }
 
 async function thisRedisPing(): Promise<boolean> {

@@ -28,6 +28,22 @@ const V2B_SCHEMA_VERSION = "1.1.0";
 const V2B_SCHEMA_DESCRIPTION = "Universal identity federation foundation (V2-B)";
 const INITIAL_SCHEMA_VERSION = "1.0.0";
 const INITIAL_SCHEMA_DESCRIPTION = "Initial Identity Registry";
+const IDENTITY_SCHEMA_MIGRATIONS = [
+		[INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_DESCRIPTION],
+		[V2B_SCHEMA_VERSION, V2B_SCHEMA_DESCRIPTION],
+		[V2C_SCHEMA_VERSION, V2C_SCHEMA_DESCRIPTION],
+		[PASSKEY_SCHEMA_VERSION, PASSKEY_SCHEMA_DESCRIPTION],
+		[CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION]
+] as const;
+
+const REQUIRED_UNVERSIONED_TABLES = [
+		"registration_evidence", "identity_registration_audit",
+		"hapi_face_enrollment_bindings", "hapi_face_authentication_consents", "authenticator_enrollment_audit"
+];
+const EMAIL_TABLES = [
+		"verification_challenges", "verification_delivery_events", "email_verification_audit",
+		"email_authentication_results", "email_authentication_audit"
+];
 
 export type SchemaVersionInfo = {
 		schemaVersion: string | null;
@@ -62,13 +78,7 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 		}
 
 		// Record each version exactly once; never duplicated on subsequent startups.
-		for (const [version, description] of [
-				[INITIAL_SCHEMA_VERSION, INITIAL_SCHEMA_DESCRIPTION],
-				[V2B_SCHEMA_VERSION, V2B_SCHEMA_DESCRIPTION],
-				[V2C_SCHEMA_VERSION, V2C_SCHEMA_DESCRIPTION],
-				[PASSKEY_SCHEMA_VERSION, PASSKEY_SCHEMA_DESCRIPTION],
-				[CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_DESCRIPTION]
-		]) {
+		for (const [version, description] of IDENTITY_SCHEMA_MIGRATIONS) {
 				await client.query(
 						`INSERT INTO schema_migrations (version, description, applied_at)
 						 VALUES ($1, $2, $3)
@@ -78,6 +88,31 @@ export async function ensureIdentitySchema(client: PostgresClient = getPostgresP
 		}
 
 		schemaEnsured = true;
+}
+
+export async function getMissingRequiredSchema(
+		emailConfigured: boolean,
+		client: PostgresClient = getPostgresPool()
+): Promise<{ versions: string[]; tables: string[] }> {
+		const versions = IDENTITY_SCHEMA_MIGRATIONS.map(([version]) => version);
+		const tables = emailConfigured ? [...REQUIRED_UNVERSIONED_TABLES, ...EMAIL_TABLES] : REQUIRED_UNVERSIONED_TABLES;
+		const [applied, present] = await Promise.all([
+				client.query<{ version: string }>(
+						"SELECT version FROM schema_migrations WHERE version = ANY($1::text[]) AND applied_at IS NOT NULL",
+						[versions]
+				),
+				client.query<{ name: string }>(
+						`SELECT name FROM unnest($1::text[]) AS names(name)
+						 WHERE EXISTS (SELECT 1 FROM pg_class WHERE oid = to_regclass(name) AND relkind IN ('r', 'p'))`,
+						[tables]
+				)
+		]);
+		const appliedVersions = new Set(applied.rows.map(row => row.version));
+		const presentTables = new Set(present.rows.map(row => row.name));
+		return {
+				versions: versions.filter(version => !appliedVersions.has(version)),
+				tables: tables.filter(table => !presentTables.has(table))
+		};
 }
 
 // Read-only for health reporting (Task 4); never mutates schema_migrations.

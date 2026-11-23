@@ -238,6 +238,11 @@ The new account-linking API remains disabled unless explicitly enabled. HAPI pro
 requires PostgreSQL and fails startup if the identity schema bootstrap or Bookwrm seed
 fails; the other enabled schema initializers also complete before the server listens.
 This does not change the existing Bookwrm or HAPI staging bootstrap behavior.
+HAPI production `/health/ready` also checks every required identity migration version
+and the presence of the unversioned registration and Face schema tables, plus email
+tables when an email provider is configured. Missing records or tables, verification
+errors, or timeouts return 503 with `migrationsReady: false`. These checks do not
+validate every column, constraint, or index; the startup DDL must also succeed.
 Startup executes additive schema statements and the existing Bookwrm seed/backfill; these
 operations are not one atomic migration. Use a dedicated, empty HAPI database, never an
 existing production database, and investigate any partial initialization before retrying.
