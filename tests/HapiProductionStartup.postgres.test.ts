@@ -197,7 +197,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 				}
 		}, 25_000);
 
-		it("refuses production Email OTP startup without a pilot allowlist", async () => {
+		it("refuses a partially configured production pilot allowlist", async () => {
 			const { url, pool } = await newSchema();
 			try {
 				const server = start(url, {
@@ -208,7 +208,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 					HAPI_EMAIL_FROM: "test@example.invalid"
 				});
 				expect(await server.exited).not.toBe(0);
-				expect(server.output()).toContain("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required");
+				expect(server.output()).toContain("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID must be configured together");
 				expect(server.output()).not.toContain("Server listening");
 			} finally {
 				await pool.end();

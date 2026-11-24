@@ -52,6 +52,9 @@ if (process.env.HAPI_PILOT_PROVISIONING_TARGET !== "https://id.hapiinc.com") {
 if (process.env.OIDC_ISSUER !== "https://id.hapiinc.com") {
 	throw new Error("Execution refused: OIDC_ISSUER must exactly equal https://id.hapiinc.com");
 }
+if (process.env.HAPI_PILOT_ALLOWLIST_CONFIRMED !== "true") {
+	throw new Error("Execution refused: confirm the pilot application allowlist will be configured before activation");
+}
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is required");
 const databaseUrl = new URL(process.env.DATABASE_URL);
 const approvedDatabaseHost = process.env.HAPI_PILOT_PROVISIONING_DATABASE_HOST?.trim();
@@ -64,20 +67,48 @@ if (/^(localhost|127\.0\.0\.1)$/i.test(databaseUrl.hostname) || /(staging|test|d
 	throw new Error("Execution refused: DATABASE_URL appears to be non-production or a disposable environment");
 }
 
+if (process.stdin.isTTY) throw new Error("Execution refused: supply the approved vault credential via standard input, not a terminal");
+let secretInput = "";
+for await (const chunk of process.stdin) {
+	secretInput += chunk.toString("utf8");
+	if (secretInput.length > 65) throw new Error("Execution refused: invalid credential input");
+}
+const secret = secretInput.replace(/\r?\n$/, "");
+if (!/^[A-Za-z0-9_-]{64}$/.test(secret)) {
+	throw new Error("Execution refused: credential must be a 48-byte random base64url value supplied via standard input");
+}
+
 function hashSecret(secret) {
 	const salt = crypto.randomBytes(16);
 	const derived = crypto.scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
 	return `scrypt$16384$8$1$${salt.toString("base64url")}$${derived.toString("base64url")}`;
 }
 
+function matchesSecret(stored, supplied) {
+	const parts = stored.split("$");
+	if (parts.length !== 6 || parts[0] !== "scrypt" || parts[1] !== "16384" || parts[2] !== "8" || parts[3] !== "1") return false;
+	const salt = Buffer.from(parts[4], "base64url");
+	const expected = Buffer.from(parts[5], "base64url");
+	if (salt.length !== 16 || expected.length !== 32 ||
+		salt.toString("base64url") !== parts[4] || expected.toString("base64url") !== parts[5]) return false;
+	const actual = crypto.scryptSync(supplied, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+	return crypto.timingSafeEqual(expected, actual);
+}
+
+class ProvisioningError extends Error {}
+
 const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
-await client.connect();
+try {
+	await client.connect();
+} catch {
+	throw new Error("Provisioning database connection failed; inspect the approved target without exposing credentials");
+}
 try {
 	await client.query("BEGIN");
 	const existingTenant = await client.query(
 		"SELECT id, name, slug, status FROM tenants WHERE slug=$1 OR id=$2", [plan.tenant.slug, plan.tenant.id]);
 	if (existingTenant.rows.length > 1) {
-		throw new Error("multiple pilot tenant matches; refusing mutation");
+		throw new ProvisioningError("multiple pilot tenant matches; refusing mutation");
 	}
 	if (existingTenant.rows.length === 0) {
 		await client.query(
@@ -87,7 +118,7 @@ try {
 	} else {
 		const tenant = existingTenant.rows[0];
 		if (tenant.id !== plan.tenant.id || tenant.name !== plan.tenant.name || tenant.slug !== plan.tenant.slug || tenant.status !== "active") {
-			throw new Error("existing pilot tenant differs; refusing mutation");
+			throw new ProvisioningError("existing pilot tenant differs; refusing mutation");
 		}
 	}
 	const tenantId = plan.tenant.id;
@@ -102,7 +133,7 @@ try {
 			JSON.stringify(application.allowed_authentication_methods) !== JSON.stringify(plan.application.allowedAuthenticationMethods) ||
 			JSON.stringify(application.allowed_identity_providers) !== JSON.stringify(plan.application.allowedIdentityProviders) ||
 			application.face_setup_enabled !== false) {
-			throw new Error("existing approved application differs; refusing mutation");
+			throw new ProvisioningError("existing approved application differs; refusing mutation");
 		}
 	} else {
 		await client.query(
@@ -114,11 +145,9 @@ try {
 	}
 
 	const existingClient = await client.query(
-		"SELECT id, application_id, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, status FROM oidc_clients WHERE client_id=$1",
+		"SELECT id, application_id, client_secret, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, status FROM oidc_clients WHERE client_id=$1",
 		[plan.client.clientId]);
-	let secret = null;
 	if (existingClient.rows.length === 0) {
-		secret = crypto.randomBytes(48).toString("base64url");
 		await client.query(
 			`INSERT INTO oidc_clients
 			 (id, application_id, client_id, client_secret, redirect_uris, scopes, grant_types, response_types, token_endpoint_auth_method, require_pkce, created_at, updated_at, status)
@@ -132,19 +161,20 @@ try {
 			JSON.stringify(row.scopes) === JSON.stringify(plan.client.scopes) &&
 			JSON.stringify(row.grant_types) === JSON.stringify(plan.client.grantTypes) &&
 			JSON.stringify(row.response_types) === JSON.stringify(["code"]) &&
-			row.token_endpoint_auth_method === plan.client.authMethod && row.require_pkce === true && row.status === "active";
-		if (!same) throw new Error("existing hapi-pilot-certification client differs; refusing mutation");
+			row.token_endpoint_auth_method === plan.client.authMethod && row.require_pkce === true && row.status === "active" &&
+			matchesSecret(row.client_secret, secret);
+		if (!same) throw new ProvisioningError("existing hapi-pilot-certification client or credential differs; refusing mutation");
 	}
 	await client.query("COMMIT");
-	console.log(JSON.stringify({ action: existingClient.rows.length ? "unchanged" : "created", applicationId, clientId: plan.client.clientId, secretWasGenerated: secret !== null }, null, 2));
-	if (secret) {
-		console.log("CLIENT_SECRET_BEGIN");
-		console.log(secret);
-		console.log("CLIENT_SECRET_END");
-	}
+	console.log(JSON.stringify({ action: existingClient.rows.length ? "unchanged" : "created", applicationId, clientId: plan.client.clientId }, null, 2));
 } catch (error) {
-	await client.query("ROLLBACK");
-	throw error;
+	try {
+		await client.query("ROLLBACK");
+	} catch {
+		console.error("Provisioning rollback failed; transaction outcome requires operator investigation");
+	}
+	if (error instanceof ProvisioningError) throw error;
+	throw new Error("Provisioning failed; transaction was not confirmed. Inspect the target securely before retrying");
 } finally {
 	await client.end();
 }

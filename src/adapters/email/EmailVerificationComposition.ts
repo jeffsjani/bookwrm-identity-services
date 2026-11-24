@@ -42,9 +42,6 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 		env,
 		env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER
 	);
-	if (env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER && !pilotAllowlist.configured) {
-		throw new Error("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required for production Email OTP");
-	}
 	const requireSetting = (key: string): string => {
 		if (!env[key]) throw new Error(`Missing required ${key}`);
 		return env[key]!;

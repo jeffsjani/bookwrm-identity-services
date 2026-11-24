@@ -4,9 +4,13 @@ Status: prepared for operator review. No production database, identity, OAuth cl
 
 ## Client-secret security
 
-New confidential OIDC clients are stored with `scrypt$...` salted hashes using scrypt N=16384, r=8, p=1 and 32-byte derived keys. Verification uses Node timing-safe byte comparison. Existing plaintext credentials remain accepted unchanged and are not rewritten during normal seeding. A new or explicitly changed valid secret is hashed when inserted or updated. Missing, malformed and wrong secrets fail closed.
+Pilot provisioning stores the confidential client secret as a `scrypt$...` salted hash using scrypt N=16384, r=8, p=1 and 32-byte derived keys. Verification uses Node timing-safe byte comparison. Existing plaintext credentials remain accepted unchanged and are not rewritten during normal seeding. Other client creation and rotation paths are not automatically migrated to scrypt. Missing, malformed and wrong secrets fail closed.
 
-No raw secret is logged or returned by the repository contract. A separate hash migration is unnecessary: the existing `client_secret TEXT NOT NULL` column is additive-compatible, and the code recognizes both hashed and legacy plaintext values.
+The production baseline compares plaintext secrets directly, or compares SHA-256 digests of the supplied and stored plaintext in H1/registration; it does not identify a stored SHA-256 digest as a hash of the credential. Those stored values remain plaintext-compatible. A legacy plaintext secret beginning `scrypt$` is ambiguous and will be interpreted as a hash; inventory and rotate such secrets before release. A separate hash migration is unnecessary: the existing `client_secret TEXT NOT NULL` column is additive-compatible.
+
+The token endpoint now requires the registered authentication method on authorization-code and enabled refresh grants. A Basic request may include a matching body `client_id`, but not a body secret; conflicting IDs, malformed or unsupported Authorization headers, duplicate credentials, and secrets on public clients fail closed. Existing clients using a different method than their registration must be corrected before deployment. Bookwrm's default registration is `client_secret_post`, unless explicitly configured otherwise; actual production registrations and observed request methods require separate operator verification.
+
+The pilot allowlist is inactive when neither pilot setting is present. When configured, it limits only the specified application; other applications retain their prior behavior. Partial production settings fail startup. Before provisioning or enabling the dedicated pilot, the operator must configure both settings for its exact application ID and approved addresses; otherwise the pilot is not restricted.
 
 ## Operator-controlled provisioning
 
@@ -18,7 +22,9 @@ node scripts/provision-production-pilot.mjs \
   --redirect-uri <exact-approved-HTTPS-callback>
 ```
 
-This defaults to a plan-only output and makes no database changes. Execution requires `--execute`, `DATABASE_URL`, `HAPI_PILOT_PROVISIONING_ACKNOWLEDGED=true`, `HAPI_PILOT_PROVISIONING_TARGET=https://id.hapiinc.com`, `OIDC_ISSUER=https://id.hapiinc.com`, an exact approved `HAPI_PILOT_PROVISIONING_DATABASE_HOST`, and TLS (`sslmode=require` or `sslmode=verify-full`). Existing configuration is compared; mismatches or a different application are refused rather than mutated. A newly created secret is printed once to operator output and is not written to source control.
+This defaults to a plan-only output and makes no database changes. Execution requires `--execute`, `DATABASE_URL`, `HAPI_PILOT_PROVISIONING_ACKNOWLEDGED=true`, `HAPI_PILOT_ALLOWLIST_CONFIRMED=true`, `HAPI_PILOT_PROVISIONING_TARGET=https://id.hapiinc.com`, `OIDC_ISSUER=https://id.hapiinc.com`, an exact approved `HAPI_PILOT_PROVISIONING_DATABASE_HOST`, and TLS (`sslmode=require` or `sslmode=verify-full`). The operator must first generate 48 cryptographically random bytes, encode them as 64 base64url characters, and store the value in an approved secret manager. In a separate approved session, stream the stored value to provisioning on standard input without echoing, logging, command arguments, or environment variables. The script does not generate or print the secret. An operator must securely configure the same vault value in the already deployed certification client separately; no secret-manager integration is provided here. Confirm the allowlist and secure handoff before activation.
+
+Existing configuration and the provided credential are compared; mismatches are refused rather than mutated. The confirmation flag is an operator attestation, not a check of deployed settings. If the connection fails around commit, securely inspect the database before retrying with the same vault value; never rotate or regenerate it blindly.
 
 The mechanism creates or preserves:
 

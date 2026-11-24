@@ -17,6 +17,8 @@ describe("OIDC client secret hashing", () => {
 		expect(await verifyOIDCClientSecret(secret, "wrong-secret")).toBe(false);
 		expect(await verifyOIDCClientSecret(secret, "")).toBe(false);
 		expect(await verifyOIDCClientSecret(secret, "bad\0secret")).toBe(false);
+		expect(await verifyOIDCClientSecret(secret.replace("scrypt$16384$", "scrypt$65536$"), "correct-high-entropy-secret-123456789")).toBe(false);
+		expect(await verifyOIDCClientSecret(`${secret}!`, "correct-high-entropy-secret-123456789")).toBe(false);
 		expect(await verifyOIDCClientSecret("malformed$hash", "correct-high-entropy-secret-123456789")).toBe(false);
 	});
 

@@ -315,9 +315,10 @@ async function appleCallback(f: Fixture, params: Record<string, string>) {
 async function exchangeCode(f: Fixture, location: string, verifier: string) {
 	const code = new URL(location).searchParams.get("code")!;
 	return f.app.inject({ method: "POST", url: "/token",
-		headers: { "content-type": "application/x-www-form-urlencoded" },
+		headers: { "content-type": "application/x-www-form-urlencoded",
+			authorization: `Basic ${Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64")}` },
 		payload: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: REDIRECT,
-			client_id: CLIENT_ID, client_secret: CLIENT_SECRET, code_verifier: verifier }).toString() });
+			code_verifier: verifier }).toString() });
 }
 
 function decodeJwt(token: string): Record<string, unknown> {

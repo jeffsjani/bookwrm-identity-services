@@ -11,7 +11,7 @@ export function emailPilotAllowlistFromEnvironment(
 	production = false
 ): EmailPilotAllowlist {
 	const raw = env.HAPI_EMAIL_PILOT_ALLOWLIST;
-	const applicationId = env.HAPI_EMAIL_PILOT_APPLICATION_ID?.trim();
+	const applicationId = env.HAPI_EMAIL_PILOT_APPLICATION_ID?.trim().toLowerCase();
 	const emails = new Set<string>();
 	if (raw !== undefined) {
 		const entries = raw.split(",");
@@ -28,10 +28,18 @@ export function emailPilotAllowlistFromEnvironment(
 		throw new Error("HAPI_EMAIL_PILOT_APPLICATION_ID must be a UUID");
 	}
 	const configured = emails.size > 0 && Boolean(applicationId);
-	const enforced = production || raw !== undefined || applicationId !== undefined;
+	if (production && (raw !== undefined || applicationId !== undefined) && !configured) {
+		throw new Error("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID must be configured together");
+	}
 	return {
 		configured: production ? configured : emails.size > 0,
-		allows: (email, context) => !enforced || (emails.has(normalizeEmail(email)) &&
-			(!production && !applicationId || context?.applicationId === applicationId))
+		allows: (email, context) => {
+			if (raw === undefined && applicationId === undefined) return true;
+			if (applicationId) {
+				if (!context?.applicationId) return false;
+				if (context.applicationId.toLowerCase() !== applicationId) return true;
+			}
+			return emails.has(normalizeEmail(email));
+		}
 	};
 }

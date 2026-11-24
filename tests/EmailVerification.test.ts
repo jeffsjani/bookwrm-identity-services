@@ -6,6 +6,7 @@ import Fastify from "fastify";
 import { parse } from "@babel/parser";
 import { Webhook } from "svix";
 import { normalizeEmail } from "../src/email/EmailNormalizationService.js";
+import { hashOIDCClientSecret } from "../src/security/OIDCClientSecret.js";
 import { VerificationSecrets } from "../src/email/VerificationSecrets.js";
 import { defaultVerificationPolicy, verificationPolicyFromEnvironment } from "../src/email/VerificationPolicy.js";
 import { InMemoryVerificationChallengeRepository } from "../src/email/InMemoryVerificationChallengeRepository.js";
@@ -172,12 +173,20 @@ describe("H2 verification primitives", () => {
 		expect(allowlist.configured).toBe(true);
 		expect(allowlist.allows("Pilot@example.com", { ...context, applicationId })).toBe(true);
 		expect(allowlist.allows("other@example.com", { ...context, applicationId })).toBe(false);
-		expect(allowlist.allows("Pilot@example.com", context)).toBe(false);
+		expect(allowlist.allows("outside@example.com", context)).toBe(true);
+		expect(allowlist.allows("Pilot@example.com")).toBe(false);
+		const caseInsensitiveScope = emailPilotAllowlistFromEnvironment({
+			HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
+			HAPI_EMAIL_PILOT_APPLICATION_ID: "ABCDEF12-ABCD-4123-ABCD-ABCDEF123456"
+		}, true);
+		expect(caseInsensitiveScope.allows("outside@example.com", {
+			...context, applicationId: "abcdef12-abcd-4123-abcd-abcdef123456"
+		})).toBe(false);
 		const missingProductionScope = emailPilotAllowlistFromEnvironment({}, true);
 		expect(missingProductionScope.configured).toBe(false);
-		expect(missingProductionScope.allows("any@example.com", context)).toBe(false);
-		expect(emailPilotAllowlistFromEnvironment({ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com" }, true).configured)
-			.toBe(false);
+		expect(missingProductionScope.allows("any@example.com", context)).toBe(true);
+		expect(() => emailPilotAllowlistFromEnvironment({ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com" }, true))
+			.toThrow("must be configured together");
 		expect(() => emailPilotAllowlistFromEnvironment({
 			HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
 			HAPI_EMAIL_PILOT_APPLICATION_ID: "not-a-uuid"
@@ -234,6 +243,17 @@ async function apiFixture() {
 }
 
 describe("H2 HTTP security and isolation", () => {
+	it("authenticates a client with a salted secret through H1", async () => {
+		const { app, headers, clients } = await apiFixture();
+		try {
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing test client");
+			await clients.upsert({ ...client, clientSecret: await hashOIDCClientSecret("client-secret") });
+			const payload = { email: "pilot@example.com", purpose: "REGISTRATION" };
+			expect((await app.inject({ method: "POST", url: "/v1/identity/email/start", headers: headers("client", "wrong"), payload })).statusCode).toBe(401);
+			expect((await app.inject({ method: "POST", url: "/v1/identity/email/start", headers: headers(), payload })).statusCode).toBe(200);
+		} finally { await app.close(); }
+	});
 	it("malformed JSON never echoes or logs OTP or client credentials", async () => {
 		const { app, headers, logs } = await apiFixture();
 		try {
