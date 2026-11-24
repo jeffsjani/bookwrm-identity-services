@@ -160,3 +160,26 @@ disabled throughout release preparation and any separately approved deployment.
    does not verify scrypt client secrets, so an already provisioned pilot client
    must remain inactive until a compatible backend is restored. Investigate any
    uncertain transaction outcome separately and preserve all production data.
+
+## Stage 5C.3 suspension safety certification
+
+The OAuth pilot and safe rollback candidates enforce persisted client status on
+each request to `/authorize`, `/token` (authorization-code and enabled refresh
+grants), and `/userinfo`. This includes authorization codes, refresh tokens, and
+access tokens issued before the client was suspended. H1 authority and
+registration paths also reject suspended clients. Candidate-local tests against
+synthetic disposable PostgreSQL verified that a status change takes effect
+without a restart, readiness remains HTTP 200, and an unrelated active client
+continues to work.
+
+This does not describe the current live baseline
+`4cea087d6c887865b322786e588c1ff1752a9314`: its UserInfo handler does not
+re-check client status. During a transition from that build, an already-issued
+access token can still reach UserInfo after suspension. Keep Email OTP and
+Universal Login disabled, suspend an existing pilot row before switching, and
+use a separately verified ingress/maintenance gate until the candidate is
+healthy and the suspended-client behavior is verified. Railway has no
+service-native path-specific deny; if the independent traffic gate cannot be
+verified, do not switch while publicly reachable. No production database,
+client, secret, configuration, or Railway service was accessed or changed for
+this certification.
