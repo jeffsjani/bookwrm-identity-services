@@ -641,6 +641,14 @@ export class OIDCService {
 										error = "Client is blocked";
 										return { error: "invalid_token", error_description: "Access token is invalid or expired" };
 								}
+								try {
+										await resolveRegisteredClient(clientId, this.clientAuthority);
+								} catch (err) {
+										if (!(err instanceof VerificationError)) throw err;
+										reply.code(401);
+										error = "Client is not active";
+										return { error: "invalid_token", error_description: "Access token is invalid or expired" };
+								}
 								user = tokenRecord.sub;
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
