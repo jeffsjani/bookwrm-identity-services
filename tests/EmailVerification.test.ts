@@ -44,7 +44,8 @@ describe("H2 challenge lifecycle", () => {
 		const repository = new InMemoryVerificationChallengeRepository();
 		const provider = new InMemoryEmailDeliveryProvider();
 		const secrets = new VerificationSecrets("pilot-test-secret".repeat(3));
-		const unrestricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy);
+		let now = Date.now();
+		const unrestricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy, () => now);
 		const pilotId = "123e4567-e89b-42d3-a456-426614174000";
 		const pilotContext = { ...context, applicationId: pilotId };
 		const outside = await unrestricted.start(pilotContext, "outside@example.com", "REGISTRATION");
@@ -54,7 +55,7 @@ describe("H2 challenge lifecycle", () => {
 			HAPI_EMAIL_PILOT_APPLICATION_ID: pilotId
 		}, true);
 		const restricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy,
-			Date.now, allowlist.allows);
+			() => now, allowlist.allows);
 		await expect(restricted.start(context, "outside@example.com", "REGISTRATION"))
 			.rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED", statusCode: 403 });
 		await expect(restricted.verify(pilotContext, outside.challengeId, provider.messages[0].code))
@@ -70,7 +71,10 @@ describe("H2 challenge lifecycle", () => {
 		expect(provider.messages).toHaveLength(2);
 		const allowed = await restricted.start(pilotContext, "pilot@EXAMPLE.com", "REGISTRATION");
 		expect(provider.messages).toHaveLength(3);
-		await expect(restricted.verify(pilotContext, allowed.challengeId, provider.messages[2].code)).resolves.toMatchObject({ verified: true });
+		now += 60_000;
+		await expect(restricted.resend(pilotContext, allowed.challengeId)).resolves.toMatchObject({ challengeId: allowed.challengeId });
+		expect(provider.messages).toHaveLength(4);
+		await expect(restricted.verify(pilotContext, allowed.challengeId, provider.messages[3].code)).resolves.toMatchObject({ verified: true });
 	});
 	it("incorrect OTP consumes attempts and locks at the configured maximum", async () => {
 		const { service, repository } = fixture();
