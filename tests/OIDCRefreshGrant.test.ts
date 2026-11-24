@@ -192,6 +192,24 @@ describe("V2-C refresh grant: enabled gate", () => {
 				await app.close();
 		});
 
+		it("enforces the registered method on refresh without consuming the token", async () => {
+				mockIdentityContextFetch();
+				enableRefreshGrant();
+				const { app } = await buildOidcTestApp();
+				const refreshToken = await loginAndGetRefreshToken(app);
+				const record = await inMemoryOIDCClientRepository.findByClientId("base44-web");
+				if (!record) throw new Error("OIDC test client was not seeded");
+				await inMemoryOIDCClientRepository.upsert({ ...record, tokenEndpointAuthMethod: "client_secret_basic" });
+				const rejected = await refreshExchange(app, refreshToken);
+				expect(rejected.json()).toMatchObject({ error: "invalid_client" });
+				const credentials = Buffer.from("base44-web:base44-secret").toString("base64");
+				const response = await app.inject({ method: "POST", url: "/token",
+						headers: { "content-type": "application/x-www-form-urlencoded", authorization: `Basic ${credentials}` },
+						payload: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken }).toString() });
+				expect(response.statusCode).toBe(200);
+				await app.close();
+		});
+
 		it("rejects clients whose registration does not include the refresh_token grant", async () => {
 				mockIdentityContextFetch();
 				enableRefreshGrant();

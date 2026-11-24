@@ -59,7 +59,9 @@ describe.skipIf(!databaseUrl)("H3 durable PostgreSQL atomicity/concurrency", () 
 	it("creates exactly one canonical IdentitySubject and consumes the challenge exactly once (happy path)", async () => {
 		const email = uniqueEmail();
 		const verificationId = await verifiedChallenge(email);
-		const outcome = await registrationRepository.complete({ context, verificationId });
+		const pilotRegistration = new PostgresRegistrationRepository(pool,
+			(candidate, registrationContext) => candidate === email && registrationContext.applicationId === applicationId);
+		const outcome = await pilotRegistration.complete({ context, verificationId });
 		expect(outcome).toMatchObject({ registered: true, email, emailVerified: true, created: true });
 		const rows = await pool.query("SELECT * FROM identity_subjects WHERE primary_provider = 'HAPI_EMAIL' AND primary_provider_subject = $1", [email]);
 		expect(rows.rows).toHaveLength(1);
@@ -83,6 +85,20 @@ describe.skipIf(!databaseUrl)("H3 durable PostgreSQL atomicity/concurrency", () 
 		const sources = await restartedStore.getClaimSources(rows.rows[0].id);
 		expect(sources.email).toBe("HAPI_EMAIL");
 		expect(sources.emailVerified).toBe("HAPI_EMAIL");
+	});
+
+	it("rejects direct registration completion for an email outside the pilot allowlist", async () => {
+		const email = uniqueEmail();
+		const verificationId = await verifiedChallenge(email);
+		const restricted = new PostgresRegistrationRepository(pool,
+			(candidate, registrationContext) => candidate === "pilot@example.com" && registrationContext.applicationId === applicationId);
+		await expect(restricted.complete({ context, verificationId }))
+			.rejects.toMatchObject({ code: "INVALID_EVIDENCE" });
+		expect((await pool.query(
+			"SELECT id FROM identity_subjects WHERE primary_provider='HAPI_EMAIL' AND primary_provider_subject=$1", [email]
+		)).rows).toHaveLength(0);
+		expect((await pool.query("SELECT status FROM verification_challenges WHERE id=$1", [verificationId])).rows[0].status)
+			.toBe("VERIFIED");
 	});
 
 	it("Task 9/18: concurrent completion of the SAME verification yields exactly one registered identity and one consumption", async () => {

@@ -21,6 +21,8 @@ import type { EmailOIDCHandoff } from "../../authentication/EmailOIDCHandoff.js"
 import { registerEmailAuthenticationRoutes } from "../../routes/emailAuthentication.js";
 import type { VerificationChallengeRepository } from "../../email/VerificationChallengeRepository.js";
 import { normalizeEmail } from "../../email/EmailNormalizationService.js";
+import { emailPilotAllowlistFromEnvironment } from "../../email/EmailPilotAllowlist.js";
+import { HAPI_PRODUCTION_ISSUER } from "../../config/IssuerPolicy.js";
 import { RegistrationError } from "../../registration/RegistrationTypes.js";
 import type { RegistrationService } from "../../registration/RegistrationService.js";
 import { identityRegistry, type IdentityRegistry } from "../../identity/IdentityRegistry.js";
@@ -36,6 +38,10 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 	}
 	if (!env.HAPI_EMAIL_PROVIDER) return;
 	if (env.HAPI_EMAIL_PROVIDER !== "resend") throw new Error("Unsupported HAPI_EMAIL_PROVIDER");
+	const pilotAllowlist = emailPilotAllowlistFromEnvironment(
+		env,
+		env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER
+	);
 	const requireSetting = (key: string): string => {
 		if (!env[key]) throw new Error(`Missing required ${key}`);
 		return env[key]!;
@@ -48,7 +54,7 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 	const pool = getPostgresPool() as pg.Pool;
 	const repository = new PostgresVerificationChallengeRepository(pool);
 	await repository.ensureSchema();
-	const service = new EmailVerificationService(repository, provider, secrets, policy);
+	const service = new EmailVerificationService(repository, provider, secrets, policy, Date.now, pilotAllowlist.allows);
 	const authority = {
 		clients: new PostgresOIDCClientRepository(), applications: new PostgresApplicationRepository(), tenants: new PostgresTenantRepository()
 	};

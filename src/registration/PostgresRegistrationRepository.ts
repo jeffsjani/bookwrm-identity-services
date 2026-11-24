@@ -25,7 +25,10 @@ type ChallengeRow = {
 // one Postgres transaction/client: verification lock, identity resolve-or-create, claim provenance,
 // verification consumption, and audit all commit or roll back together.
 export class PostgresRegistrationRepository implements RegistrationRepository {
-		constructor(private readonly pool: pg.Pool) {}
+		constructor(
+			private readonly pool: pg.Pool,
+			private readonly isPilotEmailAllowed: (email: string, context: CompleteRegistrationInput["context"]) => boolean = () => true
+		) {}
 
 		async ensureSchema(): Promise<void> {
 				await this.pool.query(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
@@ -47,6 +50,9 @@ export class PostgresRegistrationRepository implements RegistrationRepository {
 						// Not found, wrong tenant, or wrong application all read identically (Task 19): never
 						// leak which case applies to an unauthenticated/mismatched caller.
 						if (!challenge || challenge.tenant_id !== context.tenantId || challenge.application_id !== context.applicationId) {
+								return this.fail(client, "INVALID_EVIDENCE", context, verificationId, null);
+						}
+						if (!this.isPilotEmailAllowed(challenge.destination_normalized, context)) {
 								return this.fail(client, "INVALID_EVIDENCE", context, verificationId, null);
 						}
 

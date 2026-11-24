@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { configuration } from "../../config/ConfigurationService.js";
+import { HAPI_PRODUCTION_ISSUER } from "../../config/IssuerPolicy.js";
 import { BOOKWRM_TENANT_ID, BOOKWRM_APPLICATION_ID } from "../../identity/WellKnownIdentities.js";
 import type { TenantRepository } from "../../identity/TenantRepository.js";
 import type { ApplicationRepository } from "../../identity/ApplicationRepository.js";
@@ -52,6 +53,7 @@ async function backfillIdentitySubjects(applicationId: string, client?: Postgres
 		if (configuration.getIdentityRegistryDriver() !== "postgres") {
 				return 0;
 		}
+		if (isHapiProductionIssuer()) return 0;
 
 		const pool = client ?? getPostgresPool();
 		const result = await pool.query<{ id: string }>(
@@ -60,6 +62,10 @@ async function backfillIdentitySubjects(applicationId: string, client?: Postgres
 		);
 
 		return result.rows.length;
+}
+
+function isHapiProductionIssuer(): boolean {
+	return configuration.get("OIDC_ISSUER")?.trim() === HAPI_PRODUCTION_ISSUER;
 }
 
 // Bookwrm/Base44-scoped migration: seeds Tenant #1 (Bookwrm) + Application #1 (Bookwrm Base44) + its
@@ -111,7 +117,7 @@ export async function ensureBookwrmApplicationSeed(
 		}
 
 		const backfilledIdentitySubjects = await backfillIdentitySubjects(application.id, deps.postgresClient);
-		if (configuration.getIdentityRegistryDriver() === "postgres") {
+		if (configuration.getIdentityRegistryDriver() === "postgres" && !isHapiProductionIssuer()) {
 				const client = deps.postgresClient ?? getPostgresPool();
 				await client.query(`WITH migrated AS (INSERT INTO application_account_links
 					(id,identity_subject_id,application_id,external_account_id,status,created_at,updated_at)

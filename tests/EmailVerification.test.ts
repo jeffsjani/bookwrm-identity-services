@@ -6,11 +6,13 @@ import Fastify from "fastify";
 import { parse } from "@babel/parser";
 import { Webhook } from "svix";
 import { normalizeEmail } from "../src/email/EmailNormalizationService.js";
+import { hashOIDCClientSecret } from "../src/security/OIDCClientSecret.js";
 import { VerificationSecrets } from "../src/email/VerificationSecrets.js";
 import { defaultVerificationPolicy, verificationPolicyFromEnvironment } from "../src/email/VerificationPolicy.js";
 import { InMemoryVerificationChallengeRepository } from "../src/email/InMemoryVerificationChallengeRepository.js";
 import { InMemoryEmailDeliveryProvider } from "../src/email/EmailDeliveryProvider.js";
 import { EmailVerificationService } from "../src/email/EmailVerificationService.js";
+import { emailPilotAllowlistFromEnvironment } from "../src/email/EmailPilotAllowlist.js";
 import { registerEmailVerificationRoutes } from "../src/routes/emailVerification.js";
 import { InMemoryTenantRepository } from "../src/identity/InMemoryTenantRepository.js";
 import { InMemoryApplicationRepository } from "../src/identity/InMemoryApplicationRepository.js";
@@ -37,6 +39,22 @@ describe("H2 challenge lifecycle", () => {
 		expect(started).toEqual({ challengeId: expect.any(String), expiresIn: 600, resendAfter: 60 });
 		expect(await service.verify(context, started.challengeId, provider.messages[0].code)).toEqual({ verified: true, verificationId: started.challengeId });
 		expect((await repository.findById(started.challengeId))?.status).toBe("VERIFIED");
+	});
+	it("restricts OTP starts and existing challenges to the exact pilot allowlist", async () => {
+		const repository = new InMemoryVerificationChallengeRepository();
+		const provider = new InMemoryEmailDeliveryProvider();
+		const secrets = new VerificationSecrets("pilot-test-secret".repeat(3));
+		const unrestricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy);
+		const { challengeId } = await unrestricted.start(context, "outside@example.com", "REGISTRATION");
+		const restricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy,
+			Date.now, (email, requestContext) => email === "pilot@example.com" && requestContext.applicationId === context.applicationId);
+		await expect(restricted.start(context, "outside@example.com", "REGISTRATION"))
+			.rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED", statusCode: 403 });
+		await expect(restricted.verify(context, challengeId, provider.messages[0].code))
+			.rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED", statusCode: 403 });
+		await expect(restricted.start({ ...context, applicationId: "another-application" }, "pilot@example.com", "REGISTRATION"))
+			.rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED", statusCode: 403 });
+		await expect(restricted.start(context, "pilot@EXAMPLE.com", "REGISTRATION")).resolves.toBeDefined();
 	});
 	it("incorrect OTP consumes attempts and locks at the configured maximum", async () => {
 		const { service, repository } = fixture();
@@ -146,6 +164,36 @@ describe("H2 challenge lifecycle", () => {
 });
 
 describe("H2 verification primitives", () => {
+	it("restricts production pilot access to normalized exact addresses", () => {
+		const applicationId = "123e4567-e89b-42d3-a456-426614174000";
+		const allowlist = emailPilotAllowlistFromEnvironment({
+			HAPI_EMAIL_PILOT_ALLOWLIST: "Pilot@EXAMPLE.COM",
+			HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId
+		}, true);
+		expect(allowlist.configured).toBe(true);
+		expect(allowlist.allows("Pilot@example.com", { ...context, applicationId })).toBe(true);
+		expect(allowlist.allows("other@example.com", { ...context, applicationId })).toBe(false);
+		expect(allowlist.allows("outside@example.com", context)).toBe(true);
+		expect(allowlist.allows("Pilot@example.com")).toBe(false);
+		const caseInsensitiveScope = emailPilotAllowlistFromEnvironment({
+			HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
+			HAPI_EMAIL_PILOT_APPLICATION_ID: "ABCDEF12-ABCD-4123-ABCD-ABCDEF123456"
+		}, true);
+		expect(caseInsensitiveScope.allows("outside@example.com", {
+			...context, applicationId: "abcdef12-abcd-4123-abcd-abcdef123456"
+		})).toBe(false);
+		const missingProductionScope = emailPilotAllowlistFromEnvironment({}, true);
+		expect(missingProductionScope.configured).toBe(false);
+		expect(missingProductionScope.allows("any@example.com", context)).toBe(true);
+		expect(() => emailPilotAllowlistFromEnvironment({ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com" }, true))
+			.toThrow("must be configured together");
+		expect(() => emailPilotAllowlistFromEnvironment({
+			HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
+			HAPI_EMAIL_PILOT_APPLICATION_ID: "not-a-uuid"
+		}, true)).toThrow("HAPI_EMAIL_PILOT_APPLICATION_ID must be a UUID");
+		expect(emailPilotAllowlistFromEnvironment({}).allows("any@example.com")).toBe(true);
+		expect(() => emailPilotAllowlistFromEnvironment({ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@*.com" }, true)).toThrow();
+	});
 	it("normalizes domains deterministically without rewriting local addresses", () => {
 		expect(normalizeEmail("  Person.Name+tag@GMAIL.COM  ")).toBe("Person.Name+tag@gmail.com");
 		expect(normalizeEmail(normalizeEmail("A@EXAMPLE.COM"))).toBe("A@example.com");
@@ -195,6 +243,17 @@ async function apiFixture() {
 }
 
 describe("H2 HTTP security and isolation", () => {
+	it("authenticates a client with a salted secret through H1", async () => {
+		const { app, headers, clients } = await apiFixture();
+		try {
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing test client");
+			await clients.upsert({ ...client, clientSecret: await hashOIDCClientSecret("client-secret") });
+			const payload = { email: "pilot@example.com", purpose: "REGISTRATION" };
+			expect((await app.inject({ method: "POST", url: "/v1/identity/email/start", headers: headers("client", "wrong"), payload })).statusCode).toBe(401);
+			expect((await app.inject({ method: "POST", url: "/v1/identity/email/start", headers: headers(), payload })).statusCode).toBe(200);
+		} finally { await app.close(); }
+	});
 	it("malformed JSON never echoes or logs OTP or client credentials", async () => {
 		const { app, headers, logs } = await apiFixture();
 		try {
