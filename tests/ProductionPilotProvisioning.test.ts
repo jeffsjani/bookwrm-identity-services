@@ -108,12 +108,32 @@ describe("production pilot provisioning", () => {
 		expect(run.stderr + run.stdout).not.toContain(secret);
 	});
 
+	it("accepts a vault-shaped stdin value without printing it on connection failure", () => {
+		const secret = "C".repeat(64);
+		const run = spawnSync(process.execPath, [script, "--application-id", applicationId, "--redirect-uri", redirectUri, "--execute"], {
+			cwd: process.cwd(), encoding: "utf8", input: `${secret}\n`, timeout: 10_000,
+			env: {
+				PATH: process.env.PATH, HOME: process.env.HOME,
+				HAPI_PILOT_PROVISIONING_ACKNOWLEDGED: "true",
+				HAPI_PILOT_PROVISIONING_TARGET: "https://id.hapiinc.com",
+				OIDC_ISSUER: "https://id.hapiinc.com", HAPI_PILOT_ALLOWLIST_CONFIRMED: "true",
+				HAPI_PILOT_PROVISIONING_DATABASE_HOST: "database.example.invalid",
+				HAPI_PILOT_PROVISIONING_DATABASE_PORT: "5432", HAPI_PILOT_PROVISIONING_DATABASE_NAME: "db",
+				HAPI_PILOT_PROVISIONING_DATABASE_SCHEMA: "public",
+				DATABASE_URL: "postgresql://user:pass@database.example.invalid:5432/db?sslmode=verify-full"
+			}
+		});
+		expect(run.status).not.toBe(0);
+		expect(run.stderr.includes("Provisioning database connection failed")).toBe(true);
+		expect((run.stdout + run.stderr).includes(secret)).toBe(false);
+	});
+
 	it.each(["create", "unchanged", "conflict", "application-conflict", "client-conflict", "insert-error", "wrong-schema"])("handles a mocked %s transaction without emitting the credential", async mode => {
 		const secret = "A".repeat(64);
 		const storedSecret = mode === "unchanged" ? await hashOIDCClientSecret(secret) : "";
 		const originalArgv = process.argv;
 		const query = vi.fn(async (sql: string, _values?: unknown[]) => {
-			if (mode === "insert-error" && sql.includes("INSERT INTO oidc_clients")) throw new Error("synthetic insertion error");
+			if (mode === "insert-error" && sql.includes("INSERT INTO oidc_clients")) throw new Error(secret);
 			return {
 				rows: sql.startsWith("SELECT current_database()")
 					? [{ database_name: "db", schema_name: mode === "wrong-schema" ? "other" : "public" }]
@@ -169,12 +189,19 @@ describe("production pilot provisioning", () => {
 					: mode === "application-conflict" ? "existing approved application differs"
 					: mode === "client-conflict" ? "client or credential differs"
 						: mode === "wrong-schema" ? "connected database or schema differs" : "Provisioning failed";
-				await expect(import("../scripts/provision-production-pilot.mjs")).rejects.toThrow(message);
+				let exception = "";
+				try {
+					await import("../scripts/provision-production-pilot.mjs");
+				} catch (caught) {
+					exception = String(caught);
+				}
+				expect(exception.includes(message)).toBe(true);
+				expect(exception.includes(secret)).toBe(false);
 				expect(query.mock.calls.some(([sql]) => sql === "ROLLBACK")).toBe(true);
 				expect(query.mock.calls.some(([sql]) => sql === "COMMIT")).toBe(false);
 				if (mode === "wrong-schema") expect(query.mock.calls.some(([sql]) => sql === "BEGIN")).toBe(false);
 			}
-			expect(JSON.stringify([...log.mock.calls, ...error.mock.calls])).not.toContain(secret);
+			expect(JSON.stringify([...log.mock.calls, ...error.mock.calls]).includes(secret)).toBe(false);
 			expect(connect).toHaveBeenCalledOnce();
 			expect(end).toHaveBeenCalledOnce();
 		} finally {
