@@ -58,6 +58,7 @@ import {
 } from "./refresh/RefreshTokenRotationService.js";
 import type { OIDCLogEntry } from "./types.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
+import { verifyOIDCClientSecret } from "../security/OIDCClientSecret.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
 	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
@@ -635,6 +636,14 @@ export class OIDCService {
 								}
 
 								clientId = tokenRecord.clientId;
+								try {
+										await resolveRegisteredClient(clientId, this.clientAuthority);
+								} catch (err) {
+										if (!(err instanceof VerificationError)) throw err;
+										reply.code(401);
+										error = "Client is not active";
+										return { error: "invalid_token", error_description: "Access token is invalid or expired" };
+								}
 								user = tokenRecord.sub;
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
@@ -679,10 +688,19 @@ export class OIDCService {
 						const redirectUri = body.redirect_uri?.trim();
 						const codeVerifier = body.code_verifier?.trim();
 
-						// RFC 6749 §2.3.1: client_secret_basic credentials arrive via the Authorization header and take precedence over the request body.
 						const basicCredentials = this.parseBasicClientCredentials(request.headers.authorization);
-						const clientId = basicCredentials?.clientId ?? body.client_id?.trim();
-						const clientSecret = basicCredentials?.clientSecret ?? body.client_secret?.trim();
+						const bodyClientId = typeof body.client_id === "string" ? body.client_id.trim() : undefined;
+						const bodyClientSecret = typeof body.client_secret === "string" ? body.client_secret.trim() : undefined;
+						const credentialsInvalid =
+								(body.client_id !== undefined && bodyClientId === undefined) ||
+								(body.client_secret !== undefined && bodyClientSecret === undefined) ||
+								(request.headers.authorization !== undefined &&
+										(!basicCredentials || body.client_secret !== undefined ||
+												(body.client_id !== undefined && bodyClientId !== basicCredentials.clientId)));
+						const clientId = basicCredentials?.clientId ?? bodyClientId;
+						const clientSecret = basicCredentials?.clientSecret ?? bodyClientSecret;
+						const credentialMethod = basicCredentials ? "client_secret_basic"
+								: body.client_secret !== undefined ? "client_secret_post" : "none";
 
 						try {
 								await this.rateLimiter.assertWithinLimits({
@@ -690,6 +708,11 @@ export class OIDCService {
 										clientId: clientId ?? "",
 										userId: ""
 								});
+								if (credentialsInvalid) {
+										reply.code(400);
+										error = "Client authentication failed";
+										return { error: "invalid_client", error_description: error };
+								}
 
 								// HAPI ID V2-C: grant_type=refresh_token exists ONLY behind the default-off
 								// feature gate. With the gate off, the rejection below is byte-identical to V2-B.
@@ -699,6 +722,7 @@ export class OIDCService {
 												refreshToken: body.refresh_token?.trim(),
 												clientId,
 												clientSecret,
+												credentialMethod,
 												reply
 										});
 										error = result.error ?? "";
@@ -770,7 +794,6 @@ export class OIDCService {
 										return { error: "invalid_client", error_description: "Unknown client" };
 								}
 
-								const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
 								await requireApplicationMethod(clientId, this.clientAuthority,
 										this.applicationMethodFor(codeRecord.authenticationMethod));
 								if (!this.hasValidClientAuthenticationConfiguration(client)) {
@@ -778,13 +801,7 @@ export class OIDCService {
 										error = "Client authentication metadata is invalid";
 										return { error: "invalid_client", error_description: "Client authentication metadata is invalid" };
 								}
-								const configuredClientSecret =
-									typeof client.client_secret === "string" ? client.client_secret : "";
-								if (
-										tokenEndpointAuthMethod !== "none" &&
-										(!clientSecret || !configuredClientSecret.trim() ||
-											!constantTimeStringEqual(configuredClientSecret, clientSecret))
-								) {
+								if (!(await this.validTokenClientCredentials(client, credentialMethod, clientSecret))) {
 										reply.code(400);
 										error = "client_secret is invalid";
 										return { error: "invalid_client", error_description: "client_secret is invalid" };
@@ -2550,6 +2567,15 @@ export class OIDCService {
 				return typeof client.client_secret === "string" && client.client_secret.trim().length > 0;
 		}
 
+		private async validTokenClientCredentials(
+				client: OIDCClient, method: "client_secret_basic" | "client_secret_post" | "none", secret?: string
+		): Promise<boolean> {
+				if (this.clientTokenEndpointAuthMethod(client) !== method) return false;
+				if (method === "none") return true;
+				return typeof client.client_secret === "string" && typeof secret === "string" && secret.length > 0 &&
+						await verifyOIDCClientSecret(client.client_secret, secret);
+		}
+
 		private extractScopes(client: OIDCClient): string[] {
 				if (typeof client.scope !== "string") {
 						return [];
@@ -2744,6 +2770,7 @@ export class OIDCService {
 				refreshToken?: string;
 				clientId?: string;
 				clientSecret?: string;
+				credentialMethod: "client_secret_basic" | "client_secret_post" | "none";
 				reply: FastifyReply;
 		}): Promise<{ body: Record<string, unknown>; error?: string; user?: string }> {
 				const { reply } = input;
@@ -2783,14 +2810,7 @@ export class OIDCService {
 								error: "Client authentication metadata is invalid"
 						};
 				}
-				const tokenEndpointAuthMethod = this.clientTokenEndpointAuthMethod(client);
-				const configuredClientSecret =
-						typeof client.client_secret === "string" ? client.client_secret : "";
-				if (
-						tokenEndpointAuthMethod !== "none" &&
-						(!input.clientSecret || !configuredClientSecret.trim() ||
-								!constantTimeStringEqual(configuredClientSecret, input.clientSecret))
-				) {
+				if (!(await this.validTokenClientCredentials(client, input.credentialMethod, input.clientSecret))) {
 						reply.code(400);
 						return {
 								body: { error: "invalid_client", error_description: "client_secret is invalid" },
@@ -2951,18 +2971,20 @@ export class OIDCService {
 
 		// RFC 6749 §2.3.1: decodes an HTTP Basic Authorization header into client_secret_basic credentials.
 		private parseBasicClientCredentials(authorizationHeader?: string): { clientId: string; clientSecret: string } | undefined {
-				if (!authorizationHeader || !authorizationHeader.startsWith("Basic ")) {
+				if (!authorizationHeader || !/^Basic /i.test(authorizationHeader)) {
 						return undefined;
 				}
 
 				const encoded = authorizationHeader.slice("Basic ".length).trim();
-				if (!encoded) {
+				if (!encoded || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
 						return undefined;
 				}
 
 				let decoded: string;
 				try {
-						decoded = Buffer.from(encoded, "base64").toString("utf8");
+						const bytes = Buffer.from(encoded, "base64");
+						if (bytes.toString("base64") !== encoded) return undefined;
+						decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 				} catch {
 						return undefined;
 				}
@@ -2972,20 +2994,12 @@ export class OIDCService {
 						return undefined;
 				}
 
-				const clientId = this.tryDecodeUriComponent(decoded.slice(0, separatorIndex));
-				const clientSecret = this.tryDecodeUriComponent(decoded.slice(separatorIndex + 1));
-				if (!clientId) {
-						return undefined;
-				}
-
-				return { clientId, clientSecret };
-		}
-
-		private tryDecodeUriComponent(value: string): string {
 				try {
-						return decodeURIComponent(value);
+						const clientId = decodeURIComponent(decoded.slice(0, separatorIndex).replace(/\+/g, " "));
+						const clientSecret = decodeURIComponent(decoded.slice(separatorIndex + 1).replace(/\+/g, " "));
+						return clientId ? { clientId, clientSecret } : undefined;
 				} catch {
-						return value;
+						return undefined;
 				}
 		}
 

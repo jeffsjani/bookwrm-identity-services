@@ -19,7 +19,10 @@ export async function configureRegistration(app: FastifyInstance, env = process.
 		env,
 		env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER
 	);
-	const repository = new PostgresRegistrationRepository(getPostgresPool() as pg.Pool, pilotAllowlist.allows);
+	const disabledProductionEmail = env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER &&
+		env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== "true";
+	const repository = new PostgresRegistrationRepository(getPostgresPool() as pg.Pool,
+		(email, context) => !disabledProductionEmail && pilotAllowlist.allows(email, context));
 	await repository.ensureSchema();
 	const service = new RegistrationService(repository);
 	await registerRegistrationRoutes(app, service, {

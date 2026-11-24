@@ -29,10 +29,12 @@ import { identityRegistry, type IdentityRegistry } from "../../identity/Identity
 import type { IdentitySubject } from "../../models/IdentitySubject.js";
 
 export async function configureEmailVerification(app: FastifyInstance, env = process.env): Promise<ConfiguredEmailOIDCHandoff | undefined> {
+	const production = env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER;
 	if (env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== undefined &&
 		!["true", "false"].includes(env.HAPI_EMAIL_AUTHENTICATION_ENABLED)) {
 		throw new Error("HAPI_EMAIL_AUTHENTICATION_ENABLED must be true or false");
 	}
+	if (production && env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== "true") return;
 	if (env.HAPI_EMAIL_AUTHENTICATION_ENABLED === "true" && !env.HAPI_EMAIL_PROVIDER) {
 		throw new Error("Email authentication requires H2 email verification");
 	}
@@ -40,9 +42,9 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 	if (env.HAPI_EMAIL_PROVIDER !== "resend") throw new Error("Unsupported HAPI_EMAIL_PROVIDER");
 	const pilotAllowlist = emailPilotAllowlistFromEnvironment(
 		env,
-		env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER
+		production
 	);
-	if (env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER && !pilotAllowlist.configured) {
+	if (production && !pilotAllowlist.configured) {
 		throw new Error("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required for production Email OTP");
 	}
 	const requireSetting = (key: string): string => {

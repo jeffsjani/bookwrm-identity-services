@@ -13,6 +13,7 @@ import { InMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClient
 import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
 import { RegistrationService } from "../src/registration/RegistrationService.js";
 import { registerRegistrationRoutes } from "../src/routes/registration.js";
+import { hashOIDCClientSecret } from "../src/security/OIDCClientSecret.js";
 
 async function apiFixture() {
 	const challenges = new InMemoryVerificationChallengeRepository();
@@ -52,6 +53,31 @@ async function apiFixture() {
 }
 
 describe("H3 HTTP /v1/registration/complete", () => {
+	it("rejects a suspended client without consuming its verified registration evidence", async () => {
+		const { app, headers, verifiedChallenge, clients } = await apiFixture();
+		try {
+			const verificationId = await verifiedChallenge("person@example.com");
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing test client");
+			await clients.upsert({ ...client, status: "suspended" });
+			const request = { method: "POST" as const, url: "/v1/registration/complete", headers: headers(), payload: { verificationId } };
+			expect((await app.inject(request)).statusCode).toBe(401);
+			await clients.upsert({ ...client, status: "active" });
+			expect((await app.inject(request)).statusCode).toBe(200);
+		} finally { await app.close(); }
+	});
+	it("accepts a salted client secret for registration and rejects a wrong secret", async () => {
+		const { app, headers, verifiedChallenge, clients } = await apiFixture();
+		try {
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing test client");
+			await clients.upsert({ ...client, clientSecret: await hashOIDCClientSecret("client-secret") });
+			const verificationId = await verifiedChallenge("person@example.com");
+			const payload = { verificationId };
+			expect((await app.inject({ method: "POST", url: "/v1/registration/complete", headers: headers("client", "wrong"), payload })).statusCode).toBe(401);
+			expect((await app.inject({ method: "POST", url: "/v1/registration/complete", headers: headers(), payload })).statusCode).toBe(200);
+		} finally { await app.close(); }
+	});
 	it("valid verificationId registers and returns an application-neutral payload", async () => {
 		const { app, headers, verifiedChallenge } = await apiFixture();
 		try {

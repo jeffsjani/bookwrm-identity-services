@@ -32,8 +32,10 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 				return { url: url.toString(), pool: new pg.Pool({ connectionString: url.toString() }) };
 		}
 
-		function start(url: string, extraEnv: NodeJS.ProcessEnv = {}) {
-				const child = spawn(process.execPath, ["--import", "tsx", "src/server.ts"], {
+		function start(url: string, extraEnv: NodeJS.ProcessEnv = {}, serverScript?: string) {
+				const args = serverScript ? [serverScript] : process.env.HAPI_STARTUP_TEST_COMPILED === "true"
+						? ["dist/server.js"] : ["--import", "tsx", "src/server.ts"];
+				const child = spawn(process.execPath, args, {
 						env: {
 								PATH: process.env.PATH,
 								HOME: process.env.HOME,
@@ -49,6 +51,19 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 								PRIVATEID_CALLBACK_URL: "https://id.hapiinc.com/privateid/webhook",
 								PRIVATEID_REDIRECT_URL: "https://id.hapiinc.com/privateid/callback",
 								MOCK_AUTH_ENABLED: "false",
+								PRIVATEID_MOCK_MODE: "false",
+								HAPI_EMAIL_AUTHENTICATION_ENABLED: "false",
+								HAPI_UNIVERSAL_LOGIN_ENABLED: "false",
+								HAPI_GOOGLE_FEDERATION_ENABLED: "false",
+								HAPI_APPLE_FEDERATION_ENABLED: "false",
+								HAPI_PASSKEY_AUTHENTICATION_ENABLED: "false",
+								HAPI_FACE_SETUP_ENABLED: "false",
+								HAPI_FACE_ENROLLMENT_ENABLED: "false",
+								HAPI_ACCOUNT_LINKING_API_ENABLED: "false",
+								HAPI_REFRESH_GRANT_ENABLED: "false",
+								HAPI_PERSISTENT_SESSIONS_ENABLED: "false",
+								STAGING_TEST_CONSOLE_ENABLED: "false",
+								STAGING_WEB_SECRET_ROTATION_ENABLED: "false",
 								HAPI_PLATFORM_SERVICE_KEY: "synthetic-legacy-key",
 								...extraEnv
 						},
@@ -95,6 +110,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 				try {
 						const server = start(url);
 						const base = await server.waitForListening();
+						expect((await fetch(`${base}/health/live`)).status).toBe(200);
 						const ready = await fetch(`${base}/health/ready`);
 						expect(ready.status).toBe(200);
 						expect(await ready.json()).toMatchObject({ databaseConnected: true, providerReady: true, migrationsReady: true });
@@ -107,6 +123,31 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						})).status).toBe(404);
 						expect((await fetch(`${base}/account/authentication-methods`)).status).toBe(404);
 						expect((await pool.query("SELECT client_id FROM oidc_clients")).rows).toHaveLength(0);
+						const jwks = await fetch(`${base}/jwks`);
+						expect(jwks.status).toBe(200);
+						expect(await jwks.json()).toMatchObject({ keys: [expect.objectContaining({ kty: "RSA", alg: "RS256" })] });
+						for (const operation of ["start", "verify", "resend"]) {
+								expect((await fetch(`${base}/v1/identity/email/${operation}`, {
+										method: "POST", headers: { "content-type": "application/json" }, body: "{}"
+								})).status).toBe(404);
+						}
+						const subjectId = randomUUID();
+						const linkId = randomUUID();
+						await pool.query(`INSERT INTO identity_subjects
+								(id, oidc_subject, primary_provider, primary_provider_subject, status, created_at, updated_at)
+								VALUES ($1, $2, 'SYNTHETIC', $3, 'ACTIVE', now(), now())`,
+								[subjectId, randomUUID(), randomUUID()]);
+						await pool.query(`INSERT INTO identity_account_links
+								(id, source, external_user_id, identity_subject_id, status, linked_at, updated_at)
+								VALUES ($1, 'bookwrm', $2, $3, 'active', now(), now())`, [linkId, randomUUID(), subjectId]);
+						await pool.query("DELETE FROM application_account_links WHERE id=$1", [linkId]);
+						async function assertLegacyDataUntouched() {
+								expect((await pool.query("SELECT application_id FROM identity_subjects WHERE id=$1", [subjectId])).rows)
+										.toEqual([{ application_id: null }]);
+								expect((await pool.query("SELECT id FROM identity_account_links WHERE id=$1", [linkId])).rows).toHaveLength(1);
+								expect((await pool.query("SELECT id FROM application_account_links WHERE identity_subject_id=$1", [subjectId])).rows).toHaveLength(0);
+						}
+						await assertLegacyDataUntouched();
 						server.child.kill("SIGTERM");
 						expect(await server.exited).toBe(0);
 						const restarted = start(url);
@@ -115,10 +156,92 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						expect(restartedReady.status).toBe(200);
 						expect(await restartedReady.json()).toMatchObject({ migrationsReady: true });
 						expect((await pool.query("SELECT version FROM schema_migrations")).rows).toHaveLength(5);
+						expect((await pool.query("SELECT client_id FROM oidc_clients")).rows).toHaveLength(0);
+						await assertLegacyDataUntouched();
+						if (process.env.HAPI_ROLLBACK_SERVER_PATH) {
+								restarted.child.kill("SIGTERM");
+								expect(await restarted.exited).toBe(0);
+								const rollback = start(url, {}, process.env.HAPI_ROLLBACK_SERVER_PATH);
+								const rollbackBase = await rollback.waitForListening();
+								expect((await fetch(`${rollbackBase}/health/ready`)).status).toBe(200);
+								await assertLegacyDataUntouched();
+								expect((await pool.query("SELECT client_id FROM oidc_clients")).rows).toHaveLength(0);
+						}
 				} finally {
 						await pool.end();
 				}
 		}, 35_000);
+
+		it.each([
+				["disabled, no provider", {}, true, ""],
+				["disabled, configured provider", { HAPI_EMAIL_PROVIDER: "resend" }, true, ""],
+				["enabled, no provider", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true" }, false, "Email authentication requires H2"],
+				["enabled, unsupported provider", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_EMAIL_PROVIDER: "other" }, false, "Unsupported HAPI_EMAIL_PROVIDER"],
+				["enabled, no allowlist", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_EMAIL_PROVIDER: "resend" }, false, "are required for production Email OTP"],
+				["enabled, email only", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_EMAIL_PROVIDER: "resend", HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com" }, false, "must be configured together"],
+				["disabled, app only", { HAPI_EMAIL_PILOT_APPLICATION_ID: "123e4567-e89b-42d3-a456-426614174000" }, false, "must be configured together"],
+				["enabled, empty list", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_EMAIL_PROVIDER: "resend", HAPI_EMAIL_PILOT_ALLOWLIST: "", HAPI_EMAIL_PILOT_APPLICATION_ID: "123e4567-e89b-42d3-a456-426614174000" }, false, "must contain exact email addresses"],
+				["enabled, malformed app", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "true", HAPI_EMAIL_PROVIDER: "resend", HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com", HAPI_EMAIL_PILOT_APPLICATION_ID: "bad" }, false, "must be a UUID"],
+				["invalid flag", { HAPI_EMAIL_AUTHENTICATION_ENABLED: "yes" }, false, "must be true or false"]
+		])("production email configuration: %s", async (_name, extra, succeeds, message) => {
+				const { url, pool } = await newSchema();
+				try {
+						const server = start(url, extra);
+						if (succeeds) {
+								const base = await server.waitForListening();
+								expect((await fetch(`${base}/health/ready`)).status).toBe(200);
+								expect((await fetch(`${base}/v1/identity/email/start`, { method: "POST" })).status).toBe(404);
+						} else {
+								expect(await server.exited).not.toBe(0);
+								expect(server.output()).toContain(message);
+								expect(server.output()).not.toContain("Server listening");
+						}
+				} finally { await pool.end(); }
+		}, 25_000);
+
+		it("denies previously verified registration evidence when production email is disabled", async () => {
+				const { url, pool } = await newSchema();
+				const tenantId = randomUUID();
+				const applicationId = randomUUID();
+				const verificationId = randomUUID();
+				try {
+						const server = start(url, {
+								HAPI_EMAIL_PROVIDER: "resend",
+								HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
+								HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId
+						});
+						const base = await server.waitForListening();
+						await pool.query(readFileSync(new URL("../src/email/schema.sql", import.meta.url), "utf8"));
+						await pool.query("INSERT INTO tenants VALUES ($1, 'test', $2, 'active', now(), now())", [tenantId, tenantId]);
+						await pool.query(`INSERT INTO applications
+								(id, tenant_id, name, slug, status, created_at, updated_at, application_key)
+								VALUES ($1::uuid, $2, 'test', 'test', 'active', now(), now(), $1::text)`, [applicationId, tenantId]);
+						await pool.query(`INSERT INTO oidc_clients
+								(id, application_id, client_id, client_secret, redirect_uris, scopes, grant_types, response_types,
+								token_endpoint_auth_method, created_at, updated_at)
+								VALUES ($1, $2, 'synthetic-client', 'synthetic-secret', ARRAY['https://example.invalid/cb'],
+								ARRAY['openid'], ARRAY['authorization_code'], ARRAY['code'], 'client_secret_basic', now(), now())`,
+								[randomUUID(), applicationId]);
+						await pool.query(`INSERT INTO verification_challenges
+								(id, tenant_id, application_id, channel, purpose, destination_normalized, destination_hash,
+								code_hash, status, expires_at, attempt_count, max_attempts, send_count, last_sent_at,
+								verified_at, created_at, updated_at)
+								VALUES ($1, $2, $3, 'EMAIL', 'REGISTRATION', 'pilot@example.com', 'synthetic', '',
+								'VERIFIED', now() + interval '10 minutes', 0, 5, 1, now(), now(), now(), now())`,
+								[verificationId, tenantId, applicationId]);
+						const response = await fetch(`${base}/v1/registration/complete`, {
+								method: "POST",
+								headers: { "content-type": "application/json",
+										authorization: `Basic ${Buffer.from("synthetic-client:synthetic-secret").toString("base64")}` },
+								body: JSON.stringify({ verificationId })
+						});
+						expect(response.status).toBe(400);
+						expect(await response.json()).toMatchObject({ error: "INVALID_EVIDENCE" });
+						expect((await pool.query("SELECT status FROM verification_challenges WHERE id=$1", [verificationId])).rows)
+								.toEqual([{ status: "VERIFIED" }]);
+						expect((await pool.query("SELECT id FROM identity_subjects WHERE email='pilot@example.com'")).rows).toHaveLength(0);
+				} finally { await pool.end(); }
+		}, 25_000);
 
 		it("fails readiness for each missing migration, missing unversioned schema, or verification error", async () => {
 				const { url, pool } = await newSchema();
@@ -180,6 +303,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 						const server = start(url, {
 								HAPI_EMAIL_PROVIDER: "resend",
 								HAPI_EMAIL_AUTHENTICATION_ENABLED: "true",
+								HAPI_EMAIL_AUTHENTICATION_ENABLED: "true",
 								HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com",
 								HAPI_EMAIL_PILOT_APPLICATION_ID: randomUUID(),
 								HAPI_EMAIL_VERIFICATION_SECRET: "synthetic-verification-secret-32-bytes",
@@ -197,7 +321,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 				}
 		}, 25_000);
 
-		it("refuses production Email OTP startup without a pilot allowlist", async () => {
+		it("refuses a partially configured production pilot allowlist", async () => {
 			const { url, pool } = await newSchema();
 			try {
 				const server = start(url, {
@@ -208,7 +332,7 @@ describe.skipIf(!databaseUrl)("HAPI production startup safety", () => {
 					HAPI_EMAIL_FROM: "test@example.invalid"
 				});
 				expect(await server.exited).not.toBe(0);
-				expect(server.output()).toContain("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required");
+				expect(server.output()).toContain("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID must be configured together");
 				expect(server.output()).not.toContain("Server listening");
 			} finally {
 				await pool.end();

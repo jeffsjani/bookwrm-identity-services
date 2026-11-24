@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { inMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClientRepository.js";
+import { hashOIDCClientSecret } from "../src/security/OIDCClientSecret.js";
 import { authorizeAndGetCode, buildOidcTestApp, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 
 const BASE44_CLIENT_ID = "base44-web";
@@ -9,6 +10,12 @@ const BASE44_REDIRECT_URI = "https://example.com/callback";
 
 function basicAuthHeader(clientId: string, clientSecret: string): string {
 		return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
+}
+
+async function setBasicClient(secret = BASE44_CLIENT_SECRET): Promise<void> {
+		const record = await inMemoryOIDCClientRepository.findByClientId(BASE44_CLIENT_ID);
+		if (!record) throw new Error("OIDC test client was not seeded");
+		await inMemoryOIDCClientRepository.upsert({ ...record, tokenEndpointAuthMethod: "client_secret_basic", clientSecret: secret });
 }
 
 function mockIdentityContextFetch(): void {
@@ -45,6 +52,7 @@ describe("OIDC /token client authentication", () => {
 				const { app } = await buildOidcTestApp();
 				const verifier = "token-auth-basic-verifier-123456";
 				const code = await authorizeAndGetCode(app, verifier);
+				await setBasicClient();
 
 				const body = new URLSearchParams({
 						grant_type: "authorization_code",
@@ -135,6 +143,7 @@ describe("OIDC /token client authentication", () => {
 				const { app } = await buildOidcTestApp();
 				const verifier = "token-auth-basic-no-body-id-123456";
 				const code = await authorizeAndGetCode(app, verifier);
+				await setBasicClient();
 
 				const body = new URLSearchParams({
 						grant_type: "authorization_code",
@@ -166,6 +175,7 @@ describe("OIDC /token client authentication", () => {
 						codeChallenge: pkceChallengeFromVerifier(verifier),
 						codeChallengeMethod: "S256"
 				});
+				await setBasicClient();
 
 				const body = new URLSearchParams({
 						grant_type: "authorization_code",
@@ -267,6 +277,62 @@ describe("OIDC /token client authentication", () => {
 			expect(response.json()).toMatchObject({ error: "invalid_client" });
 			await app.close();
 		});
+
+			it.each([
+				["basic with matching body client_id", "client_secret_basic", basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET), BASE44_CLIENT_ID, undefined, true],
+				["basic using post", "client_secret_basic", undefined, BASE44_CLIENT_ID, BASE44_CLIENT_SECRET, false],
+				["post using basic", "client_secret_post", basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET), undefined, undefined, false],
+				["both secrets", "client_secret_basic", basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET), undefined, BASE44_CLIENT_SECRET, false],
+				["conflicting client ids", "client_secret_basic", basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET), "another-client", undefined, false],
+				["malformed basic with post fallback", "client_secret_post", "Basic !!!", BASE44_CLIENT_ID, BASE44_CLIENT_SECRET, false],
+				["unsupported header with post fallback", "client_secret_post", "Bearer value", BASE44_CLIENT_ID, BASE44_CLIENT_SECRET, false],
+				["public with secret", "none", undefined, BASE44_CLIENT_ID, BASE44_CLIENT_SECRET, false],
+				["public with basic", "none", basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET), undefined, undefined, false]
+			] as const)("enforces registered method: %s", async (_name, method, authorization, bodyId, bodySecret, allowed) => {
+				mockIdentityContextFetch();
+				const { app } = await buildOidcTestApp();
+				const verifier = "token-auth-method-matrix-verifier-123";
+				const code = await authorizeAndGetCode(app, verifier);
+				const record = await inMemoryOIDCClientRepository.findByClientId(BASE44_CLIENT_ID);
+				if (!record) throw new Error("OIDC test client was not seeded");
+				await inMemoryOIDCClientRepository.upsert({ ...record, tokenEndpointAuthMethod: method });
+				const body = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: BASE44_REDIRECT_URI, code_verifier: verifier });
+				if (bodyId !== undefined) body.set("client_id", bodyId);
+				if (bodySecret !== undefined) body.set("client_secret", bodySecret);
+				const response = await app.inject({ method: "POST", url: "/token",
+					headers: { "content-type": "application/x-www-form-urlencoded", ...(authorization ? { authorization } : {}) },
+					payload: body.toString() });
+				expect(response.statusCode).toBe(allowed ? 200 : 400);
+				if (!allowed) expect(response.json()).toMatchObject({ error: "invalid_client" });
+				await app.close();
+			});
+
+			it("verifies a salted secret for a basic client", async () => {
+				mockIdentityContextFetch();
+				const { app } = await buildOidcTestApp();
+				const verifier = "token-auth-scrypt-verifier-123456";
+				const code = await authorizeAndGetCode(app, verifier);
+				await setBasicClient(await hashOIDCClientSecret(BASE44_CLIENT_SECRET));
+				const response = await app.inject({ method: "POST", url: "/token",
+					headers: { "content-type": "application/x-www-form-urlencoded", authorization: basicAuthHeader(BASE44_CLIENT_ID, BASE44_CLIENT_SECRET) },
+					payload: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: BASE44_REDIRECT_URI, code_verifier: verifier }).toString() });
+				expect(response.statusCode).toBe(200);
+				await app.close();
+			});
+
+			it("rejects duplicated credential parameters", async () => {
+				const { app } = await buildOidcTestApp();
+				const verifier = "token-auth-duplicate-verifier-123456";
+				const code = await authorizeAndGetCode(app, verifier);
+				const body = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: BASE44_REDIRECT_URI,
+					code_verifier: verifier, client_id: BASE44_CLIENT_ID, client_secret: BASE44_CLIENT_SECRET });
+				body.append("client_secret", BASE44_CLIENT_SECRET);
+				const response = await app.inject({ method: "POST", url: "/token",
+					headers: { "content-type": "application/x-www-form-urlencoded" }, payload: body.toString() });
+				expect(response.statusCode).toBe(400);
+				expect(response.json()).toMatchObject({ error: "invalid_client" });
+				await app.close();
+			});
 
 		it("authenticates an explicitly public client without a secret and enforces PKCE S256", async () => {
 			const { app } = await buildOidcTestApp();
