@@ -1,0 +1,7 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "sh hapi-5c4-worker/start.sh",
+    "restartPolicyType": "NEVER"
+  }
+}
