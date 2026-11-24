@@ -1,12 +1,13 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import type { ApplicationRepository } from "../identity/ApplicationRepository.js";
 import type { OIDCClientRepository } from "../identity/OIDCClientRepository.js";
 import type { TenantRepository } from "../identity/TenantRepository.js";
+import { isOIDCClientBlocked } from "../identity/H1ClientAuthority.js";
 import type { RegistrationContext } from "../registration/RegistrationTypes.js";
 import { RegistrationError } from "../registration/RegistrationTypes.js";
 import type { RegistrationService } from "../registration/RegistrationService.js";
+import { verifyOIDCClientSecret } from "../security/OIDCClientSecret.js";
 
 // Keeps H3's certified authorization policy unchanged; H2/H4 use the equivalent shared H1 helper.
 export interface H1ClientAuthority {
@@ -27,9 +28,9 @@ async function authorize(request: FastifyRequest, authority: H1ClientAuthority):
 		clientId = decodeURIComponent(decoded.slice(0, separator).replace(/\+/g, " "));
 		secret = decodeURIComponent(decoded.slice(separator + 1).replace(/\+/g, " "));
 	} catch { throw new RegistrationError("UNAUTHORIZED", 401); }
+	if (isOIDCClientBlocked(clientId)) throw new RegistrationError("UNAUTHORIZED", 401);
 	const client = await authority.clients.findByClientId(clientId);
-	const hash = (value: string) => createHash("sha256").update(value).digest();
-	const matches = timingSafeEqual(hash(secret), hash(client?.clientSecret ?? ""));
+	const matches = client ? await verifyOIDCClientSecret(client.clientSecret, secret) : false;
 	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none" || !matches) throw new RegistrationError("UNAUTHORIZED", 401);
 	const application = await authority.applications.findById(client.applicationId);
 	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;

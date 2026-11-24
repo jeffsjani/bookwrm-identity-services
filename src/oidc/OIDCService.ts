@@ -25,7 +25,7 @@ import { secretProvider } from "../config/SecretProvider.js";
 import { identityCache } from "../cache/IdentityCache.js";
 import { identityRegistry } from "../identity/IdentityRegistry.js";
 import { PasskeyAuthenticationRejected, PostgresPasskeyCredentialRepository } from "../identity/PostgresPasskeyCredentialRepository.js";
-import { resolveRegisteredClient, requireApplicationMethod, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
+import { isOIDCClientBlocked, resolveRegisteredClient, requireApplicationMethod, type H1ClientAuthority } from "../identity/H1ClientAuthority.js";
 import { inMemoryApplicationRepository } from "../identity/InMemoryApplicationRepository.js";
 import { inMemoryTenantRepository } from "../identity/InMemoryTenantRepository.js";
 import { PostgresApplicationRepository } from "../identity/PostgresApplicationRepository.js";
@@ -58,6 +58,7 @@ import {
 } from "./refresh/RefreshTokenRotationService.js";
 import type { OIDCLogEntry } from "./types.js";
 import { constantTimeStringEqual } from "../security/ServiceAuthentication.js";
+import { verifyOIDCClientSecret } from "../security/OIDCClientSecret.js";
 import { consumePendingAuthorizationRequest, getPrivateIDAuthenticatedUser, storePrivateIDBrowserReturn,
 	PRIVATEID_BROWSER_RETURN_COOKIE } from "../privateid/PrivateIDSessionStore.js";
 import { storeCorrelation } from "./CorrelationStore.js";
@@ -635,6 +636,11 @@ export class OIDCService {
 								}
 
 								clientId = tokenRecord.clientId;
+								if (isOIDCClientBlocked(clientId)) {
+										reply.code(401);
+										error = "Client is blocked";
+										return { error: "invalid_token", error_description: "Access token is invalid or expired" };
+								}
 								user = tokenRecord.sub;
 								await this.rateLimiter.assertWithinLimits({
 										ip: request.ip,
@@ -783,7 +789,7 @@ export class OIDCService {
 								if (
 										tokenEndpointAuthMethod !== "none" &&
 										(!clientSecret || !configuredClientSecret.trim() ||
-											!constantTimeStringEqual(configuredClientSecret, clientSecret))
+											!(await verifyOIDCClientSecret(configuredClientSecret, clientSecret)))
 								) {
 										reply.code(400);
 										error = "client_secret is invalid";
@@ -1186,21 +1192,21 @@ export class OIDCService {
 
 		// HAPI ID Core resolves clients only from the persisted application/client registry.
 		private async configureClients(): Promise<OIDCClient[]> {
+				let clients: OIDCClient[];
 				if (this.options.clients && this.options.clients.length > 0) {
-						return this.options.clients;
+						clients = this.options.clients;
+				} else {
+						const persistedClients = await this.oidcClients.list();
+						if (persistedClients.length > 0) {
+								clients = persistedClients.map((record) => this.toOIDCClient(record));
+						} else {
+								const rawClients = configuration.get("OIDC_CLIENTS_JSON");
+								if (!rawClients) return [];
+								clients = JSON.parse(rawClients) as OIDCClient[];
+						}
 				}
 
-				const persistedClients = await this.oidcClients.list();
-				if (persistedClients.length > 0) {
-						return persistedClients.map((record) => this.toOIDCClient(record));
-				}
-
-				const rawClients = configuration.get("OIDC_CLIENTS_JSON");
-				if (!rawClients) {
-						return [];
-				}
-
-				return JSON.parse(rawClients) as OIDCClient[];
+				return clients.filter(client => typeof client.client_id !== "string" || !isOIDCClientBlocked(client.client_id));
 		}
 
 		private configurePKCE(): { required: () => boolean; methods: string[] } {
@@ -2500,6 +2506,7 @@ export class OIDCService {
 		}
 
 		private async resolveClient(clientId: string, emailAuthentication = false): Promise<OIDCClient | null> {
+				if (isOIDCClientBlocked(clientId)) return null;
 				try {
 						await resolveRegisteredClient(clientId, this.clientAuthority);
 				} catch (error) {
@@ -2789,7 +2796,7 @@ export class OIDCService {
 				if (
 						tokenEndpointAuthMethod !== "none" &&
 						(!input.clientSecret || !configuredClientSecret.trim() ||
-								!constantTimeStringEqual(configuredClientSecret, input.clientSecret))
+								!(await verifyOIDCClientSecret(configuredClientSecret, input.clientSecret)))
 				) {
 						reply.code(400);
 						return {

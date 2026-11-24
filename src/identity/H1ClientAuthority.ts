@@ -1,9 +1,10 @@
-import { createHash, timingSafeEqual } from "node:crypto";
 import type { FastifyRequest } from "fastify";
+import { configuration } from "../config/ConfigurationService.js";
 import type { ApplicationRepository } from "./ApplicationRepository.js";
 import type { OIDCClientRepository } from "./OIDCClientRepository.js";
 import type { TenantRepository } from "./TenantRepository.js";
 import { VerificationError, type VerificationContext } from "../email/VerificationChallenge.js";
+import { verifyOIDCClientSecret } from "../security/OIDCClientSecret.js";
 import type { AuthenticationMethod } from "../models/Application.js";
 
 export interface H1ClientAuthority {
@@ -17,7 +18,13 @@ export interface AuthorizedH1Client {
 	clientId: string;
 }
 
+export function isOIDCClientBlocked(clientId: string): boolean {
+	const configured = configuration.get("HAPI_OIDC_BLOCKED_CLIENT_IDS") ?? "";
+	return configured.split(",").some(value => value.trim() === clientId);
+}
+
 export async function resolveRegisteredClient(clientId: string, authority: H1ClientAuthority) {
+	if (isOIDCClientBlocked(clientId)) throw new VerificationError("UNAUTHORIZED", 401);
 	const client = await authority.clients.findByClientId(clientId);
 	if (!client || client.status !== "active") throw new VerificationError("UNAUTHORIZED", 401);
 	const application = await authority.applications.findById(client.applicationId);
@@ -47,8 +54,7 @@ export async function authorizeH1Client(request: FastifyRequest, authority: H1Cl
 		secret = decodeURIComponent(decoded.slice(separator + 1).replace(/\+/g, " "));
 	} catch { throw new VerificationError("UNAUTHORIZED", 401); }
 	const client = await authority.clients.findByClientId(clientId);
-	const hash = (value: string) => createHash("sha256").update(value).digest();
-	const matches = timingSafeEqual(hash(secret), hash(client?.clientSecret ?? ""));
+	const matches = client ? await verifyOIDCClientSecret(client.clientSecret, secret) : false;
 	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none" || !matches) throw new VerificationError("UNAUTHORIZED", 401);
 	const { application, tenant } = await requireApplicationMethod(clientId, authority, "HAPI_EMAIL");
 	return { context: { tenantId: tenant.id, applicationId: application.id }, clientId };

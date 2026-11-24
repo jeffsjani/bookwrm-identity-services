@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID, scryptSync } from "node:crypto";
 import Fastify from "fastify";
 import { InMemoryVerificationChallengeRepository } from "../src/email/InMemoryVerificationChallengeRepository.js";
 import { InMemoryEmailDeliveryProvider } from "../src/email/EmailDeliveryProvider.js";
@@ -13,6 +13,7 @@ import { InMemoryOIDCClientRepository } from "../src/identity/InMemoryOIDCClient
 import { InMemoryRegistrationRepository } from "../src/registration/InMemoryRegistrationRepository.js";
 import { RegistrationService } from "../src/registration/RegistrationService.js";
 import { registerRegistrationRoutes } from "../src/routes/registration.js";
+import { configuration } from "../src/config/ConfigurationService.js";
 
 async function apiFixture() {
 	const challenges = new InMemoryVerificationChallengeRepository();
@@ -78,6 +79,59 @@ describe("H3 HTTP /v1/registration/complete", () => {
 			const publicClient = await app.inject({ method: "POST", url: "/v1/registration/complete", headers: { authorization: `Basic ${Buffer.from("public-client:").toString("base64")}` }, payload: { verificationId } });
 			expect(publicClient.statusCode).toBe(401);
 		} finally { await app.close(); }
+	});
+
+	it("accepts the original scrypt-backed client secret but rejects the stored hash as a credential", async () => {
+		const { app, verifiedChallenge, clients } = await apiFixture();
+		try {
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing synthetic registration client");
+			const secret = "synthetic-registration-secret";
+			const salt = randomBytes(16);
+			const derived = scryptSync(secret, salt, 32, { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 });
+			const hash = `scrypt$16384$8$1$${salt.toString("base64url")}$${derived.toString("base64url")}`;
+			await clients.upsert({ ...client, clientSecret: hash });
+
+			const validVerificationId = await verifiedChallenge("hash-client@example.com");
+			const valid = await app.inject({
+				method: "POST",
+				url: "/v1/registration/complete",
+				headers: { authorization: `Basic ${Buffer.from(`client:${secret}`).toString("base64")}` },
+				payload: { verificationId: validVerificationId }
+			});
+			expect(valid.statusCode).toBe(200);
+
+			const hashVerificationId = await verifiedChallenge("hash-literal@example.com");
+			const hashAsCredential = await app.inject({
+				method: "POST",
+				url: "/v1/registration/complete",
+				headers: { authorization: `Basic ${Buffer.from(`client:${hash}`).toString("base64")}` },
+				payload: { verificationId: hashVerificationId }
+			});
+			expect(hashAsCredential.statusCode).toBe(401);
+		} finally { await app.close(); }
+	});
+
+	it("blocks the configured client from the registration endpoint", async () => {
+		const previous = process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS;
+		process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS = "client";
+		configuration.reload();
+		const { app, verifiedChallenge, headers } = await apiFixture();
+		try {
+			const verificationId = await verifiedChallenge("blocked-client@example.com");
+			const response = await app.inject({
+				method: "POST",
+				url: "/v1/registration/complete",
+				headers: headers(),
+				payload: { verificationId }
+			});
+			expect(response.statusCode).toBe(401);
+		} finally {
+			await app.close();
+			if (previous === undefined) delete process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS;
+			else process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS = previous;
+			configuration.reload();
+		}
 	});
 
 	it("Task 3/19: the .strict() schema rejects any client-supplied email/tenantId/emailVerified/claimSource/oidcSubject injection", async () => {

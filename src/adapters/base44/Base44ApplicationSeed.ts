@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import { configuration } from "../../config/ConfigurationService.js";
+import { HAPI_PRODUCTION_ISSUER } from "../../config/IssuerPolicy.js";
 import { BOOKWRM_TENANT_ID, BOOKWRM_APPLICATION_ID } from "../../identity/WellKnownIdentities.js";
 import type { TenantRepository } from "../../identity/TenantRepository.js";
 import type { ApplicationRepository } from "../../identity/ApplicationRepository.js";
@@ -47,11 +48,12 @@ function defaultOidcClients(): OIDCClientRepository {
 }
 
 // Backfills pre-H1 identity_subjects rows (application_id IS NULL) onto Bookwrm's Application.
-// No-op on the memory driver -- there is no cross-process state to migrate there.
+// No-op on the memory driver and HAPI production issuer; neither should run this migration.
 async function backfillIdentitySubjects(applicationId: string, client?: PostgresClient): Promise<number> {
 		if (configuration.getIdentityRegistryDriver() !== "postgres") {
 				return 0;
 		}
+		if (isHapiProductionIssuer()) return 0;
 
 		const pool = client ?? getPostgresPool();
 		const result = await pool.query<{ id: string }>(
@@ -62,9 +64,13 @@ async function backfillIdentitySubjects(applicationId: string, client?: Postgres
 		return result.rows.length;
 }
 
+function isHapiProductionIssuer(): boolean {
+	return configuration.get("OIDC_ISSUER")?.trim() === HAPI_PRODUCTION_ISSUER;
+}
+
 // Bookwrm/Base44-scoped migration: seeds Tenant #1 (Bookwrm) + Application #1 (Bookwrm Base44) + its
-// OIDCClient row from the legacy env-driven Base44 config, then backfills any pre-H1 IdentitySubjects
-// onto that Application. Idempotent -- safe to run on every process start (mirrors ensureIdentitySchema()).
+// OIDCClient row from the legacy env-driven Base44 config, then backfills pre-H1 IdentitySubjects outside
+// HAPI production. Idempotent -- safe to run on every process start (mirrors ensureIdentitySchema()).
 export async function ensureBookwrmApplicationSeed(
 		deps: Base44ApplicationSeedDependencies = {}
 ): Promise<Base44ApplicationSeedResult> {
@@ -111,7 +117,7 @@ export async function ensureBookwrmApplicationSeed(
 		}
 
 		const backfilledIdentitySubjects = await backfillIdentitySubjects(application.id, deps.postgresClient);
-		if (configuration.getIdentityRegistryDriver() === "postgres") {
+		if (configuration.getIdentityRegistryDriver() === "postgres" && !isHapiProductionIssuer()) {
 				const client = deps.postgresClient ?? getPostgresPool();
 				await client.query(`WITH migrated AS (INSERT INTO application_account_links
 					(id,identity_subject_id,application_id,external_account_id,status,created_at,updated_at)
