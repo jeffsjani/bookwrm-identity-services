@@ -26,6 +26,9 @@ import { PostgresRefreshTokenFamilyRepository } from "../src/oidc/refresh/Postgr
 import { RefreshTokenRotationService } from "../src/oidc/refresh/RefreshTokenRotationService.js";
 import { DependencyHealthMonitor } from "../src/infrastructure/DependencyHealthMonitor.js";
 import { registerHealthRoutes } from "../src/routes/health.js";
+import { registerRegistrationRoutes } from "../src/routes/registration.js";
+import { RegistrationService } from "../src/registration/RegistrationService.js";
+import { PostgresRegistrationRepository } from "../src/registration/PostgresRegistrationRepository.js";
 import { ensureOidcTestEnvironment, pkceChallengeFromVerifier } from "./oidcTestHarness.js";
 
 const databaseUrl = process.env.HAPI_AUTHENTICATION_TEST_DATABASE_URL;
@@ -80,6 +83,8 @@ describe.skipIf(!databaseUrl)("OIDC client suspension with disposable PostgreSQL
 		await pool.query(refreshDdl);
 		await challengeRepository.ensureSchema();
 		await emailAuthenticationRepository.ensureSchema();
+		const registrationRepository = new PostgresRegistrationRepository(pool);
+		await registrationRepository.ensureSchema();
 		await tenants.upsert({ id: tenantId, name: "Synthetic", slug: tenantId, status: "active" });
 		for (const [id, key] of [[pilotApplicationId, "PILOT_TEST"], [unrelatedApplicationId, "ACTIVE_TEST"]]) {
 			await applications.upsert({
@@ -144,6 +149,7 @@ describe.skipIf(!databaseUrl)("OIDC client suspension with disposable PostgreSQL
 		});
 		await app.register(formbody);
 		await oidc.registerEndpoints(app);
+		await registerRegistrationRoutes(app, new RegistrationService(registrationRepository), authority);
 		await registerHealthRoutes(app, {
 			configurationLoaded: () => Boolean(configuration.getEnvironment()),
 			redisRequired: () => featureFlags.isRedisEnabled(),
@@ -261,6 +267,12 @@ describe.skipIf(!databaseUrl)("OIDC client suspension with disposable PostgreSQL
 			{ headers: { authorization: `Basic ${Buffer.from(`${pilotClientId}:synthetic-pilot-secret`).toString("base64")}` } } as import("fastify").FastifyRequest,
 			authority
 		)).rejects.toMatchObject({ statusCode: 401 });
+		const suspendedRegistration = await app.inject({
+			method: "POST", url: "/v1/registration/complete",
+			headers: { authorization: `Basic ${Buffer.from(`${pilotClientId}:synthetic-pilot-secret`).toString("base64")}` },
+			payload: { verificationId: randomUUID() }
+		});
+		expect(suspendedRegistration.statusCode).toBe(401);
 
 		const codeExchange = await exchangeCode(pilotClientId, "synthetic-pilot-secret", pending.code, pending.verifier);
 		expect(codeExchange.statusCode).toBe(400);
@@ -301,5 +313,41 @@ describe.skipIf(!databaseUrl)("OIDC client suspension with disposable PostgreSQL
 			headers: { authorization: `Bearer ${unrelatedToken.json().access_token}` }
 		});
 		expect(unrelatedUserInfo.statusCode).toBe(200);
+	});
+
+	it("blocks a client across OAuth and registration, including previously issued credentials", async () => {
+		await pool.query("UPDATE oidc_clients SET status='active' WHERE client_id=$1", [pilotClientId]);
+		const issued = await issueCode(pilotClientId, "synthetic-pilot-secret");
+		const token = await exchangeCode(pilotClientId, "synthetic-pilot-secret", issued.code, issued.verifier);
+		expect(token.statusCode).toBe(200);
+		const pending = await issueCode(pilotClientId, "synthetic-pilot-secret");
+		const previous = process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS;
+		try {
+			process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS = pilotClientId;
+			configuration.reload();
+			const query = new URLSearchParams({
+				response_type: "code", client_id: pilotClientId, redirect_uri: "https://rp.example/callback",
+				scope: "openid email", state: "blocked-test", nonce: "blocked-test", code_challenge_method: "S256",
+				code_challenge: pkceChallengeFromVerifier("synthetic-pg-new-flow-verifier")
+			});
+			expect((await app.inject({ method: "GET", url: `/authorize?${query}` })).statusCode).toBe(400);
+			expect((await exchangeCode(pilotClientId, "synthetic-pilot-secret", pending.code, pending.verifier)).statusCode).toBe(400);
+			expect((await app.inject({ method: "POST", url: "/token",
+				headers: { authorization: `Basic ${Buffer.from(`${pilotClientId}:synthetic-pilot-secret`).toString("base64")}`,
+					"content-type": "application/x-www-form-urlencoded" },
+				payload: new URLSearchParams({ grant_type: "refresh_token", refresh_token: token.json().refresh_token }).toString()
+			})).statusCode).toBe(400);
+			expect((await app.inject({ method: "GET", url: "/userinfo",
+				headers: { authorization: `Bearer ${token.json().access_token}` } })).statusCode).toBe(401);
+			expect((await app.inject({ method: "POST", url: "/v1/registration/complete",
+				headers: { authorization: `Basic ${Buffer.from(`${pilotClientId}:synthetic-pilot-secret`).toString("base64")}` },
+				payload: { verificationId: randomUUID() } })).statusCode).toBe(401);
+			const unrelated = await issueCode(unrelatedClientId, "synthetic-active-secret");
+			expect((await exchangeCode(unrelatedClientId, "synthetic-active-secret", unrelated.code, unrelated.verifier)).statusCode).toBe(200);
+		} finally {
+			if (previous === undefined) delete process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS;
+			else process.env.HAPI_OIDC_BLOCKED_CLIENT_IDS = previous;
+			configuration.reload();
+		}
 	});
 });

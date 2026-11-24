@@ -12,11 +12,13 @@ export class EmailVerificationService {
 		private readonly provider: EmailDeliveryProvider,
 		private readonly secrets: VerificationSecrets,
 		private readonly policy: VerificationPolicy,
-		private readonly clock: () => number = Date.now
+		private readonly clock: () => number = Date.now,
+		private readonly isPilotEmailAllowed: (email: string, context: VerificationContext) => boolean = () => true
 	) {}
 
 	async start(context: VerificationContext, email: string, purpose: VerificationPurpose) {
 		const destination = normalizeEmail(email);
+		this.assertPilotEmailAllowed(destination, context);
 		const destinationHash = this.secrets.destination(destination);
 		const outcome = await this.repository.transaction(context, destinationHash, snapshot => {
 			const now = this.clock();
@@ -44,6 +46,7 @@ export class EmailVerificationService {
 
 	async resend(context: VerificationContext, challengeId: string) {
 		const outcome = await this.withChallenge(context, challengeId, (snapshot, challenge) => {
+			this.assertPilotEmailAllowed(challenge.destinationNormalized, context);
 			const error = this.pendingError(snapshot, challenge);
 			if (error) return { error };
 			const now = this.clock();
@@ -61,6 +64,7 @@ export class EmailVerificationService {
 
 	async verify(context: VerificationContext, challengeId: string, code: string, purpose?: VerificationPurpose) {
 		const outcome = await this.withChallenge(context, challengeId, (snapshot, challenge) => {
+			this.assertPilotEmailAllowed(challenge.destinationNormalized, context);
 			if (purpose && challenge.purpose !== purpose) return { error: "INVALID_CHALLENGE" };
 			const error = this.pendingError(snapshot, challenge);
 			if (error) return { error };
@@ -89,6 +93,7 @@ export class EmailVerificationService {
 
 	async consume(context: VerificationContext, verificationId: string, email: string, purpose: VerificationPurpose) {
 		const destination = normalizeEmail(email);
+		this.assertPilotEmailAllowed(destination, context);
 		const outcome = await this.withChallenge(context, verificationId, (snapshot, challenge) => {
 			if (challenge.destinationNormalized !== destination || challenge.purpose !== purpose || challenge.status !== "VERIFIED") {
 				return { error: "INVALID_EVIDENCE" };
@@ -190,6 +195,9 @@ export class EmailVerificationService {
 		this.audit(snapshot, challenge, "EMAIL_VERIFICATION_EXPIRED");
 	}
 	private timestamp() { return new Date(this.clock()).toISOString(); }
+	private assertPilotEmailAllowed(email: string, context: VerificationContext) {
+		if (!this.isPilotEmailAllowed(email, context)) throw new VerificationError("PILOT_ACCESS_DENIED", 403);
+	}
 	private audit(snapshot: VerificationSnapshot, challenge: VerificationChallenge, type: VerificationAuditType) {
 		snapshot.audit.push({ id: randomUUID(), tenantId: challenge.tenantId, applicationId: challenge.applicationId,
 			challengeId: challenge.id, destinationHash: challenge.destinationHash, type, occurredAt: this.timestamp() });

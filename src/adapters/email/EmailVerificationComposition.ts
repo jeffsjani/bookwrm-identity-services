@@ -21,21 +21,29 @@ import type { EmailOIDCHandoff } from "../../authentication/EmailOIDCHandoff.js"
 import { registerEmailAuthenticationRoutes } from "../../routes/emailAuthentication.js";
 import type { VerificationChallengeRepository } from "../../email/VerificationChallengeRepository.js";
 import { normalizeEmail } from "../../email/EmailNormalizationService.js";
+import { emailPilotAllowlistFromEnvironment } from "../../email/EmailPilotAllowlist.js";
+import { HAPI_PRODUCTION_ISSUER } from "../../config/IssuerPolicy.js";
 import { RegistrationError } from "../../registration/RegistrationTypes.js";
 import type { RegistrationService } from "../../registration/RegistrationService.js";
 import { identityRegistry, type IdentityRegistry } from "../../identity/IdentityRegistry.js";
 import type { IdentitySubject } from "../../models/IdentitySubject.js";
 
 export async function configureEmailVerification(app: FastifyInstance, env = process.env): Promise<ConfiguredEmailOIDCHandoff | undefined> {
+	const production = env.OIDC_ISSUER?.trim() === HAPI_PRODUCTION_ISSUER;
 	if (env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== undefined &&
 		!["true", "false"].includes(env.HAPI_EMAIL_AUTHENTICATION_ENABLED)) {
 		throw new Error("HAPI_EMAIL_AUTHENTICATION_ENABLED must be true or false");
 	}
+	if (production && env.HAPI_EMAIL_AUTHENTICATION_ENABLED !== "true") return;
 	if (env.HAPI_EMAIL_AUTHENTICATION_ENABLED === "true" && !env.HAPI_EMAIL_PROVIDER) {
 		throw new Error("Email authentication requires H2 email verification");
 	}
 	if (!env.HAPI_EMAIL_PROVIDER) return;
 	if (env.HAPI_EMAIL_PROVIDER !== "resend") throw new Error("Unsupported HAPI_EMAIL_PROVIDER");
+	const pilotAllowlist = production ? emailPilotAllowlistFromEnvironment(env, true) : undefined;
+	if (production && !pilotAllowlist?.configured) {
+		throw new Error("HAPI_EMAIL_PILOT_ALLOWLIST and HAPI_EMAIL_PILOT_APPLICATION_ID are required for production Email OTP");
+	}
 	const requireSetting = (key: string): string => {
 		if (!env[key]) throw new Error(`Missing required ${key}`);
 		return env[key]!;
@@ -48,7 +56,7 @@ export async function configureEmailVerification(app: FastifyInstance, env = pro
 	const pool = getPostgresPool() as pg.Pool;
 	const repository = new PostgresVerificationChallengeRepository(pool);
 	await repository.ensureSchema();
-	const service = new EmailVerificationService(repository, provider, secrets, policy);
+	const service = new EmailVerificationService(repository, provider, secrets, policy, Date.now, pilotAllowlist?.allows);
 	const authority = {
 		clients: new PostgresOIDCClientRepository(), applications: new PostgresApplicationRepository(), tenants: new PostgresTenantRepository()
 	};

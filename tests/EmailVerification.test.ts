@@ -11,6 +11,7 @@ import { defaultVerificationPolicy, verificationPolicyFromEnvironment } from "..
 import { InMemoryVerificationChallengeRepository } from "../src/email/InMemoryVerificationChallengeRepository.js";
 import { InMemoryEmailDeliveryProvider } from "../src/email/EmailDeliveryProvider.js";
 import { EmailVerificationService } from "../src/email/EmailVerificationService.js";
+import { emailPilotAllowlistFromEnvironment } from "../src/email/EmailPilotAllowlist.js";
 import { registerEmailVerificationRoutes } from "../src/routes/emailVerification.js";
 import { InMemoryTenantRepository } from "../src/identity/InMemoryTenantRepository.js";
 import { InMemoryApplicationRepository } from "../src/identity/InMemoryApplicationRepository.js";
@@ -31,6 +32,36 @@ function fixture(overrides = {}) {
 }
 
 describe("H2 challenge lifecycle", () => {
+	it("enforces the production pilot for start, resend and verification", async () => {
+		const repository = new InMemoryVerificationChallengeRepository();
+		const provider = new InMemoryEmailDeliveryProvider();
+		const secrets = new VerificationSecrets("pilot-test-secret".repeat(3));
+		let now = Date.now();
+		const unrestricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy, () => now);
+		const applicationId = "123e4567-e89b-42d3-a456-426614174000";
+		const pilotContext = { ...context, applicationId };
+		const outside = await unrestricted.start(pilotContext, "outside@example.com", "REGISTRATION");
+		const wrongApp = await unrestricted.start(context, "pilot@example.com", "REGISTRATION");
+		const allowlist = emailPilotAllowlistFromEnvironment({
+			HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com", HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId
+		}, true);
+		const restricted = new EmailVerificationService(repository, provider, secrets, defaultVerificationPolicy, () => now, allowlist.allows);
+		await expect(restricted.start(pilotContext, "outside@example.com", "REGISTRATION")).rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED" });
+		await expect(restricted.start(context, "pilot@example.com", "REGISTRATION")).rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED" });
+		for (const [challengeContext, challenge, code] of [
+			[pilotContext, outside, provider.messages[0].code],
+			[context, wrongApp, provider.messages[1].code]
+		] as const) {
+			await expect(restricted.verify(challengeContext, challenge.challengeId, code)).rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED" });
+			await expect(restricted.resend(challengeContext, challenge.challengeId)).rejects.toMatchObject({ code: "PILOT_ACCESS_DENIED" });
+		}
+		expect(provider.messages).toHaveLength(2);
+		const allowed = await restricted.start(pilotContext, "pilot@EXAMPLE.com", "REGISTRATION");
+		now += 60_000;
+		await restricted.resend(pilotContext, allowed.challengeId);
+		expect(provider.messages).toHaveLength(4);
+		await expect(restricted.verify(pilotContext, allowed.challengeId, provider.messages[3].code)).resolves.toMatchObject({ verified: true });
+	});
 	it("correct OTP produces bound verified evidence, never a subject", async () => {
 		const { service, provider, repository } = fixture();
 		const started = await service.start(context, "Person@example.com", "REGISTRATION");
@@ -146,6 +177,18 @@ describe("H2 challenge lifecycle", () => {
 });
 
 describe("H2 verification primitives", () => {
+	it("fails closed for missing, partial and malformed production pilot settings", () => {
+		const applicationId = "123e4567-e89b-42d3-a456-426614174000";
+		expect(emailPilotAllowlistFromEnvironment({}, true).allows("any@example.com", { ...context, applicationId })).toBe(false);
+		for (const env of [
+			{ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com" },
+			{ HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId },
+			{ HAPI_EMAIL_PILOT_ALLOWLIST: "", HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId },
+			{ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@*.com", HAPI_EMAIL_PILOT_APPLICATION_ID: applicationId },
+			{ HAPI_EMAIL_PILOT_ALLOWLIST: "pilot@example.com", HAPI_EMAIL_PILOT_APPLICATION_ID: "invalid" }
+		]) expect(() => emailPilotAllowlistFromEnvironment(env, true)).toThrow();
+		expect(emailPilotAllowlistFromEnvironment({}).allows("any@example.com", context)).toBe(true);
+	});
 	it("normalizes domains deterministically without rewriting local addresses", () => {
 		expect(normalizeEmail("  Person.Name+tag@GMAIL.COM  ")).toBe("Person.Name+tag@gmail.com");
 		expect(normalizeEmail(normalizeEmail("A@EXAMPLE.COM"))).toBe("A@example.com");

@@ -1,6 +1,12 @@
 # HAPI ID Stage 5C.3 Safe Rollback
 
-This local rollback artifact is based on the production baseline. It preserves the HAPI production backfill guard and verifies both scrypt-backed client secrets and existing plaintext client secrets. It does not include the pilot Email OTP or Universal Login implementation.
+This local rollback artifact is based on the production baseline. It preserves the HAPI production backfill guard and verifies both scrypt-backed client secrets and existing plaintext client secrets. It adds the production pilot restrictions but does not add the separate Universal Login implementation.
+
+## Production email and registration
+
+With `HAPI_EMAIL_AUTHENTICATION_ENABLED` unset or false on the HAPI production issuer, email verification and authentication routes are not mounted even when a provider is configured, and registration denies existing email evidence. With the flag true, startup requires the supported email provider, a nonempty `HAPI_EMAIL_PILOT_ALLOWLIST` of exact addresses, and a valid `HAPI_EMAIL_PILOT_APPLICATION_ID` UUID. Missing, partial, empty or malformed pilot settings fail startup. Start, resend, verify and registration accept only a listed address bound to that application. Other issuers retain their existing staging behavior.
+
+Registration rejects suspended clients and clients listed in `HAPI_OIDC_BLOCKED_CLIENT_IDS`, as well as inactive tenant/application and unknown or invalid credentials. Existing plaintext and supported scrypt client secrets remain valid.
 
 ## Blocking pilot OAuth clients
 
@@ -17,7 +23,9 @@ Before switching from the live baseline, keep Email OTP and Universal Login disa
 1. Keep `HAPI_EMAIL_AUTHENTICATION_ENABLED` and `HAPI_UNIVERSAL_LOGIN_ENABLED` false, and keep pilot authentication configuration disabled. If a pilot row exists, set its status to `suspended` before switching builds; do not provision one for rollback testing.
 2. Before switching versions, take and verify an operator-approved backup. Keep the externally verified OIDC traffic gate active throughout the rollout.
 3. Start only this rollback build with the approved pilot client ID in `HAPI_OIDC_BLOCKED_CLIENT_IDS`. Do not delete pilot records, modify secrets, drop tables, or restore the whole database.
-4. Verify the deployed artifact, production issuer, `/health/ready`, rejection of the suspended/blocked client at all three OAuth paths, and an unrelated active client's operation. Keep the client suspended and blocked until a separately approved release explicitly re-enables it.
+4. Verify the deployed artifact, production issuer, `/health/ready`, rejection of the suspended/blocked client at all three OAuth paths and registration, and an unrelated active client's operation. Keep the client suspended and blocked until a separately approved release explicitly re-enables it.
 5. If any unscoped identity or missing legacy application-account link exists, do not use the unguarded baseline. This rollback build skips both production backfills and makes no schema or migration changes.
 
 The scrypt verifier reserves the `scrypt$` prefix for the supported stored-hash format. Ordinary legacy plaintext secrets continue to compare in constant time. A legacy plaintext secret beginning with that reserved prefix is ambiguous and must be rotated through an approved process rather than treated as a literal.
+
+Neither client suspension nor this blocklist revokes already-issued ID tokens or relying-party sessions validated locally. Access tokens are rejected at UserInfo after the block or suspension, but an independent traffic gate is still required during version transitions; verify session expiry or logout separately when immediate termination is needed.

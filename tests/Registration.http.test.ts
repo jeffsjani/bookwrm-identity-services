@@ -53,6 +53,19 @@ async function apiFixture() {
 }
 
 describe("H3 HTTP /v1/registration/complete", () => {
+	it("rejects a suspended client without consuming verified evidence", async () => {
+		const { app, headers, verifiedChallenge, clients } = await apiFixture();
+		try {
+			const verificationId = await verifiedChallenge("person@example.com");
+			const client = await clients.findByClientId("client");
+			if (!client) throw new Error("Missing test client");
+			await clients.upsert({ ...client, status: "suspended" });
+			const request = { method: "POST" as const, url: "/v1/registration/complete", headers: headers(), payload: { verificationId } };
+			expect((await app.inject(request)).statusCode).toBe(401);
+			await clients.upsert({ ...client, status: "active" });
+			expect((await app.inject(request)).statusCode).toBe(200);
+		} finally { await app.close(); }
+	});
 	it("valid verificationId registers and returns an application-neutral payload", async () => {
 		const { app, headers, verifiedChallenge } = await apiFixture();
 		try {

@@ -116,7 +116,8 @@ async function checkProductionMigrations(app: FastifyInstance): Promise<boolean>
 						timer = setTimeout(() => reject(new Error("schema verification timeout")), DATABASE_PING_TIMEOUT_MS);
 				});
 				const missing = await Promise.race([
-						getMissingRequiredSchema(Boolean(configuration.get("HAPI_EMAIL_PROVIDER"))),
+						getMissingRequiredSchema(configuration.get("HAPI_EMAIL_AUTHENTICATION_ENABLED") === "true" &&
+								Boolean(configuration.get("HAPI_EMAIL_PROVIDER"))),
 						timeout
 				]);
 				if (missing.versions.length || missing.tables.length) {

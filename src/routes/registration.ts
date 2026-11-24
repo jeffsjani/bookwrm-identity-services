@@ -31,7 +31,9 @@ async function authorize(request: FastifyRequest, authority: H1ClientAuthority):
 	if (isOIDCClientBlocked(clientId)) throw new RegistrationError("UNAUTHORIZED", 401);
 	const client = await authority.clients.findByClientId(clientId);
 	const matches = client ? await verifyOIDCClientSecret(client.clientSecret, secret) : false;
-	if (!client || !client.clientSecret || client.tokenEndpointAuthMethod === "none" || !matches) throw new RegistrationError("UNAUTHORIZED", 401);
+	if (!client || client.status !== "active" || !client.clientSecret || client.tokenEndpointAuthMethod === "none" || !matches) {
+		throw new RegistrationError("UNAUTHORIZED", 401);
+	}
 	const application = await authority.applications.findById(client.applicationId);
 	const tenant = application ? await authority.tenants.findById(application.tenantId) : undefined;
 	if (!application || application.status !== "active" || !tenant || tenant.status !== "active") throw new RegistrationError("UNAUTHORIZED", 401);
